@@ -214,9 +214,9 @@ def get_params() -> AttributeDict:
             "feature_dim": 80,
             "encoder_out_dim": 512,
             "subsampling_factor": 4,
-            "attention_dim": 512,
+            "attention_dim": 256,
             "nhead": 8,
-            "dim_feedforward": 2048,
+            "dim_feedforward": 1024,
             "num_encoder_layers": 12,
             "vgg_frontend": False,
             # parameters for Noam
@@ -643,7 +643,7 @@ def run(rank, world_size, args):
     train_cuts = train_cuts.filter(remove_short_and_long_utt)
 
     try:
-        num_left = len(train_cuts).to_eager()
+        num_left = len(train_cuts.to_eager())
         num_removed = num_in_total - num_left
         removed_percent = num_removed / num_in_total * 100
 
