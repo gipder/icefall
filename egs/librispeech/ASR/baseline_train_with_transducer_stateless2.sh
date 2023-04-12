@@ -10,5 +10,5 @@ ${basedir}/train.py \
     --start-epoch 0 \
     --exp-dir ${basedir}/${task} \
     --full-libri 0 \
-    --max-duration 100 \
+    --max-duration 150 \
     --lr-factor 2.5
