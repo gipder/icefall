@@ -153,6 +153,41 @@ def get_parser():
         help="Accumulate stats on activations, print them and exit.",
     )
 
+    parser.add_argument(
+        "--fast-emit",
+        type=str2bool,
+        default=False,
+        help="FastEmit flag, True or False.",
+    )
+
+    parser.add_argument(
+        "--fast-emit-weight",
+        type=float,
+        default=0.0,
+        help="FastEmit weight, the default value is 0.0",
+    )
+
+    parser.add_argument(
+        "--loss-regularization",
+        type=str2bool,
+        default=False,
+        help="Loss Regularization flag, True or False.",
+    )
+
+    parser.add_argument(
+        "--loss-regularization-weight",
+        type=float,
+        default=0.0,
+        help="Loss Regularization weight",
+    )
+
+    parser.add_argument(
+        "--loss-regularization-sigma",
+        type=float,
+        default=1.0,
+        help="Loss Regularization sigma, it is related to the width of dense probabilities",
+    )
+
     return parser
 
 
