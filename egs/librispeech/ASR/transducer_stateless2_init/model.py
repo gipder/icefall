@@ -63,6 +63,11 @@ class Transducer(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.joiner = joiner
+        self.fast_emit = False
+        self.fast_emit_weight = 0.0
+        self.loss_regularization = False
+        self.loss_regularization_weight = 0.0
+        self.loss_regularization_sigma = 1.0
 
     def forward(
         self,
@@ -118,6 +123,8 @@ class Transducer(nn.Module):
             "Please install a version >= 0.10.0"
         )
 
+        #print(x_lens)
+        #print(x_lens)
         loss = torchaudio.functional.rnnt_loss(
             logits=logits,
             targets=y_padded,
@@ -125,6 +132,9 @@ class Transducer(nn.Module):
             target_lengths=y_lens,
             blank=blank_id,
             reduction="sum",
+            loss_regularization=self.loss_regularization,
+            loss_regularization_weight=self.loss_regularization_weight,
+            loss_regularization_sigma=self.loss_regularization_sigma
         )
 
         return loss

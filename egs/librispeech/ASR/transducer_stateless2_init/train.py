@@ -251,7 +251,7 @@ def get_params() -> AttributeDict:
             "subsampling_factor": 4,
             "attention_dim": 256,
             "nhead": 8,
-            "dim_feedforward": 1024,
+            "dim_feedforward": 512,
             "num_encoder_layers": 12,
             "vgg_frontend": False,
             # parameters for Noam
@@ -432,6 +432,9 @@ def compute_loss(
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
+    #print(feature.shape)
+    #print(feature_lens)
+
     with torch.set_grad_enabled(is_training):
         loss = model(
             x=feature,
@@ -534,7 +537,6 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(train_dl):
         params.batch_idx_train += 1
         batch_size = len(batch["supervisions"]["text"])
-
         loss, loss_info = compute_loss(
             params=params,
             model=model,
@@ -636,6 +638,14 @@ def run(rank, world_size, args):
 
     logging.info("About to create model")
     model = get_transducer_model(params)
+    if params.loss_regularization is True:
+        model.loss_regularization = params.loss_regularization
+        model.loss_regularization_weight = params.loss_regularization_weight
+        model.loss_regularization_sigma = params.loss_regularization_sigma
+
+    if params.fast_emit is True:
+        model.fast_emit = params.fast_emit
+        model.fast_emit_weight = params.fast_emit_weight
 
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
