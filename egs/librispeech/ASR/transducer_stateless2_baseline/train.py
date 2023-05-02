@@ -212,12 +212,12 @@ def get_params() -> AttributeDict:
             "valid_interval": 3000,  # For the 100h subset, use 800
             # parameters for conformer
             "feature_dim": 80,
-            "encoder_out_dim": 512,
+            "encoder_out_dim": 256,
             "subsampling_factor": 4,
             "attention_dim": 256,
-            "nhead": 8,
+            "nhead": 4,
             "dim_feedforward": 512,
-            "num_encoder_layers": 12,
+            "num_encoder_layers": 8,
             "vgg_frontend": False,
             # parameters for Noam
             "warm_step": 80000,  # For the 100h subset, use 8k

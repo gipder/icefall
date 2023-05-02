@@ -125,6 +125,10 @@ class Transducer(nn.Module):
 
         #print(x_lens)
         #print(x_lens)
+        if self.training is True:
+            self.loss_regularization = True
+        else:
+            self.loss_regularization = False
         loss = torchaudio.functional.rnnt_loss(
             logits=logits,
             targets=y_padded,
