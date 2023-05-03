@@ -68,6 +68,7 @@ class Transducer(nn.Module):
         self.loss_regularization = False
         self.loss_regularization_weight = 0.0
         self.loss_regularization_sigma = 1.0
+        self.loss_regularization_swing = False
 
     def forward(
         self,
@@ -138,7 +139,8 @@ class Transducer(nn.Module):
             reduction="sum",
             loss_regularization=self.loss_regularization,
             loss_regularization_weight=self.loss_regularization_weight,
-            loss_regularization_sigma=self.loss_regularization_sigma
+            loss_regularization_sigma=self.loss_regularization_sigma,
+            loss_regularization_swing=self.loss_regularization_swing
         )
 
         return loss

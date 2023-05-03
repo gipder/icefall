@@ -185,7 +185,15 @@ def get_parser():
         "--loss-regularization-sigma",
         type=float,
         default=1.0,
-        help="Loss Regularization sigma, it is related to the width of dense probabilities",
+        help="Loss Regularization sigma, it is related to the width of dense"
+             "probabilities",
+    )
+
+    parser.add_argument(
+        "--loss-regularization-swing",
+        type=str2bool,
+        default=False,
+        help="The mean of Loss Regularization is randomly changed",
     )
 
     return parser
@@ -642,6 +650,7 @@ def run(rank, world_size, args):
         model.loss_regularization = params.loss_regularization
         model.loss_regularization_weight = params.loss_regularization_weight
         model.loss_regularization_sigma = params.loss_regularization_sigma
+        model.loss_regularization_swing = params.loss_regularization_swing
 
     if params.fast_emit is True:
         model.fast_emit = params.fast_emit
