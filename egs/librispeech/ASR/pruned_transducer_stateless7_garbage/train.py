@@ -179,6 +179,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         """,
     )
 
+    parser.add_argument(
+        "--compress-time-axis",
+        type=str2bool,
+        default=False,
+        help="Whether to use compress by time axis",
+    )
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -503,6 +510,11 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
     )
+
+    if params.compress_time_axis is True:
+        model.compress_time_axis = True
+    else:
+        model.compress_time_axis = False
     return model
 
 

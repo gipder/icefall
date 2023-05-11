@@ -74,6 +74,7 @@ class Transducer(nn.Module):
         # for debugging
         self.inner_cnt = 0
         self.timer = 0
+        self.compress_time_axis = False
 
     def forward(
         self,
@@ -112,8 +113,8 @@ class Transducer(nn.Module):
               lm_scale * lm_probs + am_scale * am_probs +
               (1-lm_scale-am_scale) * combined_probs
         """
-        compress_t = True
-        compress_verbose = True
+        compress_time_axis = self.compress_time_axis
+        compress_verbose = False
         d_verbose = False
         assert x.ndim == 3, x.shape
         assert x_lens.ndim == 1, x_lens.shape
@@ -171,8 +172,8 @@ class Transducer(nn.Module):
                 return_grad=True,
             )
 
-        print("px_grad.shape: " + str(px_grad.shape))
-        print("py_grad.shape: " + str(py_grad.shape))
+        if d_verbose: print("px_grad.shape: " + str(px_grad.shape))
+        if d_verbose: print("py_grad.shape: " + str(py_grad.shape))
         # ranges : [B, T, prune_range]
         ranges = k2.get_rnnt_prune_ranges(
             px_grad=px_grad,
@@ -191,7 +192,8 @@ class Transducer(nn.Module):
 
         if d_verbose: print("am_pruned.shape: " + str(am_pruned.shape))
         if d_verbose: print("lm_pruned.shape: " + str(lm_pruned.shape))
-        if d_verbose:print("ranges.shape: " + str(ranges.shape))
+        if d_verbose: print("ranges.shape: " + str(ranges.shape))
+        """
         def _compress_am_and_lm(am_pruned, lm_pruned, ranges, boundary):
             import random
             section_size = 4
@@ -221,20 +223,21 @@ class Transducer(nn.Module):
             boundary_result = boundary.clone()
             boundary_result[:, -1] = boundary_result[:, -1] - gap_t
             return am_pruned_result, lm_pruned_result, ranges_result, boundary_result
+        """
 
         # logits : [B, T, prune_range, vocab_size]
         # project_input=False since we applied the decoder's input projections
         # prior to do_rnnt_pruning (this is an optimization for speed).
-        c_am_pruned, c_lm_pruned, c_ranges, c_boundary = _compress_am_and_lm(am_pruned, lm_pruned, ranges, boundary)
-        if compress_t is False:
-            logits = self.joiner(am_pruned, lm_pruned, project_input=False)
-        else:
-            logits = self.joiner(c_am_pruned, c_lm_pruned, project_input=False)
-            c_logits = logits
+        #c_am_pruned, c_lm_pruned, c_ranges, c_boundary = _compress_am_and_lm(am_pruned, lm_pruned, ranges, boundary)
+        #if compress_t is False:
+        logits = self.joiner(am_pruned, lm_pruned, project_input=False)
+        #else:
+        #    logits = self.joiner(c_am_pruned, c_lm_pruned, project_input=False)
+        #    c_logits = logits
         if d_verbose:print("logits.shape: " + str(logits.shape))
-        if compress_t is False:
+        if compress_time_axis is False:
             if d_verbose: print(boundary)
-            start = time.time()
+            #start = time.time()
             with torch.cuda.amp.autocast(enabled=False):
                 pruned_loss = k2.rnnt_loss_pruned(
                     logits=logits.float(),
@@ -244,20 +247,19 @@ class Transducer(nn.Module):
                     boundary=boundary,
                     reduction="sum",
                 )
-            self.timer = self.timer + (time.time() - start )
+            #self.timer = self.timer + (time.time() - start )
         else:
-            """
+            if d_verbose:
+                print("Before compressing")
+                print("compress_time_axis: " + str(compress_time_axis))
+                print("logits.shape: " + str(logits.shape))
+                print("y_padded.shape: " + str(y_padded.shape))
+                print("ranges.shape: " + str(ranges.shape))
+                print("boundary.shape: " + str(boundary.shape))
+                print("After compressing")
 
-            print("Before compressing")
-            print("compress_t: " + str(compress_t))
-            print("logits.shape: " + str(logits.shape))
-            print("y_padded.shape: " + str(y_padded.shape))
-            print("ranges.shape: " + str(ranges.shape))
-            print("boundary.shape: " + str(boundary.shape))
-            print("After compressing")
             def _compress_time(logits, ranges, boundary):
-                import random
-                section_size = 4
+                section_size = 10
                 assert logits.shape[1] == ranges.shape[1]
                 #logits_result = torch.zeros(1, 1)
                 #ranges_result = torch.zeors(1, 1)
@@ -280,11 +282,11 @@ class Transducer(nn.Module):
                 boundary_result[:, -1] = boundary_result[:, -1] - gap_t
                 return logits_result, ranges_result, boundary_result
 
-            compressed_logits, compressed_ranges, compressed_boundary =_compress_time(logits, ranges, boundary)
-            print("compressed_logits.shape: " + str(compressed_logits.shape))
-            print("compressed_ranges.shape: " + str(compressed_ranges.shape))
-            """
-            start = time.time()
+            c_logits, c_ranges, c_boundary = _compress_time(logits, ranges, boundary)
+            if d_verbose:
+                print("compressed_logits.shape: " + str(c_logits.shape))
+            if d_verbose:
+                print("compressed_ranges.shape: " + str(c_ranges.shape))
             with torch.cuda.amp.autocast(enabled=False):
                 pruned_loss = k2.rnnt_loss_pruned(
                     logits=c_logits.float(),
@@ -294,13 +296,10 @@ class Transducer(nn.Module):
                     boundary=c_boundary,
                     reduction="sum",
                 )
-            self.timer = self.timer + (time.time() - start )
-
 
         if compress_verbose is True:
-            limit = 1000
+            limit = 1
             self.inner_cnt = self.inner_cnt + 1
             if self.inner_cnt >= limit:
-                print( self.timer )
                 sys.exit(3)
         return (simple_loss, pruned_loss)
