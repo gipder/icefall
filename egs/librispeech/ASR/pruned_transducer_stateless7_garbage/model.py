@@ -41,6 +41,7 @@ class Transducer(nn.Module):
         decoder_dim: int,
         joiner_dim: int,
         vocab_size: int,
+        compress_time_axis: bool = False
     ):
         """
         Args:
@@ -70,11 +71,16 @@ class Transducer(nn.Module):
             encoder_dim,
             vocab_size,
         )
+
         self.simple_lm_proj = nn.Linear(decoder_dim, vocab_size)
         # for debugging
         self.inner_cnt = 0
         self.timer = 0
-        self.compress_time_axis = False
+
+        # test
+        self.compress_time_axis = compress_time_axis
+        if self.compress_time_axis:
+            self.compress_layer = nn.MaxPool1d(2, stride=2)
 
     def forward(
         self,
@@ -193,6 +199,36 @@ class Transducer(nn.Module):
         if d_verbose: print("am_pruned.shape: " + str(am_pruned.shape))
         if d_verbose: print("lm_pruned.shape: " + str(lm_pruned.shape))
         if d_verbose: print("ranges.shape: " + str(ranges.shape))
+
+        def _compress_with_maxpool(am_pruned, lm_pruned, ranges, boundary):
+            assert am_pruned.shape[1] == lm_pruned.shape[1]
+            assert am_pruned.shape[1] == ranges.shape[1]
+            max_t = am_pruned.shape[1]
+            #reshape (B, T, S, C) -> (B, C, S, T)
+            am_pruned_transposed = am_pruned.permute(0, 4, 2, 1)
+            lm_pruned_transposed = lm_pruned.permute(0, 4, 2, 1)
+            ranges_transposed = ranges.permute()
+            for i in range(0, am_pruned.shape[1], section_size):
+                am_pruned_section = am_pruned[:, i:i+section_size, :]
+                lm_pruned_section = lm_pruned[:, i:i+section_size, :]
+                ranges_section = ranges[:, i:i+section_size, :]
+                rand_idx = random.randint(i, i+section_size-1)
+                am_pruned_section = torch.cat((am_pruned_section[:, :rand_idx-i], am_pruned_section[:, rand_idx+1-i:]), dim=1)
+                lm_pruned_section = torch.cat((lm_pruned_section[:, :rand_idx-i], lm_pruned_section[:, rand_idx+1-i:]), dim=1)
+                ranges_section = torch.cat((ranges_section[:, :rand_idx-i], ranges_section[:, rand_idx+1-i:]), dim=1)
+                if i == 0:
+                    am_pruned_result = am_pruned_section
+                    lm_pruned_result = lm_pruned_section
+                    ranges_result = ranges_section
+                else:
+                    am_pruned_result = torch.cat((am_pruned_result, am_pruned_section), dim=1)
+                    lm_pruned_result = torch.cat((lm_pruned_result, lm_pruned_section), dim=1)
+                    ranges_result = torch.cat((ranges_result, ranges_section), dim=1)
+
+            gap_t = max_t - am_pruned_result.shape[1]
+            boundary_result = boundary.clone()
+            boundary_result[:, -1] = boundary_result[:, -1] - gap_t
+            return am_pruned_result, lm_pruned_result, ranges_result, boundary_result
         """
         def _compress_am_and_lm(am_pruned, lm_pruned, ranges, boundary):
             import random
