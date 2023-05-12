@@ -509,12 +509,14 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
+        compress_time_axis=params.compress_time_axis
     )
-
+    """
     if params.compress_time_axis is True:
         model.compress_time_axis = True
     else:
         model.compress_time_axis = False
+    """
     return model
 
 

@@ -205,29 +205,47 @@ class Transducer(nn.Module):
             assert am_pruned.shape[1] == ranges.shape[1]
             max_t = am_pruned.shape[1]
             #reshape (B, T, S, C) -> (B, C, S, T)
-            am_pruned_transposed = am_pruned.permute(0, 4, 2, 1)
-            lm_pruned_transposed = lm_pruned.permute(0, 4, 2, 1)
-            ranges_transposed = ranges.permute()
-            for i in range(0, am_pruned.shape[1], section_size):
-                am_pruned_section = am_pruned[:, i:i+section_size, :]
-                lm_pruned_section = lm_pruned[:, i:i+section_size, :]
-                ranges_section = ranges[:, i:i+section_size, :]
-                rand_idx = random.randint(i, i+section_size-1)
-                am_pruned_section = torch.cat((am_pruned_section[:, :rand_idx-i], am_pruned_section[:, rand_idx+1-i:]), dim=1)
-                lm_pruned_section = torch.cat((lm_pruned_section[:, :rand_idx-i], lm_pruned_section[:, rand_idx+1-i:]), dim=1)
-                ranges_section = torch.cat((ranges_section[:, :rand_idx-i], ranges_section[:, rand_idx+1-i:]), dim=1)
-                if i == 0:
-                    am_pruned_result = am_pruned_section
-                    lm_pruned_result = lm_pruned_section
-                    ranges_result = ranges_section
-                else:
-                    am_pruned_result = torch.cat((am_pruned_result, am_pruned_section), dim=1)
-                    lm_pruned_result = torch.cat((lm_pruned_result, lm_pruned_section), dim=1)
-                    ranges_result = torch.cat((ranges_result, ranges_section), dim=1)
+            am_pruned_transposed = am_pruned.permute(0, 3, 2, 1)
+            lm_pruned_transposed = lm_pruned.permute(0, 3, 2, 1)
+            ranges_transposed = ranges.permute(0, 2, 1)
 
+            size = 2
+            am0 = am_pruned_transposed.shape[0]
+            am1 = am_pruned_transposed.shape[1]
+            am2 = am_pruned_transposed.shape[2]
+            am3 = am_pruned_transposed.shape[3] // size
+            lm0 = lm_pruned_transposed.shape[0]
+            lm1 = lm_pruned_transposed.shape[1]
+            lm2 = lm_pruned_transposed.shape[2]
+            lm3 = lm_pruned_transposed.shape[3] // size
+            ra0 = ranges_transposed.shape[0]
+            ra1 = ranges_transposed.shape[1]
+            ra2 = ranges_transposed.shape[2] // size
+
+
+            am_pruned_result = torch.randn((am0, am1, am2, am3), dtype=am_pruned_transposed.dtype)
+            lm_pruned_result = torch.randn((am0, am1, am2, am3), dtype=lm_pruned_transposed.dtype)
+            ranges_result = torch.randn((ra0, ra1, ra2), dtype=torch.float)
+            for b in range(0, am0):
+                am_pruned_result[b] = self.compress_layer(am_pruned_transposed[b])
+                lm_pruned_result[b] = self.compress_layer(lm_pruned_transposed[b])
+                ranges_result[b] = self.compress_layer(ranges_transposed[b].type(torch.float))
+
+            #reshape (B, C, S, T) -> (B, T, S, C)
+            am_pruned_result = am_pruned_result.permute(0, 3, 2, 1)
+            lm_pruned_result = lm_pruned_result.permute(0, 3, 2, 1)
+            ranges_result = ranges_result.permute(0, 2, 1)
+            ranges_result = ranges_result.type(ranges_transposed.dtype)
+
+            #change boundary
             gap_t = max_t - am_pruned_result.shape[1]
             boundary_result = boundary.clone()
             boundary_result[:, -1] = boundary_result[:, -1] - gap_t
+
+            #device
+            am_pruned_result = am_pruned_result.to(am_pruned.device)
+            lm_pruned_result = lm_pruned_result.to(lm_pruned.device)
+            ranges_result = ranges_result.to(ranges.device)
             return am_pruned_result, lm_pruned_result, ranges_result, boundary_result
         """
         def _compress_am_and_lm(am_pruned, lm_pruned, ranges, boundary):
@@ -264,12 +282,12 @@ class Transducer(nn.Module):
         # logits : [B, T, prune_range, vocab_size]
         # project_input=False since we applied the decoder's input projections
         # prior to do_rnnt_pruning (this is an optimization for speed).
-        #c_am_pruned, c_lm_pruned, c_ranges, c_boundary = _compress_am_and_lm(am_pruned, lm_pruned, ranges, boundary)
-        #if compress_t is False:
-        logits = self.joiner(am_pruned, lm_pruned, project_input=False)
-        #else:
-        #    logits = self.joiner(c_am_pruned, c_lm_pruned, project_input=False)
-        #    c_logits = logits
+        if compress_time_axis is False:
+            logits = self.joiner(am_pruned, lm_pruned, project_input=False)
+        else:
+            c_am_pruned, c_lm_pruned, c_ranges, c_boundary = _compress_with_maxpool(am_pruned, lm_pruned, ranges, boundary)
+            logits = self.joiner(c_am_pruned, c_lm_pruned, project_input=False)
+            c_logits = logits
         if d_verbose:print("logits.shape: " + str(logits.shape))
         if compress_time_axis is False:
             if d_verbose: print(boundary)
@@ -318,7 +336,7 @@ class Transducer(nn.Module):
                 boundary_result[:, -1] = boundary_result[:, -1] - gap_t
                 return logits_result, ranges_result, boundary_result
 
-            c_logits, c_ranges, c_boundary = _compress_time(logits, ranges, boundary)
+            #c_logits, c_ranges, c_boundary = _compress_time(logits, ranges, boundary)
             if d_verbose:
                 print("compressed_logits.shape: " + str(c_logits.shape))
             if d_verbose:
