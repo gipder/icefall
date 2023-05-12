@@ -120,8 +120,8 @@ class Transducer(nn.Module):
               (1-lm_scale-am_scale) * combined_probs
         """
         compress_time_axis = self.compress_time_axis
-        compress_verbose = True
-        d_verbose = True
+        compress_verbose = False
+        d_verbose = False
         assert x.ndim == 3, x.shape
         assert x_lens.ndim == 1, x_lens.shape
         assert y.num_axes == 2, y.num_axe

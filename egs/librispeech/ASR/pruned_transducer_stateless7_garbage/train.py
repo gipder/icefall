@@ -317,6 +317,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--pruned-loss-scale",
+        type=float,
+        default=1.0,
+        help="adjust pruned-loss-scale. The original value is 1.0",
+    )
+
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -709,8 +716,9 @@ def compute_loss(
             if batch_idx_train >= warm_step
             else 1.0 - (batch_idx_train / warm_step) * (1.0 - s)
         )
+        ss = params.pruned_loss_scale
         pruned_loss_scale = (
-            1.0
+            ss
             if batch_idx_train >= warm_step
             else 0.1 + 0.9 * (batch_idx_train / warm_step)
         )
@@ -929,8 +937,8 @@ def train_one_epoch(
                         cur_grad_scale,
                         params.batch_idx_train,
                     )
-            import sys
-            sys.exit(3)
+            #import sys
+            #sys.exit(3)
         if batch_idx % params.valid_interval == 0 and not params.print_diagnostics:
             logging.info("Computing validation loss")
             valid_info = compute_validation_loss(
