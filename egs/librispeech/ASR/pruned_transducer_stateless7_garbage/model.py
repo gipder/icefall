@@ -120,8 +120,8 @@ class Transducer(nn.Module):
               (1-lm_scale-am_scale) * combined_probs
         """
         compress_time_axis = self.compress_time_axis
-        compress_verbose = False
-        d_verbose = False
+        compress_verbose = True
+        d_verbose = True
         assert x.ndim == 3, x.shape
         assert x_lens.ndim == 1, x_lens.shape
         assert y.num_axes == 2, y.num_axe
@@ -282,12 +282,12 @@ class Transducer(nn.Module):
         # logits : [B, T, prune_range, vocab_size]
         # project_input=False since we applied the decoder's input projections
         # prior to do_rnnt_pruning (this is an optimization for speed).
-        if compress_time_axis is False:
-            logits = self.joiner(am_pruned, lm_pruned, project_input=False)
-        else:
-            c_am_pruned, c_lm_pruned, c_ranges, c_boundary = _compress_with_maxpool(am_pruned, lm_pruned, ranges, boundary)
-            logits = self.joiner(c_am_pruned, c_lm_pruned, project_input=False)
-            c_logits = logits
+        #if compress_time_axis is False:
+        logits = self.joiner(am_pruned, lm_pruned, project_input=False)
+        #else:
+        #    c_am_pruned, c_lm_pruned, c_ranges, c_boundary = _compress_with_maxpool(am_pruned, lm_pruned, ranges, boundary)
+        #    logits = self.joiner(c_am_pruned, c_lm_pruned, project_input=False)
+        #    c_logits = logits
         if d_verbose:print("logits.shape: " + str(logits.shape))
         if compress_time_axis is False:
             if d_verbose: print(boundary)
@@ -336,7 +336,7 @@ class Transducer(nn.Module):
                 boundary_result[:, -1] = boundary_result[:, -1] - gap_t
                 return logits_result, ranges_result, boundary_result
 
-            #c_logits, c_ranges, c_boundary = _compress_time(logits, ranges, boundary)
+            c_logits, c_ranges, c_boundary = _compress_time(logits, ranges, boundary)
             if d_verbose:
                 print("compressed_logits.shape: " + str(c_logits.shape))
             if d_verbose:
@@ -352,7 +352,7 @@ class Transducer(nn.Module):
                 )
 
         if compress_verbose is True:
-            limit = 1
+            limit = 2
             self.inner_cnt = self.inner_cnt + 1
             if self.inner_cnt >= limit:
                 sys.exit(3)
