@@ -90,6 +90,7 @@ class Transducer(nn.Module):
         prune_range: int = 5,
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
+        prune_topk: int = 1,
     ) -> torch.Tensor:
         """
         Args:
@@ -121,7 +122,7 @@ class Transducer(nn.Module):
         """
         compress_time_axis = self.compress_time_axis
         compress_verbose = False
-        d_verbose = False
+        d_verbose = True
         assert x.ndim == 3, x.shape
         assert x_lens.ndim == 1, x_lens.shape
         assert y.num_axes == 2, y.num_axe
@@ -181,19 +182,26 @@ class Transducer(nn.Module):
         if d_verbose: print("px_grad.shape: " + str(px_grad.shape))
         if d_verbose: print("py_grad.shape: " + str(py_grad.shape))
         # ranges : [B, T, prune_range]
-        ranges = k2.get_rnnt_prune_ranges(
+        ranges = k2.get_topk_rnnt_prune_ranges(
             px_grad=px_grad,
             py_grad=py_grad,
             boundary=boundary,
             s_range=prune_range,
+            k=prune_topk,
         )
 
         # am_pruned : [B, T, prune_range, encoder_dim]
         # lm_pruned : [B, T, prune_range, decoder_dim]
+        if self.training is True:
+            k = torch.randint(0, prune_topk, (1,)).item()
+        else: # for validation
+            k = 1
+
+        k_ranges = ranges[:, k, :, :]
         am_pruned, lm_pruned = k2.do_rnnt_pruning(
             am=self.joiner.encoder_proj(encoder_out),
             lm=self.joiner.decoder_proj(decoder_out),
-            ranges=ranges,
+            ranges=k_ranges,
         )
 
         if d_verbose: print("am_pruned.shape: " + str(am_pruned.shape))
@@ -296,7 +304,7 @@ class Transducer(nn.Module):
                 pruned_loss = k2.rnnt_loss_pruned(
                     logits=logits.float(),
                     symbols=y_padded,
-                    ranges=ranges,
+                    ranges=k_ranges,
                     termination_symbol=blank_id,
                     boundary=boundary,
                     reduction="sum",
@@ -336,7 +344,7 @@ class Transducer(nn.Module):
                 boundary_result[:, -1] = boundary_result[:, -1] - gap_t
                 return logits_result, ranges_result, boundary_result
 
-            c_logits, c_ranges, c_boundary = _compress_time(logits, ranges, boundary)
+            c_logits, c_ranges, c_boundary = _compress_time(logits, k_ranges, boundary)
             if d_verbose:
                 print("compressed_logits.shape: " + str(c_logits.shape))
             if d_verbose:
@@ -356,4 +364,5 @@ class Transducer(nn.Module):
             self.inner_cnt = self.inner_cnt + 1
             if self.inner_cnt >= limit:
                 sys.exit(3)
+
         return (simple_loss, pruned_loss)

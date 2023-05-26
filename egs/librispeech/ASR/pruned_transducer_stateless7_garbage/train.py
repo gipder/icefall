@@ -292,6 +292,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--prune-topk",
+        type=int,
+        default=1,
+        help="The top k list for prune range, the default value is 1",
+    )
+
+    parser.add_argument(
         "--lm-scale",
         type=float,
         default=0.25,
@@ -706,6 +713,7 @@ def compute_loss(
             prune_range=params.prune_range,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
+            prune_topk=params.prune_topk,
         )
 
         s = params.simple_loss_scale

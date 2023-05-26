@@ -453,6 +453,45 @@ def decode_one_batch(
 
     encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
 
+    size = encoder_out.shape[1]*2
+    encoder_out_ext = torch.zeros((encoder_out.shape[0], size, encoder_out.shape[2])).to(device)
+    encoder_out_ext_lens = encoder_out_lens * 2
+    for i in torch.arange(0, encoder_out.shape[1]):
+        encoder_out_ext[:, i*2] = encoder_out[:, i]
+
+    even_row = torch.arange(start=0, end=encoder_out_ext.shape[1], step=2)
+    odd_row = torch.arange(start=1, end=encoder_out_ext.shape[1], step=2)
+    for i in odd_row:
+        if i+1 < encoder_out_ext.shape[1]:
+            encoder_out_ext[:, i] = (encoder_out_ext[:, i-1] + encoder_out_ext[:, i+1])/2
+        else:
+            encoder_out_ext[:, i] = encoder_out_ext[:, i-1]
+
+    encoder_out = encoder_out_ext
+    encoder_out_lens = encoder_out_ext_lens
+    """
+    # Method 2
+    encoder_out_org = torch.zeros(encoder_out.shape).to(device)
+    encoder_out_lens_org = encoder_out_lens.to(device)
+    even_row = torch.arange(start=0, end=encoder_out.shape[1], step=2)
+    odd_row = torch.arange(start=1, end=encoder_out.shape[1], step=2)
+    encoder_out_org[:, even_row, :] = encoder_out[:, even_row, :]
+    for i in odd_row:
+        if i+1 < encoder_out.shape[1]:
+            encoder_out_org[:, i, :] = (encoder_out[:, i-1, :] + encoder_out[:, i+1, :])/2
+        else:
+            encoder_out_org[:, i, :] = encoder_out[:, i-1, :]
+    encoder_out = encoder_out_org
+    encoder_out_lens = encoder_out_lens_org
+    """
+    #print(encoder_out.shape)
+    # method 1
+    #encoder_out = encoder_out[:, even_row, :]
+    #encoder_out_lens = torch.div(encoder_out_lens, 2).ceil().to(torch.int32)
+
+    #print(encoder_out.shape)
+    #print(encoder_out_lens)
+    #print(torch.div(encoder_out_lens, 2).ceil().to(torch.int32))
     hyps = []
 
     if params.decoding_method == "fast_beam_search":
