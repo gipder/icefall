@@ -683,20 +683,23 @@ def compute_loss(
     batch = filter_uneven_sized_batch(batch, allowed_max_frames)
 
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
-    feature = batch["inputs"]
+    BATCH = 1
+    feature = batch["inputs"][:BATCH]
     # at entry, feature is (N, T, C)
     assert feature.ndim == 3
     feature = feature.to(device)
 
+    print(batch["supervisions"])
     supervisions = batch["supervisions"]
-    feature_lens = supervisions["num_frames"].to(device)
+    feature_lens = supervisions["num_frames"][:BATCH].to(device)
 
     batch_idx_train = params.batch_idx_train
     warm_step = params.warm_step
 
-    texts = batch["supervisions"]["text"]
+    texts = batch["supervisions"]["text"][:BATCH]
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
+
 
     with torch.set_grad_enabled(is_training):
         simple_loss, pruned_loss = model(

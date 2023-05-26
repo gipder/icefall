@@ -119,8 +119,8 @@ class Transducer(nn.Module):
               lm_scale * lm_probs + am_scale * am_probs +
               (1-lm_scale-am_scale) * combined_probs
         """
-        compress_time_axis = self.compress_time_axis
-        compress_verbose = True
+        compress_time_axis = False #self.compress_time_axis
+        compress_verbose = False
         d_verbose = True
         assert x.ndim == 3, x.shape
         assert x_lens.ndim == 1, x_lens.shape
@@ -153,18 +153,17 @@ class Transducer(nn.Module):
         boundary[:, 2] = y_lens
         boundary[:, 3] = x_lens
 
-        if d_verbose: print("decoder_out.shape: " + str(decoder_out.shape))
         lm = self.simple_lm_proj(decoder_out)
+        if self.compress_time_axis:
+            encoder_out_half = encoder_out.permute(0, 2, 1)
+            encoder_out_half = self.compress_layer(encoder_out_half)
+            encoder_out_half = encoder_out_half.permute(0, 2, 1)
+
+        am = self.simple_am_proj(encoder_out)
+        if d_verbose: print("decoder_out.shape: " + str(decoder_out.shape))
         if d_verbose: print("lm.shape: " + str(lm.shape))
         if d_verbose: print("encoder_out.shape: " +str(encoder_out.shape))
-        am = self.simple_am_proj(encoder_out)
         if d_verbose: print("am.shape: " + str(am.shape))
-
-        # if self.training and random.random() < 0.25:
-        #    lm = penalize_abs_values_gt(lm, 100.0, 1.0e-04)
-        # if self.training and random.random() < 0.25:
-        #    am = penalize_abs_values_gt(am, 30.0, 1.0e-04)
-
         with torch.cuda.amp.autocast(enabled=False):
             simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
                 lm=lm.float(),
@@ -177,194 +176,174 @@ class Transducer(nn.Module):
                 reduction="sum",
                 return_grad=True,
             )
+        # if compress
+        """
+        if False: #self.compress_time_axis:
+            boundary_half = boundary.clone()
+            boundary_half[:, -1] = boundary[:, -1] // 2
+            print(boundary_half)
+            #sys.exit(3)
+            with torch.cuda.amp.autocast(enabled=False):
+              simple_loss_half, (px_grad_half, py_grad_half) = k2.rnnt_loss_smoothed(
+                  lm=lm.float(),
+                  am=am_half.float(),
+                  symbols=y_padded,
+                  termination_symbol=blank_id,
+                  lm_only_scale=lm_scale,
+                  am_only_scale=am_scale,
+                  boundary=boundary_half,
+                  reduction="sum",
+                  return_grad=True,
+              )
+        """
 
         if d_verbose: print("px_grad.shape: " + str(px_grad.shape))
         if d_verbose: print("py_grad.shape: " + str(py_grad.shape))
+        if d_verbose: print("boundary: " + str(boundary))
+        if d_verbose: print("prune_rage: " + str(prune_range))
         # ranges : [B, T, prune_range]
-        ranges = k2.get_rnnt_prune_ranges(
+
+        """
+        ranges = k2.get_topk_rnnt_prune_ranges(
             px_grad=px_grad,
             py_grad=py_grad,
             boundary=boundary,
             s_range=prune_range,
+            k=1,
         )
+
+        """
+        ranges = k2.get_topk_rnnt_prune_ranges(
+            px_grad=px_grad,
+            py_grad=py_grad,
+            boundary=boundary,
+            s_range=prune_range,
+            k=1,
+        )
+
+        #even_row = torch.arange(start=0, end=ranges.shape[1], step=2)
+        """
+        if self.compress_time_axis:
+            ranges_half = k2.get_rnnt_prune_ranges(
+              px_grad=px_grad_half,
+              py_grad=py_grad_half,
+              boundary=boundary_half,
+              s_range=prune_range,
+          )
+
+        """
 
         # am_pruned : [B, T, prune_range, encoder_dim]
         # lm_pruned : [B, T, prune_range, decoder_dim]
+
+        #even_row_eo = torch.arange(start=0, end=self.joiner.encoder_proj(encoder_out).shape[1], step=2)
+        """
         am_pruned, lm_pruned = k2.do_rnnt_pruning(
-            am=self.joiner.encoder_proj(encoder_out),
+            am=self.joiner.encoder_proj(encoder_out)[:, even_row_eo],
             lm=self.joiner.decoder_proj(decoder_out),
-            ranges=ranges,
+            ranges=ranges[:, even_row],
         )
-
-        if d_verbose: print("am_pruned.shape: " + str(am_pruned.shape))
-        if d_verbose: print("lm_pruned.shape: " + str(lm_pruned.shape))
-        if d_verbose: print("ranges.shape: " + str(ranges.shape))
-
-        def _compress_with_maxpool(am_pruned, lm_pruned, ranges, boundary):
-            assert am_pruned.shape[1] == lm_pruned.shape[1]
-            assert am_pruned.shape[1] == ranges.shape[1]
-            max_t = am_pruned.shape[1]
-            #reshape (B, T, S, C) -> (B, C, S, T)
-            am_pruned_transposed = am_pruned.permute(0, 3, 2, 1)
-            lm_pruned_transposed = lm_pruned.permute(0, 3, 2, 1)
-            ranges_transposed = ranges.permute(0, 2, 1)
-
-            size = 2
-            am0 = am_pruned_transposed.shape[0]
-            am1 = am_pruned_transposed.shape[1]
-            am2 = am_pruned_transposed.shape[2]
-            am3 = am_pruned_transposed.shape[3] // size
-            lm0 = lm_pruned_transposed.shape[0]
-            lm1 = lm_pruned_transposed.shape[1]
-            lm2 = lm_pruned_transposed.shape[2]
-            lm3 = lm_pruned_transposed.shape[3] // size
-            ra0 = ranges_transposed.shape[0]
-            ra1 = ranges_transposed.shape[1]
-            ra2 = ranges_transposed.shape[2] // size
-
-
-            am_pruned_result = torch.randn((am0, am1, am2, am3), dtype=am_pruned_transposed.dtype)
-            lm_pruned_result = torch.randn((am0, am1, am2, am3), dtype=lm_pruned_transposed.dtype)
-            ranges_result = torch.randn((ra0, ra1, ra2), dtype=torch.float)
-            for b in range(0, am0):
-                am_pruned_result[b] = self.compress_layer(am_pruned_transposed[b])
-                lm_pruned_result[b] = self.compress_layer(lm_pruned_transposed[b])
-                ranges_result[b] = self.compress_layer(ranges_transposed[b].type(torch.float))
-
-            #reshape (B, C, S, T) -> (B, T, S, C)
-            am_pruned_result = am_pruned_result.permute(0, 3, 2, 1)
-            lm_pruned_result = lm_pruned_result.permute(0, 3, 2, 1)
-            ranges_result = ranges_result.permute(0, 2, 1)
-            ranges_result = ranges_result.type(ranges_transposed.dtype)
-
-            #change boundary
-            gap_t = max_t - am_pruned_result.shape[1]
-            boundary_result = boundary.clone()
-            boundary_result[:, -1] = boundary_result[:, -1] - gap_t
-
-            #device
-            am_pruned_result = am_pruned_result.to(am_pruned.device)
-            lm_pruned_result = lm_pruned_result.to(lm_pruned.device)
-            ranges_result = ranges_result.to(ranges.device)
-            ranges_result = k2.get_rnnt_prune_ranges(
-                                px_grad=am_pruned_result,
-                                py_grad=lm_pruned_result,
-                                boundary=boundary_result,
-                                s_range=prune_range,
-                                )
-            return am_pruned_result, lm_pruned_result, ranges_result, boundary_result
         """
-        def _compress_am_and_lm(am_pruned, lm_pruned, ranges, boundary):
-            import random
-            section_size = 4
-            assert am_pruned.shape[1] == lm_pruned.shape[1]
-            assert am_pruned.shape[1] == ranges.shape[1]
-            #logits_result = torch.zeros(1, 1)
-            #ranges_result = torch.zeors(1, 1)
-            max_t = am_pruned.shape[1]
-            for i in range(0, am_pruned.shape[1], section_size):
-                am_pruned_section = am_pruned[:, i:i+section_size, :]
-                lm_pruned_section = lm_pruned[:, i:i+section_size, :]
-                ranges_section = ranges[:, i:i+section_size, :]
-                rand_idx = random.randint(i, i+section_size-1)
-                am_pruned_section = torch.cat((am_pruned_section[:, :rand_idx-i], am_pruned_section[:, rand_idx+1-i:]), dim=1)
-                lm_pruned_section = torch.cat((lm_pruned_section[:, :rand_idx-i], lm_pruned_section[:, rand_idx+1-i:]), dim=1)
-                ranges_section = torch.cat((ranges_section[:, :rand_idx-i], ranges_section[:, rand_idx+1-i:]), dim=1)
-                if i == 0:
-                    am_pruned_result = am_pruned_section
-                    lm_pruned_result = lm_pruned_section
-                    ranges_result = ranges_section
-                else:
-                    am_pruned_result = torch.cat((am_pruned_result, am_pruned_section), dim=1)
-                    lm_pruned_result = torch.cat((lm_pruned_result, lm_pruned_section), dim=1)
-                    ranges_result = torch.cat((ranges_result, ranges_section), dim=1)
+        pruned_loss_list = list()
+        for k in range(0, 1):
+            print("GARBAGE: " + str(k))
+            k_range = ranges[:, k, :, :]
+            am_pruned, lm_pruned = k2.do_rnnt_pruning(
+                am=self.joiner.encoder_proj(encoder_out),
+                lm=self.joiner.decoder_proj(decoder_out),
+                ranges=k_range,
+            )
 
-            gap_t = max_t - am_pruned_result.shape[1]
-            boundary_result = boundary.clone()
-            boundary_result[:, -1] = boundary_result[:, -1] - gap_t
-            return am_pruned_result, lm_pruned_result, ranges_result, boundary_result
-        """
+            #print(self.joiner.encoder_proj(encoder_out).shape)
+            #print(am_pruned.shape)
+            #if self.compress_time_axis:
+            #    am_pruned_half, lm_pruned_half = k2.do_rnnt_pruning(
+            #      am=self.joiner.encoder_proj(encoder_out_half),
+            #      lm=self.joiner.decoder_proj(decoder_out),
+            #      ranges=ranges_half,
+            #    )
 
-        # logits : [B, T, prune_range, vocab_size]
-        # project_input=False since we applied the decoder's input projections
-        # prior to do_rnnt_pruning (this is an optimization for speed).
-        if compress_time_axis is False:
+            if d_verbose: print("am_pruned.shape: " + str(am_pruned.shape))
+            if d_verbose: print("lm_pruned.shape: " + str(lm_pruned.shape))
+            if d_verbose: print("ranges.shape: " + str(ranges.shape))
+
+            # logits : [B, T, prune_range, vocab_size]
+            # project_input=False since we applied the decoder's input projections
+            # prior to do_rnnt_pruning (this is an optimization for speed).
+            #if self.compress_time_axis:
+            #    logits_half = self.joiner(am_pruned_half, lm_pruned_half, project_input=False)
+            #    logits = logits_half
+            #else:
             logits = self.joiner(am_pruned, lm_pruned, project_input=False)
-        else:
-            c_am_pruned, c_lm_pruned, c_ranges, c_boundary = _compress_with_maxpool(am_pruned, lm_pruned, ranges, boundary)
-            logits = self.joiner(c_am_pruned, c_lm_pruned, project_input=False)
-            c_logits = logits
-        if d_verbose:print("logits.shape: " + str(logits.shape))
-        if compress_time_axis is False:
-            if d_verbose: print(boundary)
-            #start = time.time()
+            if d_verbose: print("logits.shape: " + str(logits.shape))
+
+            #print("logits.shape: " + str(logits.shape))
+            #print(logits)
+            #logits_half = torch.randn((logits.shape[0], logits.shape[1]//2, logits.shape[2], logits.shape[-1]))
+            #logits_half = self.compress_layer(logits[0].permute(-1, 1, 0))
+            #logits_half = logits_half.permute(-1, 1, 0)
+            #print(logits_half)
+            #for i in torch.arange(start=0, end=logits.shape[0]):
+            #    logits_half[i] = self.compress_layer(logits[i].permute(-1, 1, 0)).permute(-1, 1, 0)
+            #print("logits_half.shape: " + str(logits_half.shape))
+            #print(logits_half)
+            #print(y_padded)
+            #print(boundary)
+            #boundary_half = boundary.clone()
+            #print(boundary_half[:, -1])
+            #boundary_half[:, -1] = boundary[:, -1]//2
+            #print(boundary_half)
+            #print(ranges.shape)
+            #ranges_half = self.compress_layer(ranges.to(torch.float).permute(0, -1, 1)).permute(0, -1, 1).to(torch.int64)
+            #print(ranges.dtype)
+            #print(ranges[1][:10])
+            #print(ranges_half[1][:10])
+
+            #ranges_test = ranges[:, even_row]
+            #with torch.cuda.amp.autocast(enabled=False):
+            #    pruned_loss = k2.rnnt_loss_pruned(
+            #        logits=logits_half.float(),
+            #        symbols=y_padded,
+            #        ranges=ranges_half,
+            #        termination_symbol=blank_id,
+            #        boundary=boundary_half,
+            #        reduction="sum",
+            #    )
+
             with torch.cuda.amp.autocast(enabled=False):
                 pruned_loss = k2.rnnt_loss_pruned(
                     logits=logits.float(),
                     symbols=y_padded,
-                    ranges=ranges,
+                    ranges=k_range,
                     termination_symbol=blank_id,
                     boundary=boundary,
                     reduction="sum",
                 )
-            #self.timer = self.timer + (time.time() - start )
-        else:
-            if d_verbose:
-                print("Before compressing")
-                print("compress_time_axis: " + str(compress_time_axis))
-                print("logits.shape: " + str(logits.shape))
-                print("y_padded.shape: " + str(y_padded.shape))
-                print("ranges.shape: " + str(c_ranges.shape))
-                print("boundary.shape: " + str(boundary.shape))
-                print("After compressing")
+            print("pruned_loss: " + str(pruned_loss))
+            pruned_loss_list.append(pruned_loss)
 
-            def _compress_time(logits, ranges, boundary):
-                section_size = 10
-                assert logits.shape[1] == ranges.shape[1]
-                #logits_result = torch.zeros(1, 1)
-                #ranges_result = torch.zeors(1, 1)
-                max_t = logits.shape[1]
-                for i in range(0, logits.shape[1], section_size):
-                    logits_section = logits[:, i:i+section_size, :]
-                    ranges_section = ranges[:, i:i+section_size, :]
-                    rand_idx = random.randint(i, i+section_size-1)
-                    logits_section = torch.cat((logits_section[:, :rand_idx-i], logits_section[:, rand_idx+1-i:]), dim=1)
-                    ranges_section = torch.cat((ranges_section[:, :rand_idx-i], ranges_section[:, rand_idx+1-i:]), dim=1)
-                    if i == 0:
-                        logits_result = logits_section
-                        ranges_result = ranges_section
-                    else:
-                        logits_result = torch.cat((logits_result, logits_section), dim=1)
-                        ranges_result = torch.cat((ranges_result, ranges_section), dim=1)
-
-                gap_t = max_t - logits_result.shape[1]
-                boundary_result = boundary.clone()
-                boundary_result[:, -1] = boundary_result[:, -1] - gap_t
-                return logits_result, ranges_result, boundary_result
-
-            #c_logits, c_ranges, c_boundary = _compress_time(logits, ranges, boundary)
-            if d_verbose:
-                print("compressed_logits.shape: " + str(c_logits.shape))
-                print("compressed_ranges.shape: " + str(c_ranges.shape))
-                print(ranges[0])
-                print(ranges[0].shape)
-                print(c_ranges[0])
-                print(c_ranges[0].shape)
-                print(y_padded)
-                print(y_padded.shape)
-            with torch.cuda.amp.autocast(enabled=False):
-                pruned_loss = k2.rnnt_loss_pruned(
-                    logits=c_logits.float(),
-                    symbols=y_padded,
-                    ranges=c_ranges,
-                    termination_symbol=blank_id,
-                    boundary=c_boundary,
-                    reduction="sum",
-                )
+        #if self.compress_time_axis:
+        #    with torch.cuda.amp.autocast(enabled=False):
+        #        pruned_loss_half = k2.rnnt_loss_pruned(
+        #            logits=logits_half.float(),
+        #            symbols=y_padded,
+        #            ranges=ranges_half,
+        #            termination_symbol=blank_id,
+        #            boundary=boundary_half,
+        #            reduction="sum",
+        #        )
+        #    print(ranges)
+        #    print(ranges.shape)
+        #    print(ranges_half)
+        #    print(ranges_half.shape)
 
         if compress_verbose is True:
-            limit = 2
+            limit = 5
             self.inner_cnt = self.inner_cnt + 1
             if self.inner_cnt >= limit:
                 sys.exit(3)
+        print("simple_loss: " + str(simple_loss))
+        pruned_loss = sum(pruned_loss_list)/len(pruned_loss_list)
+        print("averaged pruned loss: " + str(pruned_loss))
+        #print("simple_loss_half: " + str(pruned_loss_half))
         return (simple_loss, pruned_loss)
