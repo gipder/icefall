@@ -149,6 +149,7 @@ from beam_search import (
     fast_beam_search_nbest_oracle,
     fast_beam_search_one_best,
     fast_beam_search_with_nbest_rescoring,
+    fast_beam_search_with_nbest_llm_rescoring,
     greedy_search,
     greedy_search_batch,
     modified_beam_search,
@@ -173,6 +174,8 @@ from icefall.utils import (
     str2bool,
     write_error_stats,
 )
+
+from my_gpt2 import AutoLMScorer
 
 LOG_EPS = math.log(1e-10)
 
@@ -470,6 +473,8 @@ def decode_one_batch(
 
     encoder_out = encoder_out_ext
     encoder_out_lens = encoder_out_ext_lens
+
+    llm_scorer = AutoLMScorer.from_pretrained("distilgpt2", device=device, batch_size=1)
     """
     # Method 2
     encoder_out_org = torch.zeros(encoder_out.shape).to(device)
@@ -494,8 +499,8 @@ def decode_one_batch(
     #print(encoder_out_lens)
     #print(torch.div(encoder_out_lens, 2).ceil().to(torch.int32))
     hyps = []
-    print("GARBAGE")
-    print(encoder_out.shape)
+    #print("GARBAGE")
+    #print(encoder_out.shape)
     if params.decoding_method == "fast_beam_search":
         hyp_tokens = fast_beam_search_one_best(
             model=model,
@@ -551,6 +556,32 @@ def decode_one_batch(
         )
         for hyp in sp.decode(hyp_tokens):
             hyps.append(hyp.split())
+    elif params.decoding_method == "fast_beam_search_with_nbest_llm_rescoring":
+        import time
+        start = time.time()
+        hyp_tokens = fast_beam_search_with_nbest_llm_rescoring(
+            model=model,
+            decoding_graph=decoding_graph,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens,
+            beam=params.beam,
+            max_states=params.max_states,
+            max_contexts=params.max_contexts,
+            num_paths=params.num_paths,
+            sp=sp,
+            oov_word="<UNK>",
+            use_double_scores=True,
+            nbest_scale=1.0,
+            temperature=1.0,
+            llm_scorer=llm_scorer,
+        )
+        end = time.time()
+        print(f"{end - start: .5f} sec")
+        import sys
+        sys.exit(3)
+        #print(hyp_tokens)
+        for hyp in sp.decode(hyp_tokens):
+            hyps.append(hyp.split())
     elif params.decoding_method == "fast_beam_search_with_nbest_rescoring":
         hyp_tokens = fast_beam_search_with_nbest_rescoring(
             model=model,
@@ -570,7 +601,7 @@ def decode_one_batch(
             nbest_scale=params.nbest_scale,
             temperature=1.0,
         )
-        print(hyp_tokens)
+        #print(hyp_tokens)
         for hyp in sp.decode(hyp_tokens):
             hyps.append(hyp.split())
     elif params.decoding_method == "greedy_search" and params.max_sym_per_frame == 1:
@@ -612,6 +643,17 @@ def decode_one_batch(
         )
         for hyp in sp.decode(hyp_tokens):
             hyps.append(hyp.split())
+    elif params.decoding_method == "modified_beam_search_ngram_rescoring":
+        hyp_tokens = modified_beam_search_ngram_rescoring(
+            model=model,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens,
+            ngram_lm=ngram_lm,
+            ngram_lm_scale=ngram_lm_scale,
+            beam=params.beam_size,
+        )
+        for hyp in sp.decode(hyp_tokens):
+            hyps.append(hyp.split())
     else:
         batch_size = encoder_out.size(0)
 
@@ -648,8 +690,10 @@ def decode_one_batch(
             key += f"nbest_scale_{params.nbest_scale}"
             if "LG" in params.decoding_method:
                 key += f"_ngram_lm_scale_{params.ngram_lm_scale}"
-
-        return {key: hyps}
+        if "llm" in params.decoding_method:
+            return {key: hyps}
+        else:
+            return {key: hyps}
     else:
         return {f"beam_size_{params.beam_size}": hyps}
 
@@ -719,8 +763,6 @@ def decode_dataset(
             ngram_lm_scale=ngram_lm_scale,
             LM=LM,
         )
-        import sys
-        sys.exit(3)
 
         for name, hyps in hyps_dict.items():
             this_batch = []
@@ -797,9 +839,11 @@ def main():
         "fast_beam_search_nbest_LG",
         "fast_beam_search_nbest_oracle",
         "fast_beam_search_with_nbest_rescoring",
+        "fast_beam_search_with_nbest_llm_rescoring",
         "modified_beam_search",
         "modified_beam_search_lm_shallow_fusion",
         "modified_beam_search_LODR",
+        "modified_beam_search_ngram_rescoring",
     )
     params.res_dir = params.exp_dir / params.decoding_method
 
@@ -952,6 +996,7 @@ def main():
             backoff_id=params.backoff_id,
             is_binary=False,
         )
+        print(ngram_lm)
         logging.info(f"num states: {ngram_lm.lm.num_states}")
         ngram_lm_scale = params.ngram_lm_scale
     else:
@@ -960,6 +1005,7 @@ def main():
 
     # only load the neural network LM if doing shallow fusion
     if params.use_shallow_fusion:
+        print("GGGGGG")
         LM = LmScorer(
             lm_type=params.lm_type,
             params=params,
@@ -1022,9 +1068,11 @@ def main():
             test_set_name=test_set,
             results_dict=results_dict,
         )
+        print(f"{test_set} is over")
 
     logging.info("Done!")
 
 
 if __name__ == "__main__":
     main()
+

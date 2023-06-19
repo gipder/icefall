@@ -23,6 +23,7 @@ import k2
 import sentencepiece as spm
 import torch
 from model import Transducer
+from my_gpt2 import AutoLMScorer
 
 from icefall import NgramLm, NgramLmStateCost
 from icefall.decode import Nbest, one_best_decoding
@@ -391,12 +392,12 @@ def fast_beam_search_nbest(
     # at this point, nbest.fsa.scores are all zeros.
 
     nbest = nbest.intersect(lattice)
-    print(nbest.fsa.shape)
+    #print(nbest.fsa.shape)
     # Now nbest.fsa.scores contains acoustic scores
     max_indexes = nbest.tot_scores().argmax()
 
     best_path = k2.index_fsa(nbest.fsa, max_indexes)
-    print(best_path.shape)
+    #print(best_path.shape)
     #import sys
     #sys.exit(3)
     #print(best_path)
@@ -1437,6 +1438,159 @@ def beam_search(
     else:
         return DecodingResults(hyps=[ys], timestamps=[best_hyp.timestamp])
 
+def fast_beam_search_with_nbest_llm_rescoring(
+    model: Transducer,
+    decoding_graph: k2.Fsa,
+    encoder_out: torch.Tensor,
+    encoder_out_lens: torch.Tensor,
+    beam: float,
+    max_states: int,
+    max_contexts: int,
+    num_paths: int,
+    sp: spm.SentencePieceProcessor,
+    oov_word: str = "<UNK>",
+    use_double_scores: bool = True,
+    temperature: float = 1.0,
+    nbest_scale: float = 1.0,
+    return_timestamps: bool = False,
+    top_k: int = 4,
+    llm_scorer: AutoLMScorer = None,
+) -> Dict[str, Union[List[List[int]], DecodingResults]]:
+    """It limits the maximum number of symbols per frame to 1.
+    A lattice is first obtained using fast beam search, num_path are selected
+    and rescored using a given language model. The shortest path within the
+    lattice is used as the final output.
+
+    Args:
+      model:
+        An instance of `Transducer`.
+      decoding_graph:
+        Decoding graph used for decoding, may be a TrivialGraph or a LG.
+      encoder_out:
+        A tensor of shape (N, T, C) from the encoder.
+      encoder_out_lens:
+        A tensor of shape (N,) containing the number of frames in `encoder_out`
+        before padding.
+      beam:
+        Beam value, similar to the beam used in Kaldi.
+      max_states:
+        Max states per stream per frame.
+      max_contexts:
+        Max contexts pre stream per frame.
+      ngram_lm_scale_list:
+        A list of floats representing LM score scales.
+      num_paths:
+        Number of paths to extract from the decoded lattice.
+      G:
+        An FsaVec containing only a single FSA. It is an n-gram LM.
+      sp:
+        The BPE model.
+      word_table:
+        The word symbol table.
+      oov_word:
+        OOV words are replaced with this word.
+      use_double_scores:
+        True to use double precision for computation. False to use
+        single precision.
+      nbest_scale:
+        It's the scale applied to the lattice.scores. A smaller value
+        yields more unique paths.
+      temperature:
+        Softmax temperature.
+      return_timestamps:
+        Whether to return timestamps.
+    Returns:
+      Return the decoded result in a dict, where the key has the form
+      'ngram_lm_scale_xx' and the value is the decoded results
+      optionally with timestamps. `xx` is the ngram LM scale value
+      used during decoding, i.e., 0.1.
+    """
+    lattice = fast_beam_search(
+        model=model,
+        decoding_graph=decoding_graph,
+        encoder_out=encoder_out,
+        encoder_out_lens=encoder_out_lens,
+        beam=beam,
+        max_states=max_states,
+        max_contexts=max_contexts,
+        temperature=temperature,
+    )
+
+    nbest = Nbest.from_lattice(
+        lattice=lattice,
+        num_paths=num_paths,
+        use_double_scores=use_double_scores,
+        nbest_scale=nbest_scale,
+    )
+    # at this point, nbest.fsa.scores are all zeros.
+
+    nbest = nbest.intersect(lattice)
+    nbest_topk = nbest.top_k(top_k)
+    # Now nbest.fsa.scores contains acoustic scores
+
+    am_scores = nbest.tot_scores()
+
+    # Now we need to compute the LM scores of each path.
+    # (1) Get the token IDs of each Path. We assume the decoding_graph
+    # is an acceptor, i.e., lattice is also an acceptor
+    tokens_shape = nbest_topk.fsa.arcs.shape().remove_axis(1)  # [path][arc]
+    #tokens_shape = nbest.fsa.arcs.shape().remove_axis(1)  # [path][arc]
+    #print(nbest.shape)
+    #print(nbest.fsa.shape)
+    tokens = k2.RaggedTensor(tokens_shape, nbest_topk.fsa.labels.contiguous())
+    #tokens = k2.RaggedTensor(tokens_shape, nbest.fsa.labels.contiguous())
+    tokens = tokens.remove_values_leq(0)  # remove -1 and 0
+    #print(tokens.shape)
+    token_list: List[List[int]] = tokens.tolist()
+    #print(token_list)
+    word_list: List[List[str]] = sp.decode(token_list)
+    #print(word_list)
+    word_to_token_dict = dict(zip(word_list, token_list))
+    #print(len(word_list))
+    if llm_scorer is None:
+        return token_list[0:-1:top_k]
+
+    #TOO SLOW
+    import time
+    start = time.time()
+    rescored_list = list()
+    for i in range(0, len(word_list), top_k):
+        max_score = 0
+        max_sent = word_list[i]
+        for sent in word_list[i:i+top_k]:
+            tmp_score = llm_scorer.sentence_score(sent, reduce="mean")
+            if tmp_score > max_score:
+                max_score = tmp_score
+                max_sent = sent
+        #print(max_sent)
+        rescored_list.append(max_sent)
+    end = time.time()
+    print(f"{end - start: .5f} sec in rescoring")
+
+    rescored_token_list = list()
+    for sent in rescored_list:
+        rescored_token_list.append(word_to_token_dict[sent])
+
+    return rescored_token_list
+
+    #return token_list[0:-1:top_k], word_list
+
+    sys.exit(3)
+    assert isinstance(oov_word, str), oov_word
+    assert oov_word in word_table, oov_word
+    oov_word_id = word_table[oov_word]
+
+    word_ids_list: List[List[int]] = []
+
+    for words in word_list:
+        this_word_ids = []
+        for w in words.split():
+            if w in word_table:
+                this_word_ids.append(word_table[w])
+            else:
+                this_word_ids.append(oov_word_id)
+        word_ids_list.append(this_word_ids)
+
 
 def fast_beam_search_with_nbest_rescoring(
     model: Transducer,
@@ -1535,10 +1689,12 @@ def fast_beam_search_with_nbest_rescoring(
     # (1) Get the token IDs of each Path. We assume the decoding_graph
     # is an acceptor, i.e., lattice is also an acceptor
     print("GARBAGE GARBAGE")
-    tokens_shape = nbest_topk.fsa.arcs.shape().remove_axis(1)  # [path][arc]
+    #tokens_shape = nbest_topk.fsa.arcs.shape().remove_axis(1)  # [path][arc]
+    tokens_shape = nbest.fsa.arcs.shape().remove_axis(1)  # [path][arc]
     print(nbest.shape)
     print(nbest.fsa.shape)
-    tokens = k2.RaggedTensor(tokens_shape, nbest_topk.fsa.labels.contiguous())
+    #tokens = k2.RaggedTensor(tokens_shape, nbest_topk.fsa.labels.contiguous())
+    tokens = k2.RaggedTensor(tokens_shape, nbest.fsa.labels.contiguous())
     tokens = tokens.remove_values_leq(0)  # remove -1 and 0
     print(tokens.shape)
     token_list: List[List[int]] = tokens.tolist()
@@ -1576,7 +1732,7 @@ def fast_beam_search_with_nbest_rescoring(
     #print(G.arcs)
     print(b_to_a_map.shape)
     print(word_fsas_with_self_loops.shape)
-
+    """
     rescored_word_fsas = k2.intersect_device(
         a_fsas=G,
         b_fsas=word_fsas_with_self_loops,
@@ -1584,15 +1740,19 @@ def fast_beam_search_with_nbest_rescoring(
         sorted_match_a=True,
         ret_arc_maps=False,
     )
+    """
 
-    rescored_word_fsas = k2.remove_epsilon_self_loops(rescored_word_fsas)
+    ##GARBAGE modified
+    #rescored_word_fsas = k2.remove_epsilon_self_loops(rescored_word_fsas)
+    #rescored_word_fsas = k2.top_sort(k2.connect(rescored_word_fsas))
+    rescored_word_fsas = k2.remove_epsilon_self_loops(word_fsas_with_self_loops)
     rescored_word_fsas = k2.top_sort(k2.connect(rescored_word_fsas))
-    print(rescored_word_fsas[0])
+
+    #print(rescored_word_fsas[0])
     ngram_lm_scores = rescored_word_fsas.get_tot_scores(
         use_double_scores=True,
         log_semiring=False,
     )
-
     ans: Dict[str, Union[List[List[int]], DecodingResults]] = {}
     for s in ngram_lm_scale_list:
         key = f"ngram_lm_scale_{s}"
@@ -1605,8 +1765,10 @@ def fast_beam_search_with_nbest_rescoring(
             ans[key] = get_texts(best_path)
         else:
             ans[key] = get_texts_with_timestamp(best_path)
-
-    return ans
+    print(ans[key])
+    import sys
+    sys.exit(3)
+    return ans[key]
 
 
 def fast_beam_search_with_nbest_rnn_rescoring(
@@ -1963,6 +2125,169 @@ def modified_beam_search_ngram_rescoring(
 
     return ans
 
+def modified_beam_search_rnn_rescoring(
+    model: Transducer,
+    encoder_out: torch.Tensor,
+    encoder_out_lens: torch.Tensor,
+    LM: LmScorer,
+    return_timestamps: bool = False,
+    beam: int = 4,
+    temperature: float = 1.0,
+) -> List[List[int]]:
+    """Beam search in batch mode with --max-sym-per-frame=1 being hardcoded.
+
+    Args:
+      model:
+        The transducer model.
+      encoder_out:
+        Output from the encoder. Its shape is (N, T, C).
+      encoder_out_lens:
+        A 1-D tensor of shape (N,), containing number of valid frames in
+        encoder_out before padding.
+      LM:
+        LmScorer.
+
+      temperature:
+        Softmax temperature.
+    Returns:
+      Return a list-of-list of token IDs. ans[i] is the decoding results
+      for the i-th utterance.
+    """
+    assert encoder_out.ndim == 3, encoder_out.shape
+    assert encoder_out.size(0) >= 1, encoder_out.size(0)
+
+    packed_encoder_out = torch.nn.utils.rnn.pack_padded_sequence(
+        input=encoder_out,
+        lengths=encoder_out_lens.cpu(),
+        batch_first=True,
+        enforce_sorted=False,
+    )
+
+    blank_id = model.decoder.blank_id
+    unk_id = getattr(model, "unk_id", blank_id)
+    context_size = model.decoder.context_size
+    device = next(model.parameters()).device
+    lm_scale = ngram_lm_scale
+
+    batch_size_list = packed_encoder_out.batch_sizes.tolist()
+    N = encoder_out.size(0)
+    assert torch.all(encoder_out_lens > 0), encoder_out_lens
+    assert N == batch_size_list[0], (N, batch_size_list)
+
+    B = [HypothesisList() for _ in range(N)]
+    for i in range(N):
+        B[i].add(
+            Hypothesis(
+                ys=[blank_id] * context_size,
+                log_prob=torch.zeros(1, dtype=torch.float32, device=device),
+                state_cost=NgramLmStateCost(ngram_lm),
+            )
+        )
+
+    encoder_out = model.joiner.encoder_proj(packed_encoder_out.data)
+
+    offset = 0
+    finalized_B = []
+    for batch_size in batch_size_list:
+        start = offset
+        end = offset + batch_size
+        current_encoder_out = encoder_out.data[start:end]
+        current_encoder_out = current_encoder_out.unsqueeze(1).unsqueeze(1)
+        # current_encoder_out's shape is (batch_size, 1, 1, encoder_out_dim)
+        offset = end
+
+        finalized_B = B[batch_size:] + finalized_B
+        B = B[:batch_size]
+
+        hyps_shape = get_hyps_shape(B).to(device)
+
+        A = [list(b) for b in B]
+        B = [HypothesisList() for _ in range(batch_size)]
+
+        ys_log_probs = torch.cat(
+            [
+                hyp.log_prob.reshape(1, 1) + hyp.state_cost.lm_score * lm_scale
+                for hyps in A
+                for hyp in hyps
+            ]
+        )  # (num_hyps, 1)
+
+        decoder_input = torch.tensor(
+            [hyp.ys[-context_size:] for hyps in A for hyp in hyps],
+            device=device,
+            dtype=torch.int64,
+        )  # (num_hyps, context_size)
+
+        decoder_out = model.decoder(decoder_input, need_pad=False).unsqueeze(1)
+        decoder_out = model.joiner.decoder_proj(decoder_out)
+        # decoder_out is of shape (num_hyps, 1, 1, joiner_dim)
+
+        # Note: For torch 1.7.1 and below, it requires a torch.int64 tensor
+        # as index, so we use `to(torch.int64)` below.
+        current_encoder_out = torch.index_select(
+            current_encoder_out,
+            dim=0,
+            index=hyps_shape.row_ids(1).to(torch.int64),
+        )  # (num_hyps, 1, 1, encoder_out_dim)
+
+        logits = model.joiner(
+            current_encoder_out,
+            decoder_out,
+            project_input=False,
+        )  # (num_hyps, 1, 1, vocab_size)
+
+        logits = logits.squeeze(1).squeeze(1)  # (num_hyps, vocab_size)
+
+        log_probs = (logits / temperature).log_softmax(dim=-1)  # (num_hyps, vocab_size)
+
+        log_probs.add_(ys_log_probs)
+        vocab_size = log_probs.size(-1)
+        log_probs = log_probs.reshape(-1)
+
+        row_splits = hyps_shape.row_splits(1) * vocab_size
+        log_probs_shape = k2.ragged.create_ragged_shape2(
+            row_splits=row_splits, cached_tot_size=log_probs.numel()
+        )
+        ragged_log_probs = k2.RaggedTensor(shape=log_probs_shape, value=log_probs)
+
+        for i in range(batch_size):
+            topk_log_probs, topk_indexes = ragged_log_probs[i].topk(beam)
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                topk_hyp_indexes = (topk_indexes // vocab_size).tolist()
+                topk_token_indexes = (topk_indexes % vocab_size).tolist()
+
+            for k in range(len(topk_hyp_indexes)):
+                hyp_idx = topk_hyp_indexes[k]
+                hyp = A[i][hyp_idx]
+
+                new_ys = hyp.ys[:]
+                new_token = topk_token_indexes[k]
+                if new_token not in (blank_id, unk_id):
+                    new_ys.append(new_token)
+                    state_cost = hyp.state_cost.forward_one_step(new_token)
+                else:
+                    state_cost = hyp.state_cost
+
+                # We only keep AM scores in new_hyp.log_prob
+                new_log_prob = topk_log_probs[k] - hyp.state_cost.lm_score * lm_scale
+
+                new_hyp = Hypothesis(
+                    ys=new_ys, log_prob=new_log_prob, state_cost=state_cost
+                )
+                B[i].add(new_hyp)
+
+    B = B + finalized_B
+    best_hyps = [b.get_most_probable(length_norm=True) for b in B]
+
+    sorted_ans = [h.ys[context_size:] for h in best_hyps]
+    ans = []
+    unsorted_indices = packed_encoder_out.unsorted_indices.tolist()
+    for i in range(N):
+        ans.append(sorted_ans[unsorted_indices[i]])
+
+    return ans
 
 def modified_beam_search_LODR(
     model: Transducer,
