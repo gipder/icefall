@@ -90,6 +90,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--num-proj",
+        type=int,
+        default=0,
+        help="Number of additional projection layer from embedding output.",
+    )
+
+    parser.add_argument(
         "--start-epoch",
         type=int,
         default=0,
@@ -150,6 +157,20 @@ def get_parser():
         help="The seed for random generators intended for reproducibility",
     )
 
+    parser.add_argument(
+        "--use-icefall-vocab",
+        type=str2bool,
+        default=False,
+        help="Should various information be logged in tensorboard.",
+    )
+
+    parser.add_argument(
+        "--bpe-model",
+        type=str,
+        default="data/lm_training_bpe_500/bpe.model",
+        help="BPE model for tokenization",
+    )
+
     return parser
 
 
@@ -177,6 +198,7 @@ def get_params() -> AttributeDict:
             #"encoder_dim": 768,
             #"dim_feedforward": 2048,
             #"dropout": 0.1,
+            "num_proj": 0,
             "env_info": get_env_info(),
         }
     )
@@ -513,14 +535,14 @@ def run(rank, world_size, args):
     params = get_params()
     params.update(vars(args))
     is_distributed = world_size > 1
-
+       
     fix_random_seed(params.seed)
     if is_distributed:
         setup_dist(rank, world_size, params.master_port)
 
     setup_logger(f"{params.exp_dir}/log/log-train")
     logging.info("Training started")
-    logging.info(params)
+    #logging.info(params)
 
     if args.tensorboard and rank == 0:
         tb_writer = SummaryWriter(log_dir=f"{params.exp_dir}/tensorboard")
@@ -534,8 +556,15 @@ def run(rank, world_size, args):
     logging.info(f"Device: {device}")
 
     logging.info("About to create model")
-    model = CustomGPT2Model(llm=params.llm)
-    
+    model = CustomGPT2Model(llm=params.llm,
+                            use_icefall_vocab=params.use_icefall_vocab,
+                            params=params,
+                            )
+    if params.use_icefall_vocab:
+        params.sos_id = 1
+        params.eos_id = 1
+        params.vocab_size = model.tokenizer.vocab_size()
+    logging.info(params) 
     model.train()
     
     num_param = sum([p.numel() for p in model.parameters()])
@@ -548,6 +577,11 @@ def run(rank, world_size, args):
         f"{num_param_requires_grad} "
         f"({num_param_requires_grad/num_param*100}%)"
     )
+
+    #parameter_names = [name for name, _ in model.named_parameters()]
+    #print(parameter_names)
+    #import sys
+    #sys.exit()
     checkpoints = load_checkpoint_if_available(params=params, model=model)
 
     model.to(device)
