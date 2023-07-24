@@ -193,3 +193,7 @@ class Transducer(nn.Module):
             )
 
         return (simple_loss, pruned_loss)
+
+    def eval(self, mode:bool=True):
+        for p in self.parameters():
+            p.requires_grad = False

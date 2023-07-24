@@ -144,6 +144,9 @@ class PretrainedDecoder(Decoder):
             Whether to use the icefall vocab.
           params:
             Parameters for the pretrained language model from default parameters.
+          use_embedding:
+            whether to use the embedding layer from the pretrained language model.
+            The default value is False.
         """
         super(Decoder, self).__init__()
 
@@ -159,10 +162,8 @@ class PretrainedDecoder(Decoder):
                                    use_embedding=use_embedding,
                                    )
         self.mid_proj_layer = nn.Linear(decoder_dim, self.plm.config.n_embd)
-        if use_icefall_vocab:
-            assert decoder_dim == self.plm.config.n_embd
 
-        if use_embedding:
+        if not use_embedding:
             conv_input_dim = self.plm.config.n_embd
         else:
             conv_input_dim = decoder_dim
@@ -199,12 +200,12 @@ class PretrainedDecoder(Decoder):
         else:
             embedding_out = self.embedding(y.clamp(min=0)) * (y >= 0).unsqueeze(-1)
 
-        print(f"{embedding_out.shape=}")
+        #print(f"{embedding_out.shape=}")
         # pretrained language model
         embedding_out = self.mid_proj_layer(embedding_out)
-        print(f"after mid_proj_layer: {embedding_out.shape=}")
+        #print(f"after mid_proj_layer: {embedding_out.shape=}")
         embedding_out = self.plm(x=embedding_out)
-        print(f"after plm: {embedding_out.shape=}")
+        #print(f"after plm: {embedding_out.shape=}")
 
         if self.context_size > 1:
             embedding_out = embedding_out.permute(0, 2, 1)
@@ -257,7 +258,7 @@ if __name__ == "__main__":
     params.blank_id = 0
     decoder = PretrainedDecoder(
                 vocab_size=500,
-                decoder_dim=768,
+                decoder_dim=512,
                 blank_id=0,
                 context_size=2,
                 llm_name="gpt2",

@@ -344,6 +344,38 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--llm-name",
+        type=str,
+        default="gpt2",
+        help="name of LLM, gpt2, gpt2-large, and so on",
+        choices=["gpt2", "gpt2-large", "gpt2-xl"],
+    )
+
+    parser.add_argument(
+        "--use-icefall-vocab",
+        type=str2bool,
+        default=True,
+        help="""Use icefall vocab instead of original LLM tokens
+        """,
+    )
+
+    parser.add_argument(
+        "--use-embedding",
+        type=str2bool,
+        default=False,
+        help="""Use LLM embedding layer, default value is False
+        """,
+    )
+
+    parser.add_argument(
+        "--num-proj",
+        type=int,
+        default=2,
+        help="""number of projection layers, default value is 2
+        """,
+    )
+
+    parser.add_argument(
         "--use-shallow-fusion",
         type=str2bool,
         default=False,

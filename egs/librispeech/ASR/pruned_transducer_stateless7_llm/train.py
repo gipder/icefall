@@ -59,7 +59,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 from asr_datamodule import LibriSpeechAsrDataModule
-from decoder import Decoder
+from decoder import Decoder, PretrainedDecoder
 from joiner import Joiner
 from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
@@ -89,6 +89,7 @@ from icefall.utils import (
     setup_logger,
     str2bool,
 )
+
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -355,6 +356,35 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--llm-name",
+        type=str,
+        default="gpt2",
+        help="""The name of the language model. It should be one of GPT2s
+        from huggingface""",
+    )
+
+    parser.add_argument(
+        "--use-icefall-vocab",
+        type=str2bool,
+        default=True,
+        help="""Whether to use icefall vocab. If True, we will use icefall vocab"""
+    )
+
+    parser.add_argument(
+        "--use-embedding",
+        type=str2bool,
+        default=False,
+        help="""Whether to use embedding. If True, we will use embedding"""
+    )
+
+    parser.add_argument(
+        "--num_proj",
+        type=int,
+        default=2,
+        help="""number of proj layers for the fine-tuning of the pretrained model"""
+    )
+
+    parser.add_argument(
         "--average-period",
         type=int,
         default=200,
@@ -441,6 +471,7 @@ def get_params() -> AttributeDict:
             "subsampling_factor": 4,  # not passed in, this is fixed.
             "warm_step": 2000,
             "env_info": get_env_info(),
+            "max_sent_len": 256,
         }
     )
 
@@ -470,11 +501,15 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
 
 
 def get_decoder_model(params: AttributeDict) -> nn.Module:
-    decoder = Decoder(
+    decoder = PretrainedDecoder(
         vocab_size=params.vocab_size,
         decoder_dim=params.decoder_dim,
         blank_id=params.blank_id,
         context_size=params.context_size,
+        llm_name=params.llm_name,
+        use_icefall_vocab=params.use_icefall_vocab,
+        params=params,
+        use_embedding=params.use_embedding,
     )
     return decoder
 
@@ -990,7 +1025,9 @@ def run(rank, world_size, args):
 
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
-
+    model.train()
+    num_param = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logging.info(f"Number of trainable model parameters: {num_param}")
     assert params.save_every_n >= params.average_period
     model_avg: Optional[nn.Module] = None
     if rank == 0:
