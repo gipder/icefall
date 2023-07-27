@@ -360,6 +360,14 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--llm-fine-tuning",
+        type=str2bool,
+        default=False,
+        help="""Use icefall vocab instead of original LLM tokens
+        """,
+    )
+
+    parser.add_argument(
         "--use-embedding",
         type=str2bool,
         default=False,

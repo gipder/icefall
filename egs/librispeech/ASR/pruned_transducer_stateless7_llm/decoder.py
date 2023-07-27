@@ -162,8 +162,18 @@ class PretrainedDecoder(Decoder):
                                    use_embedding=use_embedding,
                                    )
         self.mid_proj_layer = nn.Linear(decoder_dim, self.plm.config.n_embd)
+        self.use_post_proj_layer = False
+        self.num_post_proj_layers = 4
+        if self.use_post_proj_layer:
+            post_proj_layers = []
+            for i in range(self.num_post_proj_layers-1):
+                post_proj_layers.append(nn.Linear(self.plm.config.n_embd, self.plm.config.n_embd))
+            post_proj_layers.append(nn.Linear(self.plm.config.n_embd, decoder_dim))
+            self.post_proj_layer = nn.ModuleList(post_proj_layers)
+        else:
+            self.post_proj_layer = None
 
-        if not use_embedding:
+        if not use_embedding and not self.use_post_proj_layer:
             conv_input_dim = self.plm.config.n_embd
         else:
             conv_input_dim = decoder_dim
@@ -205,6 +215,10 @@ class PretrainedDecoder(Decoder):
         embedding_out = self.mid_proj_layer(embedding_out)
         #print(f"after mid_proj_layer: {embedding_out.shape=}")
         embedding_out = self.plm(x=embedding_out)
+        if self.use_post_proj_layer:
+            for i in range(self.num_post_proj_layers-1):
+                embedding_out = self.post_proj_layer[i](embedding_out)
+            embedding_out = self.post_proj_layer[self.num_post_proj_layers-1](embedding_out)
         #print(f"after plm: {embedding_out.shape=}")
 
         if self.context_size > 1:
@@ -223,11 +237,13 @@ class PretrainedDecoder(Decoder):
     def train(self, mode:bool=True):
         self.plm.train()
         super().train()
-
+    """
     def eval(self, mode:bool=True):
         self.plm.eval()
         for p in self.parameters():
             p.requires_grad = False
+    """
+
 
 if __name__ == "__main__":
     x = torch.randint(0, 500, (1, 10, ))
@@ -246,6 +262,14 @@ if __name__ == "__main__":
     print(f"{x.shape=}")
     print(f"{out.shape=}")
     print("basic Decoder test done")
+    num_param = sum(p.numel() for p in decoder.parameters())
+    print(f"all params: {num_param=}")
+    decoder.train()
+    num_param = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
+    print(f"decoder.train() trainable params: {num_param=}")
+    decoder.eval()
+    num_param = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
+    print(f"decoder.eval() trainable params: {num_param=}")
     print("*" * 80)
 
     params = AttributeDict()
@@ -272,6 +296,7 @@ if __name__ == "__main__":
     print(f"{out=}")
     print(f"{x.shape=}")
     print(f"{out.shape=}")
+    print(f"{decoder.conv.weight.shape=}")
     num_param = sum(p.numel() for p in decoder.parameters())
     print(f"all params: {num_param=}")
     decoder.train()

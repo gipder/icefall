@@ -234,6 +234,32 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--base-model-path",
+        type=str,
+        default=None,
+        help="""Base transducer model. Trained transducer model
+        without LLM. If not specified, it will be None.
+        Or it can be a path to a checkpoint.
+        """,
+    )
+
+    parser.add_argument(
+        "--closed-test",
+        type=str2bool,
+        default=False,
+        help="""If True, train_dl = test_dl
+        """,
+    )
+
+    parser.add_argument(
+        "--llm-fine-tuning",
+        type=str2bool,
+        default=False,
+        help="""If True, train_dl = valid_dl
+        """,
+    )
+
+    parser.add_argument(
         "--exp-dir",
         type=str,
         default="pruned_transducer_stateless7/exp",
@@ -501,16 +527,25 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
 
 
 def get_decoder_model(params: AttributeDict) -> nn.Module:
-    decoder = PretrainedDecoder(
-        vocab_size=params.vocab_size,
-        decoder_dim=params.decoder_dim,
-        blank_id=params.blank_id,
-        context_size=params.context_size,
-        llm_name=params.llm_name,
-        use_icefall_vocab=params.use_icefall_vocab,
-        params=params,
-        use_embedding=params.use_embedding,
-    )
+    if params.llm_fine_tuning is None or not params.llm_fine_tuning:
+        decoder = Decoder(
+            vocab_size=params.vocab_size,
+            decoder_dim=params.decoder_dim,
+            blank_id=params.blank_id,
+            context_size=params.context_size,
+        )
+
+    else:
+        decoder = PretrainedDecoder(
+            vocab_size=params.vocab_size,
+            decoder_dim=params.decoder_dim,
+            blank_id=params.blank_id,
+            context_size=params.context_size,
+            llm_name=params.llm_name,
+            use_icefall_vocab=params.use_icefall_vocab,
+            params=params,
+            use_embedding=params.use_embedding,
+        )
     return decoder
 
 
@@ -1022,6 +1057,10 @@ def run(rank, world_size, args):
 
     logging.info("About to create model")
     model = get_transducer_model(params)
+    basic_model = None
+    if params.llm_fine_tuning:
+        logging.info("Loading trained basic transducer model")
+        basic_model = get_transducer_model(params)
 
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
@@ -1035,9 +1074,19 @@ def run(rank, world_size, args):
         model_avg = copy.deepcopy(model).to(torch.float64)
 
     assert params.start_epoch > 0, params.start_epoch
-    checkpoints = load_checkpoint_if_available(
-        params=params, model=model, model_avg=model_avg
-    )
+    if params.base_model_path is not None:
+        logging.info(f"Loading base model from {params.base_model_path}")
+        checkpoint = torch.load(params.base_model_path, map_location="cpu")
+        #remove decoder weights
+        for key in checkpoint["model"].copy().keys():
+            if key.startswith("decoder"):
+                del checkpoint["model"][key]
+        model.load_state_dict(checkpoint["model"], strict=False)
+        checkpoints = None
+    else:
+        checkpoints = load_checkpoint_if_available(
+            params=params, model=model, model_avg=model_avg
+        )
 
     model.to(device)
     if world_size > 1:
@@ -1084,6 +1133,10 @@ def run(rank, world_size, args):
         train_cuts = librispeech.train_all_shuf_cuts()
     else:
         train_cuts = librispeech.train_clean_100_cuts()
+
+    if params.closed_test:
+        train_cuts = librispeech.test_clean_cuts()
+        train_cuts += librispeech.test_other_cuts()
 
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 20 seconds
@@ -1138,6 +1191,12 @@ def run(rank, world_size, args):
     valid_cuts = librispeech.dev_clean_cuts()
     valid_cuts += librispeech.dev_other_cuts()
     valid_dl = librispeech.valid_dataloaders(valid_cuts)
+
+    if params.llm_fine_tuning and not params.closed_test:
+        # We use the same data loader for training and validation
+        # because we want to use the same batch size for both
+        # training and validation
+        train_dl = valid_dl
 
     if not params.print_diagnostics:
         scan_pessimistic_batches_for_oom(
