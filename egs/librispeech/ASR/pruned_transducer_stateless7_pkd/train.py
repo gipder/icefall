@@ -92,6 +92,26 @@ from icefall.utils import (
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
+def load_teacher_checkpoint(model: Union[nn.Module, DDP], filename: str, strict: bool = False) -> None:
+    """
+    Load the teacher model from a checkpoint.
+    """
+    logging.info(f"Loading checkpoint from {filename}")
+    checkpoint = torch.load(filename, map_location="cpu")
+
+    if next(iter(checkpoint["model"])).startswith("module."):
+        logging.info("Loading checkpoint saved by DDP")
+
+        dst_state_dict = model.state_dict()
+        src_state_dict = checkpoint["model"]
+        for key in dst_state_dict.keys():
+            src_key = "{}.{}".format("module", key)
+            dst_state_dict[key] = src_state_dict.pop(src_key)
+        assert len(src_state_dict) == 0
+        model.load_state_dict(dst_state_dict, strict=strict)
+    else:
+        model.load_state_dict(checkpoint["model"], strict=strict)
+
 
 def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
     if isinstance(model, DDP):
@@ -374,6 +394,55 @@ def get_parser():
         help="Whether to use half precision training.",
     )
 
+    parser.add_argument(
+        "--use-pkd",
+        type=str2bool,
+        default=False,
+        help="Whether to use knowledge distillation.",
+    )
+
+    parser.add_argument(
+        "--pkd-loss-scale",
+        type=float,
+        default=0.5,
+        help="The scalefor pruned knowledge distillation loss.",
+    )
+
+    parser.add_argument(
+        "--teacher-checkpoint",
+        type=str,
+        default="",
+        help="The checkpoint of teacher model for knowledge distillation.",
+    )
+
+    parser.add_argument(
+        "--teacher-num-encoder-layers",
+        type=str,
+        default="",
+        help="The number of encoder layers of teacher model for knowledge distillation.",
+    )
+
+    parser.add_argument(
+        "--teacher-feedforward-dims",
+        type=str,
+        default="",
+        help="The feedforward dimensions of teacher model for knowledge distillation.",
+    )
+
+    parser.add_argument(
+        "--teacher-nhead",
+        type=str,
+        default="",
+        help="The number of attention heads of teacher model for knowledge distillation.",
+    )
+
+    parser.add_argument(
+        "--teacher-encoder-dims",
+        type=str,
+        default="",
+        help="The encoder dimensions of teacher model for knowledge distillation.",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -631,6 +700,7 @@ def compute_loss(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
+    teacher_model: Optional[nn.Module] = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute transducer loss given the model and its inputs.
@@ -677,16 +747,42 @@ def compute_loss(
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
+    if params.use_pkd and teacher_model is not None:
+        if isinstance(teacher_model, DDP):
+            teacher_model = teacher_model.module
+        with torch.no_grad():
+            teacher_ranges, teacher_logits = teacher_model.get_ranges_and_logits(
+                x=feature,
+                x_lens=feature_lens,
+                y=y,
+                prune_range=params.prune_range,
+                am_scale=params.am_scale,
+                lm_scale=params.lm_scale,
+            )
+        use_pkd = True
+    else:
+        teacher_ranges = None
+        teacher_logits = None
+        use_pkd = False
+
     with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss = model(
+        simple_loss = pruned_loss = pkd_loss = torch.tensor(0.0, device=device)
+        if use_pkd:
+            ret = (simple_loss, pruned_loss, pkd_loss)
+        else:
+            ret = (simple_loss, pruned_loss)
+        #simple_loss, pruned_loss, pkd_loss = model(
+        ret = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
             prune_range=params.prune_range,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
+            use_pkd=use_pkd,
+            teacher_ranges=teacher_ranges,
+            teacher_logits=teacher_logits,
         )
-
         s = params.simple_loss_scale
         # take down the scale on the simple loss from 1.0 at the start
         # to params.simple_loss scale by warm_step.
@@ -701,7 +797,12 @@ def compute_loss(
             else 0.1 + 0.9 * (batch_idx_train / warm_step)
         )
 
-        loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
+        pkd_loss_scale = params.pkd_loss_scale
+        simple_loss = ret[0]
+        pruned_loss = ret[1]
+        if use_pkd:
+            pkd_loss = ret[2]
+        loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss + pkd_loss_scale * pkd_loss
 
     assert loss.requires_grad == is_training
 
@@ -714,6 +815,8 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
+    if params.use_pkd:
+        info["pkd_loss"] = pkd_loss.detach().cpu().item()
 
     return loss, info
 
@@ -765,6 +868,7 @@ def train_one_epoch(
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
+    teacher_model: Optional[nn.Module] = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -819,6 +923,7 @@ def train_one_epoch(
                     sp=sp,
                     batch=batch,
                     is_training=True,
+                    teacher_model=teacher_model,
                 )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
@@ -991,6 +1096,24 @@ def run(rank, world_size, args):
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
 
+    # load the model from checkpoint if available
+    teacher_model = None
+    if params.use_pkd:
+        teacher_params = copy.deepcopy(params)
+        teacher_params.num_encoder_layers = params.teacher_num_encoder_layers
+        teacher_params.feedforward_dims = params.teacher_feedforward_dims
+        teacher_params.nhead = params.teacher_nhead
+        teacher_params.encoder_dims = params.teacher_encoder_dims
+        teacher_model = get_transducer_model(teacher_params)
+        load_teacher_checkpoint(teacher_model, params.teacher_checkpoint)
+
+        assert teacher_model is not None
+        teacher_model.to(device)
+        teacher_model.eval()
+        logging.info("Teacher model loaded")
+        num_param = sum([p.numel() for p in teacher_model.parameters()])
+        logging.info(f"Number of teacher model parameters: {num_param}")
+
     assert params.save_every_n >= params.average_period
     model_avg: Optional[nn.Module] = None
     if rank == 0:
@@ -1006,6 +1129,8 @@ def run(rank, world_size, args):
     if world_size > 1:
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+        if params.use_pkd:
+            teacher_model = DDP(teacher_model, device_ids=[rank])
 
     parameters_names = []
     parameters_names.append(
@@ -1139,6 +1264,7 @@ def run(rank, world_size, args):
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,
+            teacher_model=teacher_model,
         )
 
         if params.print_diagnostics:
