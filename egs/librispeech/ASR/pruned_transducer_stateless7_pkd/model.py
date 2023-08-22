@@ -84,6 +84,7 @@ class Transducer(nn.Module):
         use_pkd: bool = False,
         teacher_ranges: torch.Tensor = None,
         teacher_logits: torch.Tensor = None,
+        use_efficient: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -199,10 +200,30 @@ class Transducer(nn.Module):
                 boundary=boundary,
                 reduction="sum",
             )
+
+        if use_efficient:
+            """
+            Efficient loss computation
+            It would be impossible to get efficient tensors in pruned_loss
+            """
+            print(f"{logits.shape=}")
+            print(f"{teacher_logits.shape=}")
+            print(f"{y=}")
+            print(f"{torch.gather(logits, 3, y[-1].to(torch.int64))=}")
+
         if use_pkd:
             pkd_loss = self.pkd_criterion(F.log_softmax(logits, dim=-1), F.softmax(teacher_logits, dim=-1))
 
         return (simple_loss, pruned_loss) if not use_pkd else (simple_loss, pruned_loss, pkd_loss)
+
+    """
+    def compact_logits(
+        self,
+        logits: torch.Tensor,
+        y: k2.RaggedTensor,
+    ) -> torch.Tensor:
+        pass
+    """
 
     def get_ranges_and_logits(
         self,
@@ -268,7 +289,11 @@ class Transducer(nn.Module):
 
         lm = self.simple_lm_proj(decoder_out)
         am = self.simple_am_proj(encoder_out)
-
+        #print(f"{am.shape=}")
+        #print(f"{encoder_out.shape=}")
+        #print(f"{lm.shape=}")
+        #print(f"{decoder_out.shape=}")
+        #with torch.cuda.amp.autocast(enabled=False):
         with torch.no_grad():
             simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
                 lm=lm.float(),
@@ -307,6 +332,41 @@ class Transducer(nn.Module):
         ranges.requires_grad_(False)
         logits = logits.detach_()
         return (ranges, logits)
+
+    def reset_simple_layer(self):
+        self.simple_lm_proj.reset_parameters()
+        self.simple_am_proj.reset_parameters()
+
+    def get_enc_and_dec_ouput(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        y: k2.RaggedTensor
+    ):
+        assert x.ndim == 3, x.shape
+        assert x_lens.ndim == 1, x_lens.shape
+        assert y.num_axes == 2, y.num_axes
+
+        assert x.size(0) == x_lens.size(0) == y.dim0
+
+        encoder_out, x_lens = self.encoder(x, x_lens)
+        assert torch.all(x_lens > 0)
+
+        # Now for the decoder, i.e., the prediction network
+        # row_splits = y.shape.row_splits(1)
+        # y_lens = row_splits[1:] - row_splits[:-1]
+
+        blank_id = self.decoder.blank_id
+        sos_y = add_sos(y, sos_id=blank_id)
+
+        # sos_y_padded: [B, S + 1], start with SOS.
+        sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
+
+        # decoder_out: [B, S + 1, decoder_dim]
+        decoder_out = self.decoder(sos_y_padded)
+
+        return (encoder_out, decoder_out)
+
 
 # This main is for testing purpose
 if __name__ == "__main__":
@@ -349,9 +409,10 @@ if __name__ == "__main__":
     print(f"{y=}")
     model.eval()
     ranges, teacher_logits = model.get_ranges_and_logits(x, x_lens, y, prune_range=5)
+    print(f"{ranges=}")
     print(f"{ranges.shape=}")
     print(f"{teacher_logits.shape=}")
-
+    print(f"{model.simple_am_proj=}")
     # for student model
     params2 = get_params()
     params2.vocab_size = 500
@@ -385,25 +446,10 @@ if __name__ == "__main__":
                                                                 lm_scale=0.5,
                                                                 use_pkd=True,
                                                                 teacher_ranges=ranges,
-                                                                teacher_logits=teacher_logits,)
+                                                                teacher_logits=teacher_logits,
+                                                                use_efficient=True,)
 
     print(f"{student_simple_loss=}")
     print(f"{student_pruned_loss=}")
     print(f"{pkd_loss=}")
-
-    #criterion = nn.KLDivLoss(reduction='batchmean')
-
-    #distill_loss = criterion(F.log_softmax(student_logits, dim=-1), F.softmax(logits, dim=-1))
-    #print(f"{distill_loss=}")
-    """
-    Args:
-        x:
-            A 3-D tensor of shape (N, T, C).
-        x_lens:
-            A 1-D tensor of shape (N,). It contains the number of frames in `x`
-            before padding.
-        y:
-            A ragged tensor with 2 axes [utt][label]. It contains labels of each
-            utterance.
-    """
 

@@ -443,6 +443,13 @@ def get_parser():
         help="The encoder dimensions of teacher model for knowledge distillation.",
     )
 
+    parser.add_argument(
+        "--use-reset-simple-layer",
+        type=str2bool,
+        default=False,
+        help="Whether to reset simple layers.",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -1110,6 +1117,10 @@ def run(rank, world_size, args):
         assert teacher_model is not None
         teacher_model.to(device)
         teacher_model.eval()
+
+        if params.use_reset_simple_layer:
+            teacher_model.reset_simple_layer()
+            logging.info("Resetting simple layer in teacher model")
         logging.info("Teacher model loaded")
         num_param = sum([p.numel() for p in teacher_model.parameters()])
         logging.info(f"Number of teacher model parameters: {num_param}")
