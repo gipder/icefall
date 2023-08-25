@@ -707,7 +707,7 @@ def compute_loss(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
-    teacher_model: Optional[nn.Module] = None,
+    teacher_model: Optional[Union[nn.Module, DDP]] = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute transducer loss given the model and its inputs.

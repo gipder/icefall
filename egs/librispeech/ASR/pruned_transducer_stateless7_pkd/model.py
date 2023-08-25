@@ -391,7 +391,8 @@ if __name__ == "__main__":
     params.decoder_dim = 512
     params.joiner_dim = 512
     print(f"{params=}")
-    device = torch.device("cuda", 0)
+    #device = torch.device("cuda", 0)
+    device = torch.device("cpu")
     print(f"{device=}")
 
     model = get_transducer_model(params)
@@ -429,7 +430,8 @@ if __name__ == "__main__":
     params2.decoder_dim = 512
     params2.joiner_dim = 512
     print(f"{params2=}")
-    device = torch.device("cuda", 0)
+    #device = torch.device("cuda", 0)
+    device = torch.device("cpu")
     print(f"{device=}")
 
     smodel = get_transducer_model(params2)
