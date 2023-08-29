@@ -549,6 +549,16 @@ def decode_one_batch(
         )
         for hyp in sp.decode(hyp_tokens):
             hyps.append(hyp.split())
+    elif params.decoding_method == "ctc-decoding":
+        logits = model.ctc_layer(encoder_out)
+        predicted_ids = torch.argmax(logits, dim=-1)
+        hyps_list = []
+        for i in range(predicted_ids.shape[0]):
+            tmp_predicted_ids = torch.unique_consecutive(predicted_ids[i, :])
+            tmp_predicted_ids = tmp_predicted_ids[tmp_predicted_ids != 0].cpu().detach()
+            hyps_list.append(tmp_predicted_ids.tolist())
+        for hyp in sp.decode(hyps_list):
+            hyps.append(hyp.split())
     else:
         batch_size = encoder_out.size(0)
 
@@ -734,6 +744,7 @@ def main():
         "modified_beam_search",
         "modified_beam_search_lm_shallow_fusion",
         "modified_beam_search_LODR",
+        "ctc-decoding"
     )
     params.res_dir = params.exp_dir / params.decoding_method
 

@@ -450,6 +450,27 @@ def get_parser():
         help="Whether to reset simple layers.",
     )
 
+    parser.add_argument(
+        "--use-ctc",
+        type=str2bool,
+        default=False,
+        help="Whether to use ctc layers.",
+    )
+
+    parser.add_argument(
+        "--use-teacher-ctc-alignment",
+        type=str2bool,
+        default=False,
+        help="Whether to use teacher ctc alignment.",
+    )
+
+    parser.add_argument(
+        "--pkd-range",
+        type=int,
+        default=1,
+        help="The prune range for pkd loss when using teacher ctc alignment.",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -754,30 +775,52 @@ def compute_loss(
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
+    if isinstance(teacher_model, DDP):
+        teacher_model = teacher_model.module
+
     if params.use_pkd and teacher_model is not None:
-        if isinstance(teacher_model, DDP):
-            teacher_model = teacher_model.module
         with torch.no_grad():
-            teacher_ranges, teacher_logits = teacher_model.get_ranges_and_logits(
-                x=feature,
-                x_lens=feature_lens,
-                y=y,
-                prune_range=params.prune_range,
-                am_scale=params.am_scale,
-                lm_scale=params.lm_scale,
-            )
+            if not params.use_teacher_ctc_alignment:
+                teacher_ranges, teacher_logits = teacher_model.get_ranges_and_logits(
+                    x=feature,
+                    x_lens=feature_lens,
+                    y=y,
+                    prune_range=params.prune_range,
+                    am_scale=params.am_scale,
+                    lm_scale=params.lm_scale,
+                )
+            else:
+                teacher_ranges, teacher_logits = teacher_model.forced_alignment(
+                    x=feature,
+                    x_lens=feature_lens,
+                    y=y,
+                )
+                # print(f"{teacher_ranges.shape}, {teacher_logits.shape}")
         use_pkd = True
+        if params.use_teacher_ctc_alignment:
+            use_teacher_ctc_alignment = True
+        else:
+            use_teacher_ctc_alignment = False
     else:
         teacher_ranges = None
         teacher_logits = None
         use_pkd = False
+        use_teacher_ctc_alignment = False
+
+    if params.use_ctc:
+        use_ctc = True
+    else:
+        use_ctc = False
 
     with torch.set_grad_enabled(is_training):
-        simple_loss = pruned_loss = pkd_loss = torch.tensor(0.0, device=device)
+        simple_loss = pruned_loss = pkd_loss = ctc_loss = torch.tensor(0.0, device=device)
+        """
+        # It doesn't need
         if use_pkd:
             ret = (simple_loss, pruned_loss, pkd_loss)
         else:
             ret = (simple_loss, pruned_loss)
+        """
         #simple_loss, pruned_loss, pkd_loss = model(
         ret = model(
             x=feature,
@@ -789,6 +832,8 @@ def compute_loss(
             use_pkd=use_pkd,
             teacher_ranges=teacher_ranges,
             teacher_logits=teacher_logits,
+            use_ctc=use_ctc,
+            use_teacher_ctc_alignment=use_teacher_ctc_alignment,
         )
         s = params.simple_loss_scale
         # take down the scale on the simple loss from 1.0 at the start
@@ -804,12 +849,17 @@ def compute_loss(
             else 0.1 + 0.9 * (batch_idx_train / warm_step)
         )
 
-        pkd_loss_scale = params.pkd_loss_scale
+        pkd_loss_scale = ctc_loss_scale = params.pkd_loss_scale
         simple_loss = ret[0]
         pruned_loss = ret[1]
         if use_pkd:
             pkd_loss = ret[2]
-        loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss + pkd_loss_scale * pkd_loss
+        if use_ctc:
+            ctc_loss = ret[-1]
+        loss = simple_loss_scale * simple_loss + \
+            pruned_loss_scale * pruned_loss + \
+            pkd_loss_scale * pkd_loss + \
+            ctc_loss_scale * ctc_loss
 
     assert loss.requires_grad == is_training
 
@@ -824,7 +874,8 @@ def compute_loss(
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
     if params.use_pkd:
         info["pkd_loss"] = pkd_loss.detach().cpu().item()
-
+    if params.use_ctc:
+        info["ctc_loss"] = ctc_loss.detach().cpu().item()
     return loss, info
 
 
@@ -1124,6 +1175,10 @@ def run(rank, world_size, args):
         logging.info("Teacher model loaded")
         num_param = sum([p.numel() for p in teacher_model.parameters()])
         logging.info(f"Number of teacher model parameters: {num_param}")
+
+    if params.use_ctc:
+        model.set_ctc_loss(reduction="sum", zero_infinity=True, blank=params.blank_id)
+        logging.info("Using CTC loss")
 
     assert params.save_every_n >= params.average_period
     model_avg: Optional[nn.Module] = None
