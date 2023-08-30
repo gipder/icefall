@@ -88,7 +88,8 @@ class Transducer(nn.Module):
         teacher_logits: torch.Tensor = None,
         use_ctc: bool = False,
         use_teacher_ctc_alignment: bool = False,
-
+        use_efficient: bool = False,
+        use_time_compression: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -224,11 +225,67 @@ class Transducer(nn.Module):
 
             logits = self.joiner(am_pruned, lm_pruned, project_input=False)
 
-
         if use_pkd:
-            #print(f"{logits.shape=}")
-            #print(f"{teacher_logits.shape=}")
-            pkd_loss = self.pkd_criterion(F.log_softmax(logits, dim=-1), F.softmax(teacher_logits, dim=-1))
+            if use_efficient:
+                #print(f"{logits.shape=}")
+                #print(f"{teacher_logits.shape=}")
+                #print(f"{ranges.shape=}")
+                idx = torch.zeros_like(ranges)
+                for b in range(ranges.shape[0]):
+                    for i in range(ranges.shape[1]):
+                        for j in range(ranges.shape[-1]):
+                            idx[b, i, j] = sos_y_padded[b, ranges[b, i, j]]
+                #print(f"{sos_y_padded[0]=}")
+                #print(f"{idx[0]=}")
+                logits = torch.softmax(logits, dim=-1)
+                teacher_logits = torch.softmax(teacher_logits, dim=-1)
+                idx = idx.unsqueeze(-1)
+                zidx = torch.zeros_like(idx, dtype=torch.int64)
+                py_logits = torch.gather(logits, dim=-1, index=idx)
+                py_teacher_logits = torch.gather(teacher_logits, dim=-1, index=idx)
+                pblank_logits = torch.gather(logits, dim=-1, index=zidx)
+                pblank_teacher_logits = torch.gather(teacher_logits, dim=-1, index=zidx)
+                prem_logits = torch.ones(py_logits.shape, device=x.device) - py_logits - pblank_logits
+                prem_teacher_logits = torch.ones(py_teacher_logits.shape, device=x.device) - py_teacher_logits - pblank_teacher_logits
+
+                # for prevent nan
+                eps = 1e-10
+                student = torch.cat([prem_logits, py_logits, pblank_logits], dim=-1)
+                student = torch.clamp(student, eps, 1.0)
+                student = student.log()
+                teacher = torch.cat([prem_teacher_logits, py_teacher_logits, pblank_teacher_logits], dim=-1)
+                #print(f"{py_logits.shape=}")
+                #print(f"{py_teacher_logits.shape=}")
+                #print(f"{pblank_logits.shape=}")
+                #print(f"{pblank_teacher_logits.shape=}")
+                #print(f"{prem_logits[0]=}")
+                #print(f"{prem_teacher_logits[0]=}")
+                #print(f"{py_logits[0, 0]=}")
+                #print(f"{pblank_logits[0, 0]=}")
+                #print(f"{prem_logits[0, 0]=}")
+                #print(f"{student.shape=}")
+                #print(f"{student[0,0]=}")
+                #print(f"{teacher.shape=}")
+            elif use_time_compression:
+                threshold = 0.9
+                student = F.log_softmax(logits, dim=-1)
+                teacher = F.softmax(teacher_logits, dim=-1)
+                blank_prob = teacher[:, :, :, blank_id]
+                mask = blank_prob > threshold
+                print(f"{mask.shape=}")
+                print(f"{mask.unsqueeze(-1)=}")
+                reduced_teacher = torch.masked_select(teacher, mask.unsqueeze(-1))
+                reduced_student = torch.masked_select(student, mask.unsqueeze(-1))
+                reduced_teacher = reduced_teacher.view(teacher.shape[0], -1, teacher.shape[-2], teacher.shape[-1])
+                reduced_student = reduced_student.view(student.shape[0], -1, student.shape[-2], student.shape[-1])
+                print(f"{reduced_teacher.shape=}")
+                print(f"{reduced_student.shape=}")
+            else:
+                student = F.log_softmax(logits, dim=-1)
+                teacher = F.softmax(teacher_logits, dim=-1)
+            # print(f"{student[0, 0]=}")
+            # print(f"{teacher[0, 0]=}")
+            pkd_loss = self.pkd_criterion(student, teacher)
 
         if use_ctc:
             # print(f"{y_padded=}")
@@ -829,6 +886,7 @@ if __name__ == "__main__":
     # tmp_predicted_ids = torch.unique_consecutive(predicted_ids[i, :])
 
     print("*" * 100)
+    print("Test use_efficient: p_y, p_blank, p_remainder")
 
     for idx, batch in enumerate(test_clean_dl):
         feature = batch["inputs"].to(device)
@@ -837,10 +895,10 @@ if __name__ == "__main__":
         encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
         y = sp.encode(supervisions["text"], out_type=int)
         y = k2.RaggedTensor(y).to(device)
-        ctc_ranges, ctc_logits = model.forced_alignment(feature, feature_lens, y)
-        #ranges, teacher_logits = model.get_ranges_and_logits(x=feature, x_lens=feature_lens, y, prune_range=5)
-        print(f"{ctc_ranges.shape=}")
-        print(f"{ctc_logits.shape=}")
+        #ranges, logits = model.forced_alignment(feature, feature_lens, y)
+        ranges, logits = model.get_ranges_and_logits(x=feature, x_lens=feature_lens, y=y, prune_range=5)
+        print(f"{ranges.shape=}")
+        print(f"{logits.shape=}")
 
         student_simple_loss, student_pruned_loss, pkd_loss, ctc_loss = smodel(
             x=feature,
@@ -850,11 +908,39 @@ if __name__ == "__main__":
             am_scale=0.5,
             lm_scale=0.5,
             use_pkd=True,
-            teacher_ranges=ctc_ranges,
-            teacher_logits=ctc_logits,
+            teacher_ranges=ranges,
+            teacher_logits=logits,
             use_ctc=True,
-            use_teacher_ctc_alignment=True,
+            use_teacher_ctc_alignment=False,
+            use_efficient=True,
         )
 
+        break
+
+    print("*" * 100)
+    print("Test compress_time_axis")
+    for idx, batch in enumerate(test_clean_dl):
+        feature = batch["inputs"].to(device)
+        supervisions = batch["supervisions"]
+        feature_lens = supervisions["num_frames"].to(device)
+        encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
+        y = sp.encode(supervisions["text"], out_type=int)
+        y = k2.RaggedTensor(y).to(device)
+        ranges, logits = model.get_ranges_and_logits(x=feature, x_lens=feature_lens, y=y, prune_range=5)
+        student_simple_loss, student_pruned_loss, pkd_loss, ctc_loss = smodel(
+            x=feature,
+            x_lens=feature_lens,
+            y=y,
+            prune_range=5,
+            am_scale=0.5,
+            lm_scale=0.5,
+            use_pkd=True,
+            teacher_ranges=ranges,
+            teacher_logits=logits,
+            use_ctc=True,
+            use_teacher_ctc_alignment=False,
+            use_efficient=False,
+            use_time_compression=True,
+        )
         break
 

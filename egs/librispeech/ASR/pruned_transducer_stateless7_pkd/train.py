@@ -465,6 +465,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--use-efficient",
+        type=str2bool,
+        default=False,
+        help="Whether to use p_y, p_blank, p_rem for KD",
+    )
+
+    parser.add_argument(
         "--pkd-range",
         type=int,
         default=1,
@@ -801,11 +808,17 @@ def compute_loss(
             use_teacher_ctc_alignment = True
         else:
             use_teacher_ctc_alignment = False
+
+        if params.use_efficient:
+            use_efficient = True
+        else:
+            use_efficient = False
     else:
         teacher_ranges = None
         teacher_logits = None
         use_pkd = False
         use_teacher_ctc_alignment = False
+        use_efficient = False
 
     if params.use_ctc:
         use_ctc = True
@@ -834,6 +847,7 @@ def compute_loss(
             teacher_logits=teacher_logits,
             use_ctc=use_ctc,
             use_teacher_ctc_alignment=use_teacher_ctc_alignment,
+            use_efficient=use_efficient,
         )
         s = params.simple_loss_scale
         # take down the scale on the simple loss from 1.0 at the start
