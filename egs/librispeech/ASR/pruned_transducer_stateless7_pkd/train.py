@@ -478,6 +478,20 @@ def get_parser():
         help="The prune range for pkd loss when using teacher ctc alignment.",
     )
 
+    parser.add_argument(
+        "--use-time-compression",
+        type=str2bool,
+        default=False,
+        help="Whether to use time compression",
+    )
+
+    parser.add_argument(
+        "--time-compression-threshold",
+        type=float,
+        default=0.95,
+        help="The threshold when using time compression",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -788,14 +802,25 @@ def compute_loss(
     if params.use_pkd and teacher_model is not None:
         with torch.no_grad():
             if not params.use_teacher_ctc_alignment:
+                if params.use_time_compression:
+                    compressed_ranges, compressed_logits, compressed_masks = teacher_model.get_ranges_and_logits_with_time_compression(
+                        x=feature,
+                        x_lens=feature_lens,
+                        y=y,
+                        prune_range=params.prune_range,
+                        am_scale=params.am_scale,
+                        lm_scale=params.lm_scale,
+                        threshold=params.time_compression_threshold,
+                    )
+
                 teacher_ranges, teacher_logits = teacher_model.get_ranges_and_logits(
-                    x=feature,
-                    x_lens=feature_lens,
-                    y=y,
-                    prune_range=params.prune_range,
-                    am_scale=params.am_scale,
-                    lm_scale=params.lm_scale,
-                )
+                        x=feature,
+                        x_lens=feature_lens,
+                        y=y,
+                        prune_range=params.prune_range,
+                        am_scale=params.am_scale,
+                        lm_scale=params.lm_scale,
+                    )
             else:
                 teacher_ranges, teacher_logits = teacher_model.forced_alignment(
                     x=feature,
@@ -813,12 +838,25 @@ def compute_loss(
             use_efficient = True
         else:
             use_efficient = False
+
+        if params.use_time_compression:
+            use_time_compression = True
+        else:
+            use_time_compression = False
+            compressed_ranges = None
+            compressed_logits = None
+            compressed_masks = None
     else:
         teacher_ranges = None
         teacher_logits = None
+        teacher_masks = None
         use_pkd = False
         use_teacher_ctc_alignment = False
         use_efficient = False
+        use_time_compression = False
+        compressed_ranges = None
+        compressed_logits = None
+        compressed_masks = None
 
     if params.use_ctc:
         use_ctc = True
@@ -833,7 +871,11 @@ def compute_loss(
             ret = (simple_loss, pruned_loss, pkd_loss)
         else:
             ret = (simple_loss, pruned_loss)
+
         """
+        #if use_pkd and teacher_logits is not None:
+        #    print(f"{teacher_logits.shape=}")
+        #    print(f"{compressed_logits.shape=}")
         #simple_loss, pruned_loss, pkd_loss = model(
         ret = model(
             x=feature,
@@ -848,6 +890,10 @@ def compute_loss(
             use_ctc=use_ctc,
             use_teacher_ctc_alignment=use_teacher_ctc_alignment,
             use_efficient=use_efficient,
+            use_time_compression=use_time_compression,
+            compressed_teacher_ranges=compressed_ranges,
+            compressed_teacher_logits=compressed_logits,
+            compressed_teacher_masks=compressed_masks,
         )
         s = params.simple_loss_scale
         # take down the scale on the simple loss from 1.0 at the start
