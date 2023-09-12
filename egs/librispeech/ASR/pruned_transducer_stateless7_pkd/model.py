@@ -77,27 +77,50 @@ class Transducer(nn.Module):
         self.ctc_layer = nn.Linear(encoder_dim, vocab_size)
         self.ctc_criterion = None
 
+    """
+    OLD one
     def forward(
         self,
-        x: torch.Tensor,
-        x_lens: torch.Tensor,
+        x: torch.tensor,
+        x_lens: torch.tensor,
+        y: k2.raggedtensor,
+        prune_range: int = 5,
+        am_scale: float = 0.0,
+        lm_scale: float = 0.0,
+        use_pkd: bool = false,
+        teacher_ranges: torch.tensor = none,
+        teacher_logits: torch.tensor = none,
+        use_ctc: bool = false,
+        use_teacher_ctc_alignment: bool = false,
+        use_efficient: bool = false,
+        use_time_compression: bool = false,
+        compressed_teacher_ranges: torch.tensor = none,
+        compressed_teacher_logits: torch.tensor = none,
+        compressed_teacher_masks: torch.tensor = none,
+        use_teacher_simple_proj: bool = false,
+        teacher_model: nn.module = none,
+    ) -> torch.tensor:
+    """
+    def forward(
+        self,
+        x: torch.tensor,
+        x_lens: torch.tensor,
         y: k2.RaggedTensor,
         prune_range: int = 5,
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
         use_pkd: bool = False,
-        teacher_ranges: torch.Tensor = None,
-        teacher_logits: torch.Tensor = None,
+        teacher_ranges: torch.tensor = None,
+        teacher_logits: torch.tensor = None,
         use_ctc: bool = False,
-        use_teacher_ctc_alignment: bool = False,
-        use_efficient: bool = False,
-        use_time_compression: bool = False,
-        compressed_teacher_ranges: torch.Tensor = None,
-        compressed_teacher_logits: torch.Tensor = None,
-        compressed_teacher_masks: torch.Tensor = None,
         use_teacher_simple_proj: bool = False,
         teacher_model: nn.Module = None,
-    ) -> torch.Tensor:
+        use_time_compression: bool = False,
+        teacher_compressed_ranges: torch.tensor = None,
+        teacher_compressed_logits: torch.tensor = None,
+        teacher_compressed_masks: torch.tensor = None,
+        use_efficient: bool = False,
+    ) -> torch.tensor:
         """
         Args:
           x:
@@ -132,9 +155,10 @@ class Transducer(nn.Module):
 
         assert x.size(0) == x_lens.size(0) == y.dim0
 
-        encoder_out, x_lens = self.encoder(x, x_lens)
         if use_teacher_simple_proj:
-            teacher_encoder_out, teacher_x_lens = teacher_model.encoder(x, x_lens)
+            teacher_x_lens = x_lens
+        # getting student encoder output and length
+        encoder_out, x_lens = self.encoder(x, x_lens)
         assert torch.all(x_lens > 0)
 
         # Now for the decoder, i.e., the prediction network
@@ -148,8 +172,6 @@ class Transducer(nn.Module):
         sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
 
         # decoder_out: [B, S + 1, decoder_dim]
-        if use_teacher_simple_proj:
-            teacher_decoder_out = teacher_model.decoder(sos_y_padded)
         decoder_out = self.decoder(sos_y_padded)
 
         # Note: y does not start with SOS
@@ -163,6 +185,12 @@ class Transducer(nn.Module):
 
         # teacher simple loss
         if use_teacher_simple_proj:
+            with torch.no_grad():
+                teacher_encoder_out, teacher_x_lens = teacher_model.encoder(x, teacher_x_lens)
+                teacher_decoder_out = teacher_model.decoder(sos_y_padded)
+
+            assert self.teacher_simple_am_proj is not None
+            assert self.teacher_simple_lm_proj is not None
             teacher_am = self.teacher_simple_am_proj(teacher_encoder_out)
             teacher_lm = self.teacher_simple_lm_proj(teacher_decoder_out)
             with torch.cuda.amp.autocast(enabled=False):
@@ -199,20 +227,8 @@ class Transducer(nn.Module):
                 return_grad=True,
             )
 
-        if use_pkd and not use_teacher_ctc_alignment and not use_teacher_simple_proj:
-            # when using teacher CTC alignment,
-            # the teacher_ranges from outside of this forward function
-            # the logits can be calculated using the teacher_ranges (CTC alignment)
-            # This means that
+        if use_pkd:
             ranges = teacher_ranges
-        elif use_pkd and use_teacher_simple_proj:
-            assert use_pkd and use_teacher_simple_proj
-            ranges = k2.get_rnnt_prune_ranges(
-                px_grad=teacher_px_grad,
-                py_grad=teacher_py_grad,
-                boundary=boundary,
-                s_range=prune_range,
-            )
         else:
             # ranges : [B, T, prune_range]
             ranges = k2.get_rnnt_prune_ranges(
@@ -245,6 +261,7 @@ class Transducer(nn.Module):
                 reduction="sum",
             )
 
+        """
         # for getting student ctc logits
         if use_teacher_ctc_alignment:
             am_pruned, lm_pruned = k2.do_rnnt_pruning(
@@ -254,10 +271,21 @@ class Transducer(nn.Module):
             )
 
             logits = self.joiner(am_pruned, lm_pruned, project_input=False)
-
+        """
 
         if use_pkd:
+            if use_time_compression:
+                assert teacher_compressed_masks is not None
+                compressed_encoder_out, compressed_x_lens = compress_time(encoder_out, x_lens, teacher_compressed_masks)
+                am_pruned, lm_pruned = k2.do_rnnt_pruning(
+                    am=self.joiner.encoder_proj(compressed_encoder_out),
+                    lm=self.joiner.decoder_proj(decoder_out),
+                    ranges=teacher_compressed_ranges,
+                )
+                logits = self.joiner(am_pruned, lm_pruned, project_input=False)
+                teacher_logits = teacher_compressed_logits
 
+            """
             if use_teacher_simple_proj:
                 am_pruned, lm_pruned = k2.do_rnnt_pruning(
                     am=teacher_model.joiner.encoder_proj(encoder_out),
@@ -334,10 +362,11 @@ class Transducer(nn.Module):
                 #print(f"{student[0,0]=}")
                 #print(f"{teacher.shape=}")
             else:
-                student = F.log_softmax(logits, dim=-1)
-                teacher = F.softmax(teacher_logits, dim=-1)
-            # print(f"{student[0, 0]=}")
-            # print(f"{teacher[0, 0]=}")
+            """
+            student = F.log_softmax(logits, dim=-1)
+            teacher = F.softmax(teacher_logits, dim=-1)
+            print(f"{student.shape=}")
+            print(f"{teacher.shape=}")
             pkd_loss = self.pkd_criterion(student, teacher)
 
         if use_ctc:
@@ -352,6 +381,8 @@ class Transducer(nn.Module):
             ret += (pkd_loss,)
         if use_ctc:
             ret += (ctc_loss,)
+        if use_teacher_simple_proj:
+            ret += (teacher_simple_loss,)
 
         return ret
 
@@ -447,8 +478,13 @@ class Transducer(nn.Module):
         prune_range: int = 5,
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
+        use_teacher_ctc_alignment: bool = False,
+        use_efficient: bool = False,
+        use_time_compression: bool = False,
+        compression_threshold: float = 0.95,
     ) -> torch.Tensor:
         """
+        this function works in teacher model when use_pkd is True
         Args:
           x:
             A 3-D tensor of shape (N, T, C).
@@ -461,8 +497,22 @@ class Transducer(nn.Module):
           prune_range:
             The prune range for rnnt loss, it means how many symbols(context)
             we are considering for each frame to compute the loss.
+          am_scale:
+            The weight for am probs
+          lm_scale:
+            The weight for lm probs
+          use_teacher_ctc_alignment:
+            If True, use teacher ctc alignment to get the pruned range
+          use_efficient:
+            If True, compress the logits for RNN-T from K-dims to 3-dims
+            The 3-dims consists of Prob of y, Prob. of blank, and Prob. of others
+            The Prob. of others can be calculated as 1 - Prob. of y - Prob. of blank
+          use_time_compression:
+            If True, compress the logits in time-axis by ignoring the t-th frame
+            when the probability of blank is higher than a threshold
+
         Returns:
-          Return Tensor (the pruned range and logits)
+          Return Tensor (the pruned range, logits, compressed length)
 
         Note:
            Regarding am_scale & lm_scale, it will make the loss-function one of
@@ -503,31 +553,69 @@ class Transducer(nn.Module):
 
         lm = self.simple_lm_proj(decoder_out)
         am = self.simple_am_proj(encoder_out)
-        #print(f"{am.shape=}")
-        #print(f"{encoder_out.shape=}")
-        #print(f"{lm.shape=}")
-        #print(f"{decoder_out.shape=}")
-        #with torch.cuda.amp.autocast(enabled=False):
-        with torch.no_grad():
-            simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
-                lm=lm.float(),
-                am=am.float(),
-                symbols=y_padded,
-                termination_symbol=blank_id,
-                lm_only_scale=lm_scale,
-                am_only_scale=am_scale,
-                boundary=boundary,
-                reduction="sum",
-                return_grad=True,
+
+        if use_teacher_ctc_alignment:
+            assert self.ctc_layer is not None
+            ctc_logits = self.ctc_layer(encoder_out)
+            ctc_logits = F.log_softmax(ctc_logits, dim=-1)
+            emission = ctc_logits
+
+            ctc_ranges = torch.zeros(
+                emission.shape[0], emission.shape[1],
+                dtype=torch.int32, device=emission.device
             )
 
-        # ranges : [B, T, prune_range]
-        ranges = k2.get_rnnt_prune_ranges(
-            px_grad=px_grad,
-            py_grad=py_grad,
-            boundary=boundary,
-            s_range=prune_range,
-        )
+            # get forced alignment results from CTC model
+            with torch.no_grad():
+                for i in range(0, emission.shape[0]):
+                    trellis = get_trellis(emission[i].cpu(), y.tolist()[i], self.decoder.blank_id)
+                    path = backtrack(trellis, emission[i].cpu(), y.tolist()[i], self.decoder.blank_id)
+                    fpath, mpath = get_alignment(path, emission[i].cpu(), y.tolist()[i], self.decoder.blank_id)
+                    ctc_ranges[i] = torch.tensor(fpath, dtype=torch.int32, device=emission.device)
+                    ctc_ranges[i, x_lens[i]:] = self.decoder.blank_id
+
+            ctc_ranges = ctc_ranges.to(torch.int32)
+            # something to do with ctc_range
+            # ctc_range : from [B, T, 1] to [B, T, prune_range]
+            ranges = torch.zeros((ctc_ranges.size(0), ctc_ranges.size(-1), prune_range),
+                                dtype=torch.int64, device=ctc_ranges.device)
+
+            idx = ctc_ranges + prune_range - 1 >= y_lens.unsqueeze(-1)
+            # change the first idx to fit the boundary
+            for i in range(0, idx.size(0)):
+                ctc_ranges[i, idx[i]] = y_lens[i] - ( prune_range - 1 )
+            ranges[:, :, 0] = ctc_ranges
+            for i in range(1, prune_range):
+                ranges[:, :, i] = ranges[:, :, i-1] + 1
+
+            # padding beyound x_lens with max values
+            idx = torch.argmax(ranges[:, :, 0], dim=-1)
+            padding_values = ranges[range(ranges.size(0)), idx, :]
+
+            # TODO: optimization
+            for i in range(0, idx.size(0)):
+                ranges[i, idx[i]:] = padding_values[i]
+        else:
+            with torch.no_grad():
+                simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
+                    lm=lm.float(),
+                    am=am.float(),
+                    symbols=y_padded,
+                    termination_symbol=blank_id,
+                    lm_only_scale=lm_scale,
+                    am_only_scale=am_scale,
+                    boundary=boundary,
+                    reduction="sum",
+                    return_grad=True,
+                )
+
+            # ranges : [B, T, prune_range]
+            ranges = k2.get_rnnt_prune_ranges(
+                px_grad=px_grad,
+                py_grad=py_grad,
+                boundary=boundary,
+                s_range=prune_range,
+            )
 
         # am_pruned : [B, T, prune_range, encoder_dim]
         # lm_pruned : [B, T, prune_range, decoder_dim]
@@ -545,7 +633,54 @@ class Transducer(nn.Module):
 
         ranges.requires_grad_(False)
         logits = logits.detach_()
-        return (ranges, logits)
+
+        masks = None
+
+        ret = (ranges, logits)
+        if use_time_compression:
+            tc_logits = self.ctc_layer(encoder_out)
+            tc_emission = F.softmax(tc_logits, dim=-1)
+            compressed_masks = tc_emission[:, :, blank_id] < compression_threshold
+            tc_encoder_out, tc_x_lens = compress_time(encoder_out, x_lens, compressed_masks)
+            tc_boundary = boundary
+            tc_boundary[:, 3] = tc_x_lens
+            tc_lm = self.simple_lm_proj(decoder_out)
+            tc_am = self.simple_am_proj(tc_encoder_out)
+
+            with torch.no_grad():
+                simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
+                    lm=tc_lm.float(),
+                    am=tc_am.float(),
+                    symbols=y_padded,
+                    termination_symbol=blank_id,
+                    lm_only_scale=lm_scale,
+                    am_only_scale=am_scale,
+                    boundary=tc_boundary,
+                    reduction="sum",
+                    return_grad=True,
+                )
+
+            # ranges : [B, T, prune_range]
+            compressed_ranges = k2.get_rnnt_prune_ranges(
+                px_grad=px_grad,
+                py_grad=py_grad,
+                boundary=tc_boundary,
+                s_range=prune_range,
+            )
+
+            # am_pruned : [B, T, prune_range, encoder_dim]
+            # lm_pruned : [B, T, prune_range, decoder_dim]
+            tc_am_pruned, tc_lm_pruned = k2.do_rnnt_pruning(
+                am=self.joiner.encoder_proj(tc_encoder_out),
+                lm=self.joiner.decoder_proj(decoder_out),
+                ranges=compressed_ranges,
+            )
+
+            compressed_logits = self.joiner(tc_am_pruned, tc_lm_pruned, project_input=False)
+
+            ret += (compressed_ranges, compressed_logits, compressed_masks)
+
+        return ret
 
     def get_ranges_and_logits_with_time_compression(
         self,
@@ -777,13 +912,26 @@ def backtrack(trellis, emission, tokens, blank_id=0):
         raise ValueError("Failed to align")
     return path[::-1]
 
+def get_prune_ranges_from_ctc_alignment(ctc_ranges, prune_range):
+    # TODO
+    # should be more shopisticated in the future
+    # from ctc_ranges: [B, T, 1]
+    # to ctc_ranges: [B, T, prune_range]
+    B = ctc_ranges.size(0)
+    T = ctc_ranges.size(1)
+    R = prune_range
+    ranges = torch.zeros((B, T, R), dtype=torch.int64, device=ctc_ranges.device)
+    # filtering ctc_ranges
+    ranges[:, :, 0] = ctc_ranges
+
+    pass
+
 def compress_time(emission, emission_lens, mask):
     B = emission.size(0)
     T = emission.size(1)
     dim = emission.size(-1)
     assert mask.ndim == 2
     assert mask.size(0) == B
-
     max_value = float('-inf')
     length = list()
     for b in range(B):
@@ -1089,9 +1237,23 @@ if __name__ == "__main__":
         y = sp.encode(supervisions["text"], out_type=int)
         y = k2.RaggedTensor(y).to(device)
         #ranges, logits = model.forced_alignment(feature, feature_lens, y)
-        ranges, logits = model.get_ranges_and_logits(x=feature, x_lens=feature_lens, y=y, prune_range=5)
+        #ranges, logits, masks = model.get_ranges_and_logits(x=feature, x_lens=feature_lens, y=y, prune_range=5,
+        ret = model.get_ranges_and_logits(x=feature, x_lens=feature_lens, y=y, prune_range=5,
+                                                     am_scale=0.5, lm_scale=0.5, use_teacher_ctc_alignment=True,
+                                                     use_efficient=False, use_time_compression=True)
+        use_time_compression = True
+        if use_time_compression:
+            teacher_ranges = ret[0]
+            teacher_logits = ret[1]
+            compressed_ranges = ret[2]
+            compressed_logits = ret[3]
+            compressed_masks = ret[-1]
         print(f"{ranges.shape=}")
         print(f"{logits.shape=}")
+        print(f"{compressed_ranges.shape=}")
+        print(f"{compressed_ranges=}")
+        print(f"{y=}")
+        print(f"{compressed_logits.shape=}")
 
         student_simple_loss, student_pruned_loss, pkd_loss, ctc_loss = smodel(
             x=feature,
@@ -1101,11 +1263,16 @@ if __name__ == "__main__":
             am_scale=0.5,
             lm_scale=0.5,
             use_pkd=True,
-            teacher_ranges=ranges,
-            teacher_logits=logits,
+            teacher_ranges=teacher_ranges,
+            teacher_logits=teacher_logits,
             use_ctc=True,
-            use_teacher_ctc_alignment=False,
-            use_efficient=True,
+            use_teacher_simple_proj=False,
+            teacher_model=model,
+            use_time_compression=True,
+            teacher_compressed_ranges=compressed_ranges,
+            teacher_compressed_logits=compressed_logits,
+            teacher_compressed_masks=compressed_masks,
+            use_efficient=False,
         )
 
         break
@@ -1135,12 +1302,13 @@ if __name__ == "__main__":
             teacher_ranges=ranges,
             teacher_logits=logits,
             use_ctc=True,
-            use_teacher_ctc_alignment=False,
-            use_efficient=False,
+            use_teacher_simple_proj=False,
+            teacher_model=model,
             use_time_compression=True,
-            compressed_teacher_ranges=ct_ranges,
-            compressed_teacher_logits=ct_logits,
-            compressed_teacher_masks=ct_masks,
+            teacher_compressed_ranges=ct_ranges,
+            teacher_compressed_logits=ct_logits,
+            teacher_compressed_masks=ct_masks,
+            use_efficient=True,
         )
         break
 
