@@ -1,4 +1,4 @@
-# Copyright    2021  Xiaomi Corp.        (authors: Fangjun Kuang)
+# Copyright    2021  Xiaomi Corp.        (authors: Fangjun Kuang, Wei Kang)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -13,18 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Note we use `rnnt_loss` from torchaudio, which exists only in
-torchaudio >= v0.10.0. It also means you have to use torch >= v1.10.0
-"""
 
+
+import random
 
 import k2
 import torch
 import torch.nn as nn
 import torchaudio
-import torchaudio.functional
 from encoder_interface import EncoderInterface
+from scaling import penalize_abs_values_gt
 
 from icefall.utils import add_sos
 
@@ -39,21 +37,25 @@ class Transducer(nn.Module):
         encoder: EncoderInterface,
         decoder: nn.Module,
         joiner: nn.Module,
+        encoder_dim: int,
+        decoder_dim: int,
+        joiner_dim: int,
+        vocab_size: int,
     ):
         """
         Args:
           encoder:
             It is the transcription network in the paper. Its accepts
-            two inputs: `x` of (N, T, C) and `x_lens` of shape (N,).
-            It returns two tensors: `logits` of shape (N, T, C) and
+            two inputs: `x` of (N, T, encoder_dim) and `x_lens` of shape (N,).
+            It returns two tensors: `logits` of shape (N, T, encoder_dm) and
             `logit_lens` of shape (N,).
           decoder:
             It is the prediction network in the paper. Its input shape
-            is (N, U) and its output shape is (N, U, C). It should contain
-            one attribute: `blank_id`.
+            is (N, U) and its output shape is (N, U, decoder_dim).
+            It should contain one attribute: `blank_id`.
           joiner:
-            It has two inputs with shapes: (N, T, C) and (N, U, C). Its
-            output shape is (N, T, U, C). Note that its output contains
+            It has two inputs with shapes: (N, T, encoder_dim) and (N, U, decoder_dim).
+            Its output shape is (N, T, U, vocab_size). Note that its output contains
             unnormalized probs, i.e., not processed by log-softmax.
         """
         super().__init__()
@@ -63,6 +65,13 @@ class Transducer(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.joiner = joiner
+        """
+        self.simple_am_proj = nn.Linear(
+            encoder_dim,
+            vocab_size,
+        )
+        self.simple_lm_proj = nn.Linear(decoder_dim, vocab_size)
+        """
 
     def forward(
         self,
@@ -82,6 +91,12 @@ class Transducer(nn.Module):
             utterance.
         Returns:
           Return the transducer loss.
+
+        Note:
+           Regarding am_scale & lm_scale, it will make the loss-function one of
+           the form:
+              lm_scale * lm_probs + am_scale * am_probs +
+              (1-lm_scale-am_scale) * combined_probs
         """
         assert x.ndim == 3, x.shape
         assert x_lens.ndim == 1, x_lens.shape
@@ -99,22 +114,26 @@ class Transducer(nn.Module):
         blank_id = self.decoder.blank_id
         sos_y = add_sos(y, sos_id=blank_id)
 
+        # sos_y_padded: [B, S + 1], start with SOS.
         sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
         sos_y_padded = sos_y_padded.to(torch.int64)
 
+        # decoder_out: [B, S + 1, decoder_dim]
         decoder_out = self.decoder(sos_y_padded)
 
-        print(f"{encoder_out.shape=}")
-        print(f"{decoder_out.shape=}")
+        encoder_out = self.joiner.encoder_proj(encoder_out)
+        decoder_out = self.joiner.decoder_proj(decoder_out)
 
+        #print(f"{encoder_out.shape=}")
+        #print(f"{decoder_out.shape=}")
         logits = self.joiner(
             encoder_out=encoder_out,
             decoder_out=decoder_out,
+            project_input=False,
         )
-        import sys
-        sys.exit(0)
-        # rnnt_loss requires 0 padded targets
+
         # Note: y does not start with SOS
+        # y_padded : [B, S]
         y_padded = y.pad(mode="constant", padding_value=0)
 
         assert hasattr(torchaudio.functional, "rnnt_loss"), (

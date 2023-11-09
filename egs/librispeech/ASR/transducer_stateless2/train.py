@@ -643,7 +643,7 @@ def run(rank, world_size, args):
     train_cuts = train_cuts.filter(remove_short_and_long_utt)
 
     try:
-        num_left = len(train_cuts)
+        num_left = len(train_cuts.to_eager())
         num_removed = num_in_total - num_left
         removed_percent = num_removed / num_in_total * 100
 

@@ -57,6 +57,9 @@ class Joiner(nn.Module):
 
         encoder_out = encoder_out.unsqueeze(2)  # (N, T, 1, C)
         decoder_out = decoder_out.unsqueeze(1)  # (N, 1, U, C)
+        print(f"Inside Joiner.forward")
+        print(f"{encoder_out.shape=}")
+        print(f"{decoder_out.shape=}")
         x = encoder_out + decoder_out  # (N, T, U, C)
 
         activations = torch.tanh(x)
