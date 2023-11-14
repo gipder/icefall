@@ -444,6 +444,20 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--teacher-attention-dims",
+        type=str,
+        default="",
+        help="The attention dimensions of teacher model for knowledge distillation.",
+    )
+
+    parser.add_argument(
+        "--teacher-encoder-unmasked-dims",
+        type=str,
+        default="",
+        help="The encoder unmasked dimensions of teacher model for knowledge distillation.",
+    )
+
+    parser.add_argument(
         "--use-reset-simple-layer",
         type=str2bool,
         default=False,
