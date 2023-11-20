@@ -959,7 +959,8 @@ def modified_beam_search(
         start = offset
         end = offset + batch_size
         current_encoder_out = encoder_out.data[start:end]
-        current_encoder_out = current_encoder_out.unsqueeze(1).unsqueeze(1)
+        #current_encoder_out = current_encoder_out.unsqueeze(1).unsqueeze(1)
+        current_encoder_out = current_encoder_out.unsqueeze(1)
         # current_encoder_out's shape is (batch_size, 1, 1, encoder_out_dim)
         offset = end
 
@@ -981,7 +982,8 @@ def modified_beam_search(
             dtype=torch.int64,
         )  # (num_hyps, context_size)
 
-        decoder_out = model.decoder(decoder_input, need_pad=False).unsqueeze(1)
+        #decoder_out = model.decoder(decoder_input, need_pad=False).unsqueeze(1)
+        decoder_out = model.decoder(decoder_input, need_pad=False)
         decoder_out = model.joiner.decoder_proj(decoder_out)
         # decoder_out is of shape (num_hyps, 1, 1, joiner_dim)
 
