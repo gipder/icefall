@@ -833,6 +833,7 @@ def compute_loss(
 
     if use_pkd:
         with torch.no_grad():
+            #print(f"{batch=}")
             ret = teacher_model.get_ranges_and_logits(
                 x=feature,
                 x_lens=feature_lens,
@@ -848,7 +849,6 @@ def compute_loss(
 
         teacher_ranges = ret[0]
         teacher_logits = ret[1]
-
         if params.use_time_compression:
             teacher_compressed_ranges = ret[-3]
             teacher_compressed_logits = ret[-2]
@@ -869,7 +869,6 @@ def compute_loss(
             ret = (simple_loss, pruned_loss)
 
         """
-
         ret = model(
             x=feature,
             x_lens=feature_lens,
