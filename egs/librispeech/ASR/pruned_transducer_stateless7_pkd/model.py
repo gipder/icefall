@@ -77,30 +77,6 @@ class Transducer(nn.Module):
         self.ctc_layer = nn.Linear(encoder_dim, vocab_size)
         self.ctc_criterion = None
 
-    """
-    OLD one
-    def forward(
-        self,
-        x: torch.tensor,
-        x_lens: torch.tensor,
-        y: k2.raggedtensor,
-        prune_range: int = 5,
-        am_scale: float = 0.0,
-        lm_scale: float = 0.0,
-        use_pkd: bool = false,
-        teacher_ranges: torch.tensor = none,
-        teacher_logits: torch.tensor = none,
-        use_ctc: bool = false,
-        use_teacher_ctc_alignment: bool = false,
-        use_efficient: bool = false,
-        use_time_compression: bool = false,
-        compressed_teacher_ranges: torch.tensor = none,
-        compressed_teacher_logits: torch.tensor = none,
-        compressed_teacher_masks: torch.tensor = none,
-        use_teacher_simple_proj: bool = false,
-        teacher_model: nn.module = none,
-    ) -> torch.tensor:
-    """
     def forward(
         self,
         x: torch.tensor,
@@ -186,7 +162,11 @@ class Transducer(nn.Module):
         boundary[:, 3] = x_lens
 
         # teacher simple loss
-        if use_teacher_simple_proj:
+        teacher_simple_loss = None
+        if use_pkd and use_teacher_simple_proj:
+            #print(f"{teacher_model=}")
+            #print(f"{use_pkd=}")
+            assert teacher_model is not None
             with torch.no_grad():
                 teacher_encoder_out, teacher_x_lens = teacher_model.encoder(x, teacher_x_lens)
                 teacher_decoder_out = teacher_model.decoder(sos_y_padded)
@@ -808,6 +788,13 @@ class Transducer(nn.Module):
         decoder_out = self.decoder(sos_y_padded)
 
         return (encoder_out, decoder_out)
+
+    def set_teacher_simple_layer(self, encoder_dim: int, decoder_dim: int, vocab_size: int, device: torch.device):
+        self.teacher_simple_am_proj = nn.Linear(encoder_dim, vocab_size)
+        self.teacher_simple_lm_proj = nn.Linear(decoder_dim, vocab_size)
+        self.teacher_simple_am_proj.to(device)
+        self.teacher_simple_lm_proj.to(device)
+
 
 def get_trellis(emission, tokens, blank_id=0):
      num_frame = emission.size(0)

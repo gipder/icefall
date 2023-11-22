@@ -853,6 +853,7 @@ def compute_loss(
             teacher_compressed_ranges = ret[-3]
             teacher_compressed_logits = ret[-2]
             teacher_compressed_masks = ret[-1]
+
     """
     if params.use_ctc:
         use_ctc = True
@@ -881,6 +882,7 @@ def compute_loss(
             teacher_logits=teacher_logits,
             use_ctc=params.use_ctc,
             use_teacher_simple_proj=params.use_teacher_simple_proj,
+            teacher_model=teacher_model,
             use_time_compression=params.use_time_compression,
             teacher_compressed_ranges=teacher_compressed_ranges,
             teacher_compressed_logits=teacher_compressed_logits,
@@ -1220,9 +1222,14 @@ def run(rank, world_size, args):
         teacher_model.to(device)
         teacher_model.eval()
 
-        if params.use_reset_simple_layer:
+        if params.use_teacher_simple_proj:
             teacher_model.reset_simple_layer()
             logging.info("Resetting simple layer in teacher model")
+            #TODO hard coded
+            model.set_teacher_simple_layer(384, #teacher_model.encoder.encoder_dims,
+                                           512, #teacher_model.decoder.dims,
+                                           500, #teacher_model.decoder.vocab_size,
+                                           device)
         logging.info("Teacher model loaded")
         num_param = sum([p.numel() for p in teacher_model.parameters()])
         logging.info(f"Number of teacher model parameters: {num_param}")
