@@ -294,13 +294,23 @@ class Transducer(nn.Module):
             ctc_out = F.log_softmax(ctc_out, dim=-1).transpose(0, 1)
             ctc_loss = self.ctc_criterion(ctc_out, y_padded, x_lens, y_lens)
 
-        ret = (simple_loss, pruned_loss)
+        ret = dict()
+        ret["simple_loss"] = simple_loss
+        ret["pruned_loss"] = pruned_loss
         if use_pkd:
-            ret += (pkd_loss,)
+            ret["pkd_loss"] = pkd_loss
+        else:
+            ret["pkd_loss"] = torch.tensor(0.0)
+
         if use_ctc:
-            ret += (ctc_loss,)
+            ret["ctc_loss"] = ctc_loss
+        else:
+            ret["ctc_loss"] = torch.tensor(0.0)
+
         if use_teacher_simple_proj:
-            ret += (teacher_simple_loss,)
+            ret["teacher_simple_loss"] = teacher_simple_loss
+        else:
+            ret["teacher_simple_loss"] = torch.tensor(0.0)
 
         return ret
 

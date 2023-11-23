@@ -828,8 +828,10 @@ def compute_loss(
 
     if teacher_model is None:
         use_pkd = False
+        use_teacher_simple_proj = False
     else:
         use_pkd = params.use_pkd
+        use_teacher_simple_proj = params.use_teacher_simple_proj
 
     if use_pkd:
         with torch.no_grad():
@@ -861,7 +863,7 @@ def compute_loss(
         use_ctc = False
     """
     with torch.set_grad_enabled(is_training):
-        simple_loss = pruned_loss = pkd_loss = ctc_loss = torch.tensor(0.0, device=device)
+        simple_loss = pruned_loss = pkd_loss = ctc_loss = teacher_simple_loss = torch.tensor(0.0, device=device)
         """
         # It doesn't need
         if use_pkd:
@@ -902,17 +904,20 @@ def compute_loss(
             else 0.1 + 0.9 * (batch_idx_train / warm_step)
         )
 
-        pkd_loss_scale = ctc_loss_scale = params.pkd_loss_scale
-        simple_loss = ret[0]
-        pruned_loss = ret[1]
+        pkd_loss_scale = ctc_loss_scale = teacher_simple_loss_scale = params.pkd_loss_scale
+        simple_loss = ret["simple_loss"]
+        pruned_loss = ret["pruned_loss"]
         if use_pkd:
-            pkd_loss = ret[2]
+            pkd_loss = ret["pkd_loss"]
+            if use_teacher_simple_proj:
+                teacher_simple_loss = ret["teacher_simple_loss"]
         if params.use_ctc:
-            ctc_loss = ret[-1]
+            ctc_loss = ret["ctc_loss"]
         loss = simple_loss_scale * simple_loss + \
             pruned_loss_scale * pruned_loss + \
             pkd_loss_scale * pkd_loss + \
-            ctc_loss_scale * ctc_loss
+            ctc_loss_scale * ctc_loss + \
+            teacher_simple_loss_scale * teacher_simple_loss
 
     assert loss.requires_grad == is_training
 
@@ -927,6 +932,8 @@ def compute_loss(
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
     if params.use_pkd:
         info["pkd_loss"] = pkd_loss.detach().cpu().item()
+        if params.use_teacher_simple_proj:
+            info["teacher_simple_loss"] = teacher_simple_loss.detach().cpu().item()
     if params.use_ctc:
         info["ctc_loss"] = ctc_loss.detach().cpu().item()
     return loss, info
