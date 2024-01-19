@@ -792,6 +792,7 @@ def compute_loss(
     batch: dict,
     is_training: bool,
     teacher_model: Optional[Union[nn.Module, DDP]] = None,
+    hyp_cache: dict = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute transducer loss given the model and its inputs.
@@ -859,6 +860,7 @@ def compute_loss(
         use_alphas = params.use_alphas
         use_beam_search = params.use_beam_search
 
+    beam_search_alignment = None
     if use_beam_search:
         from beam_search import (
             modified_beam_search,
@@ -866,6 +868,7 @@ def compute_loss(
             Hypothesis,
             HypothesisList
         )
+        from icefall.utils import add_sos
 
         # getting beam search results and making pseudo labels
         # beam search
@@ -873,32 +876,38 @@ def compute_loss(
         # option 1. from modified_beam_search
         #
         # option 2. from usual training process
+        #print(f"{batch=}")
         ids = list()
-        for i in range(len(batch["supervisions"]["cut"])):
-            ids.append(batch["supervisions"]["cut"][i].id)
+        #print(f"{batch['supervisions']['cut'][0].id=}")
+        for i in range(len(batch["supervisions"]['cut'])):
+            ids.append(batch["supervisions"]['cut'][i].id)
 
         with torch.no_grad():
             # check cache memory
             all_in_cache = True
             if hyp_cache is not None:
-                for i in range(len(ids)):
-                    if hyp_cache.get(ids[i]) is None:
-                        all_in_cache = False
-                        break
+               for i in range(len(ids)):
+                   if hyp_cache.get(ids[i]) is None:
+                       all_in_cache = False
+                       break
 
+            # if hyps exist in cache, use them or do beam search
             if all_in_cache is False:
+                print("do beam search")
                 hyp_tokens = modified_beam_search_for_kd(
                     model=teacher_model,
                     x=feature,
                     x_lens=feature_lens,
                     beam=params.teacher_n_best,
                 )
+                # add the hyp_tokens to cache
                 for i in range(len(hyp_tokens)):
                     hyp_cache[ids[i]] = hyp_tokens[i]
             else:
+                print("use hyps in cache")
                 hyp_tokens = list()
                 for i in range(len(ids)):
-                    hyp_tokens.append(hyp_cache.get(ids[i]))
+                    hyp_tokens.append(hyp_cache[ids[i]])
 
             # make pseudo labels
             pseudo_labels = list()
@@ -920,16 +929,82 @@ def compute_loss(
                 else:
                     print(f"{i=}" + "th pseudo label is empty")
                     print(f"inserting the original label {y[i].tolist()}")
+                    print(f"{len(y[i].tolist())}")
+                    #import pickld
+                    #dump_file = "batch_dump.pkl"
+                    #with open(dump_file, "wb") as f:
+                    #    pickle.dump(batch, f)
                     non_duplicated_pseudo_label = y[i].tolist()
+                    # make a new alignment with the original label
+                    # 424 / 72 = 5.88
+                    # period = 5
+                    import math
+                    x_len = math.ceil((feature_lens[i] - 8) / 4)
+                    new_alignment = list([ 0 for i in range(x_len) ])
+                    period = x_len // len(non_duplicated_pseudo_label)
+                    for j in range(len(non_duplicated_pseudo_label)):
+                        new_alignment[period//2 + j*period] = non_duplicated_pseudo_label[j]
+                    #print(f"{feature_lens=}")
+                    #print(f"{new_alignment=}")
+                    #print(f"{len(new_alignment)=}")
+                    hyp_tokens[i] = [ new_alignment ]
+
                 non_duplicated_pseudo_labels.append(non_duplicated_pseudo_label)
 
             # convert list(list()) to k2.RaggedTensor
+            #print(f"{non_duplicated_pseudo_labels=}")
             pseudo_y = k2.RaggedTensor(non_duplicated_pseudo_labels).to(device)
             y = pseudo_y.clone()
+            #print(f"{y=}")
+            row_splits = y.shape.row_splits(1)
+            y_lens = row_splits[1:] - row_splits[:-1]
+            blank_id = params.blank_id
+            sos_id = add_sos(y, sos_id=blank_id)
+
+            # change hyp_tokens to alignment for icefall
+            # for example (vocab_size=10)
+            # labels: [ 2, 4, 5, 9 ]
+            # hyp_tokens =        [[ 0, 0, 2, 4, 0, 5, 0, 0, 9, 0 ]]
+            # icefall_alignment = [[ 0, 0, 1, 2, 2, 3, 3, 3, 4, 4 ]]
+            # currently I assume that hypothesis is 1-best result
+
+            # first, check if the first token is blank
+            for i in range(len(hyp_tokens)):
+                if hyp_tokens[i][0][0] != 0:
+                    hyp_tokens[i][0][1:] = hyp_tokens[i][0][:-1] # shift to right
+                    hyp_tokens[i][0][0] = 0
+            # get max length of hyp_tokens
+            max_len = 0
+            for i in range(len(hyp_tokens)):
+                if max_len < len(hyp_tokens[i][0]):
+                    max_len = len(hyp_tokens[i][0])
+            alignment = torch.zeros((len(hyp_tokens), max_len), dtype=torch.int32)
+            # remove duplicated labels in hyp_tokens
+            # and convert the sequence to monotonic increasing sequence
+            for i in range(len(hyp_tokens)):
+                prev = hyp_tokens[i][0][0]
+                for j in range(1, len(hyp_tokens[i][0])):
+                    if hyp_tokens[i][0][j] != 0:
+                        if prev != hyp_tokens[i][0][j]:
+                            prev = hyp_tokens[i][0][j]
+                        else:
+                            hyp_tokens[i][0][j] = 0
+
+                mask = (torch.tensor(hyp_tokens[i][0], dtype=torch.bool) != 0)
+                alignment[i, :len(hyp_tokens[i][0])] = torch.cumsum(mask.int(), dim=-1, dtype=torch.int32)
+
+            beam_search_alignment = alignment.to(device)
+            #for i in range(len(hyp_tokens)):
+            #    print(f"{i}: {len(hyp_tokens[i][0])=}")
+            #print(f"{hyp_tokens[ii]=}")
+            #print(f"{len(hyp_tokens[ii][0])=}")
+            #print(f"{beam_search_alignment[ii]=}")
 
     if use_pkd:
         with torch.no_grad():
-            #print(f"{batch=}")
+            #print(f"{y=}")
+            #print(f"{use_beam_search=}")
+            #print(f"{beam_search_alignment=}")
             ret = teacher_model.get_ranges_and_logits(
                 x=feature,
                 x_lens=feature_lens,
@@ -942,7 +1017,7 @@ def compute_loss(
                 use_time_compression=params.use_time_compression,
                 compression_threshold=params.time_compression_threshold,
                 use_beam_search=use_beam_search,
-                beam_size=params.teacher_n_best,
+                beam_search_alignment=beam_search_alignment,
             )
 
         teacher_ranges = ret[0]
@@ -1125,6 +1200,7 @@ def train_one_epoch(
     world_size: int = 1,
     rank: int = 0,
     teacher_model: Optional[nn.Module] = None,
+    hyp_cache: dict = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -1173,14 +1249,18 @@ def train_one_epoch(
 
         try:
             with torch.cuda.amp.autocast(enabled=params.use_fp16):
-                loss, loss_info = compute_loss(
-                    params=params,
-                    model=model,
-                    sp=sp,
-                    batch=batch,
-                    is_training=True,
-                    teacher_model=teacher_model,
-                )
+                for i in range(2):
+                    loss, loss_info = compute_loss(
+                        params=params,
+                        model=model,
+                        sp=sp,
+                        batch=batch,
+                        is_training=True,
+                        teacher_model=teacher_model,
+                        hyp_cache=hyp_cache,
+                    )
+                import sys
+                sys.exit(0)
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
@@ -1510,6 +1590,7 @@ def run(rank, world_size, args):
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 
+    hyp_cache = dict()
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)
         fix_random_seed(params.seed + epoch - 1)
@@ -1534,6 +1615,7 @@ def run(rank, world_size, args):
             world_size=world_size,
             rank=rank,
             teacher_model=teacher_model,
+            hyp_cache=hyp_cache,
         )
 
         if params.print_diagnostics:

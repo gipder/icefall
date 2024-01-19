@@ -1045,7 +1045,7 @@ def modified_beam_search_for_kd(
                 B[i].add(new_hyp)
 
     B = B + finalized_B
-    best_hyps = [b.get_most_probable(length_norm=True) for b in B]
+    best_hyps = [b.get_most_probable(length_norm=False) for b in B]
     sorted_ans = [h.ys[context_size:] for h in best_hyps]
     sorted_timestamps = [h.timestamp for h in best_hyps]
     ans = []
@@ -1054,6 +1054,7 @@ def modified_beam_search_for_kd(
     for i in range(N):
         ans.append(sorted_ans[unsorted_indices[i]])
         ans_timestamps.append(sorted_timestamps[unsorted_indices[i]])
+    """
     #for i in range(len(ans)):
     #    print(f"{i}: {len(ans[i])=}")
     # getting n-best hypotheses
@@ -1074,8 +1075,11 @@ def modified_beam_search_for_kd(
         for h in range(beam):
             hyp.append(topk_best_list[unsorted_indices[b]])
         topk_hyps.append(hyp)
-
-    return ans
+    """
+    return DecodingResults(
+        hyps=ans,
+        timestamps=ans_timestamps,
+    )
 
 def modified_beam_search(
     model: Transducer,

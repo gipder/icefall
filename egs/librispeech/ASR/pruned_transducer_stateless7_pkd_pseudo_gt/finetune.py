@@ -50,7 +50,7 @@ import logging
 import warnings
 from pathlib import Path
 from shutil import copyfile
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import k2
 import optim
@@ -58,8 +58,8 @@ import sentencepiece as spm
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
-from asr_datamodule import LibriSpeechAsrDataModule
 from decoder import Decoder
+from gigaspeech import GigaSpeechAsrDataModule
 from joiner import Joiner
 from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
@@ -92,26 +92,6 @@ from icefall.utils import (
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
-def load_teacher_checkpoint(model: Union[nn.Module, DDP], filename: str, strict: bool = False) -> None:
-    """
-    Load the teacher model from a checkpoint.
-    """
-    logging.info(f"Loading checkpoint from {filename}")
-    checkpoint = torch.load(filename, map_location="cpu")
-
-    if next(iter(checkpoint["model"])).startswith("module."):
-        logging.info("Loading checkpoint saved by DDP")
-
-        dst_state_dict = model.state_dict()
-        src_state_dict = checkpoint["model"]
-        for key in dst_state_dict.keys():
-            src_key = "{}.{}".format("module", key)
-            dst_state_dict[key] = src_state_dict.pop(src_key)
-        assert len(src_state_dict) == 0
-        model.load_state_dict(dst_state_dict, strict=strict)
-    else:
-        model.load_state_dict(checkpoint["model"], strict=strict)
-
 
 def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
     if isinstance(model, DDP):
@@ -120,6 +100,31 @@ def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
     for module in model.modules():
         if hasattr(module, "batch_count"):
             module.batch_count = batch_count
+
+
+def add_finetune_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument("--do-finetune", type=str2bool, default=False)
+
+    parser.add_argument(
+        "--init-modules",
+        type=str,
+        default=None,
+        help="""
+        Modules to be initialized. It matches all parameters starting with
+        a specific key. The keys are given with Comma seperated. If None, 
+        all modules will be initialised. For example, if you only want to 
+        initialise all parameters staring with "encoder", use "encoder"; 
+        if you want to initialise parameters starting with encoder or decoder,
+        use "encoder,joiner".
+        """,
+    )
+
+    parser.add_argument(
+        "--finetune-ckpt",
+        type=str,
+        default=None,
+        help="Fine-tuning from which checkpoint (a path to a .pt file)",
+    )
 
 
 def add_model_arguments(parser: argparse.ArgumentParser):
@@ -148,24 +153,28 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         "--encoder-dims",
         type=str,
         default="384,384,384,384,384",
-        help="Embedding dimension in the 2 blocks of zipformer encoder layers, comma separated",
+        help="""Embedding dimension in the 2 blocks of zipformer encoder
+        layers, comma separated
+        """,
     )
 
     parser.add_argument(
         "--attention-dims",
         type=str,
         default="192,192,192,192,192",
-        help="""Attention dimension in the 2 blocks of zipformer encoder layers, comma separated;
-        not the same as embedding dimension.""",
+        help="""Attention dimension in the 2 blocks of zipformer encoder layers,\
+        comma separated; not the same as embedding dimension.
+        """,
     )
 
     parser.add_argument(
         "--encoder-unmasked-dims",
         type=str,
         default="256,256,256,256,256",
-        help="Unmasked dimensions in the encoders, relates to augmentation during training.  "
-        "Must be <= each of encoder_dims.  Empirically, less than 256 seems to make performance "
-        " worse.",
+        help="""Unmasked dimensions in the encoders, relates to augmentation
+        during training. Must be <= each of encoder_dims. Empirically, less 
+        than 256 seems to make performance worse.
+        """,
     )
 
     parser.add_argument(
@@ -266,26 +275,34 @@ def get_parser():
         "--bpe-model",
         type=str,
         default="data/lang_bpe_500/bpe.model",
-        help="Path to the BPE model",
+        help="""Path to the BPE model. 
+        This should be the bpe model of the original model
+        """,
     )
 
     parser.add_argument(
-        "--base-lr", type=float, default=0.05, help="The base learning rate."
+        "--base-lr", type=float, default=0.005, help="The base learning rate."
     )
 
     parser.add_argument(
         "--lr-batches",
         type=float,
-        default=5000,
+        default=100000,
         help="""Number of steps that affects how rapidly the learning rate
-        decreases. We suggest not to change this.""",
+        decreases. During fine-tuning, we set this very large so that the 
+        learning rate slowly decays with number of batches. You may tune 
+        its value by yourself.
+        """,
     )
 
     parser.add_argument(
         "--lr-epochs",
         type=float,
-        default=3.5,
-        help="""Number of epochs that affects how rapidly the learning rate decreases.
+        default=100,
+        help="""Number of epochs that affects how rapidly the learning rate 
+        decreases. During fine-tuning, we set this very large so that the 
+        learning rate slowly decays with number of batches. You may tune 
+        its value by yourself.
         """,
     )
 
@@ -394,147 +411,8 @@ def get_parser():
         help="Whether to use half precision training.",
     )
 
-    parser.add_argument(
-        "--use-pkd",
-        type=str2bool,
-        default=False,
-        help="Whether to use knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--pkd-loss-scale",
-        type=float,
-        default=0.5,
-        help="The scalefor pruned knowledge distillation loss.",
-    )
-
-    parser.add_argument(
-        "--teacher-checkpoint",
-        type=str,
-        default="",
-        help="The checkpoint of teacher model for knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--teacher-num-encoder-layers",
-        type=str,
-        default="",
-        help="The number of encoder layers of teacher model for knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--teacher-feedforward-dims",
-        type=str,
-        default="",
-        help="The feedforward dimensions of teacher model for knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--teacher-nhead",
-        type=str,
-        default="",
-        help="The number of attention heads of teacher model for knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--teacher-encoder-dims",
-        type=str,
-        default="",
-        help="The encoder dimensions of teacher model for knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--teacher-attention-dims",
-        type=str,
-        default="",
-        help="The attention dimensions of teacher model for knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--teacher-encoder-unmasked-dims",
-        type=str,
-        default="",
-        help="The encoder unmasked dimensions of teacher model for knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--use-reset-simple-layer",
-        type=str2bool,
-        default=False,
-        help="Whether to reset simple layers.",
-    )
-
-    parser.add_argument(
-        "--use-ctc",
-        type=str2bool,
-        default=False,
-        help="Whether to use ctc layers.",
-    )
-
-    parser.add_argument(
-        "--use-teacher-ctc-alignment",
-        type=str2bool,
-        default=False,
-        help="Whether to use teacher ctc alignment.",
-    )
-
-    parser.add_argument(
-        "--use-efficient",
-        type=str2bool,
-        default=False,
-        help="Whether to use p_y, p_blank, p_rem for KD",
-    )
-
-    parser.add_argument(
-        "--pkd-range",
-        type=int,
-        default=1,
-        help="The prune range for pkd loss when using teacher ctc alignment.",
-    )
-
-    parser.add_argument(
-        "--use-time-compression",
-        type=str2bool,
-        default=False,
-        help="Whether to use time compression",
-    )
-
-    parser.add_argument(
-        "--time-compression-threshold",
-        type=float,
-        default=0.95,
-        help="The threshold when using time compression",
-    )
-
-    parser.add_argument(
-        "--use-teacher-simple-proj",
-        type=str2bool,
-        default=False,
-        help="Whether to update simple projection layers of teacher model",
-    )
-
-    parser.add_argument(
-        "--use-alphas",
-        type=str2bool,
-        default=False,
-        help="Whether to use alphas in knowledge distillatioin",
-    )
-
-    parser.add_argument(
-        "--use-beam-search",
-        type=str2bool,
-        default=False,
-        help="Whether to use beam search when doing knowledge distillation",
-    )
-
-    parser.add_argument(
-        "--teacher-n-best",
-        type=int,
-        default=1,
-        help="How many hyphotheses do you take when doing knowledge distillation",
-    )
-
     add_model_arguments(parser)
+    add_finetune_arguments(parser)
 
     return parser
 
@@ -735,6 +613,49 @@ def load_checkpoint_if_available(
     return saved_params
 
 
+def load_model_params(
+    ckpt: str, model: nn.Module, init_modules: List[str] = None, strict: bool = True
+):
+    """Load model params from checkpoint
+
+    Args:
+        ckpt (str): Path to the checkpoint
+        model (nn.Module): model to be loaded
+
+    """
+    logging.info(f"Loading checkpoint from {ckpt}")
+    checkpoint = torch.load(ckpt, map_location="cpu")
+
+    # if module list is empty, load the whole model from ckpt
+    if not init_modules:
+        if next(iter(checkpoint["model"])).startswith("module."):
+            logging.info("Loading checkpoint saved by DDP")
+
+            dst_state_dict = model.state_dict()
+            src_state_dict = checkpoint["model"]
+            for key in dst_state_dict.keys():
+                src_key = "{}.{}".format("module", key)
+                dst_state_dict[key] = src_state_dict.pop(src_key)
+            assert len(src_state_dict) == 0
+            model.load_state_dict(dst_state_dict, strict=strict)
+        else:
+            model.load_state_dict(checkpoint["model"], strict=strict)
+    else:
+        src_state_dict = checkpoint["model"]
+        dst_state_dict = model.state_dict()
+        for module in init_modules:
+            logging.info(f"Loading parameters starting with prefix {module}")
+            src_keys = [k for k in src_state_dict.keys() if k.startswith(module)]
+            dst_keys = [k for k in dst_state_dict.keys() if k.startswith(module)]
+            assert set(src_keys) == set(dst_keys)  # two sets should match exactly
+            for key in src_keys:
+                dst_state_dict[key] = src_state_dict.pop(key)
+
+        model.load_state_dict(dst_state_dict, strict=strict)
+
+    return None
+
+
 def save_checkpoint(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
@@ -791,7 +712,6 @@ def compute_loss(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
-    teacher_model: Optional[Union[nn.Module, DDP]] = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute transducer loss given the model and its inputs.
@@ -838,186 +758,16 @@ def compute_loss(
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
-    if isinstance(teacher_model, DDP):
-        teacher_model = teacher_model.module
-
-    teacher_ranges = None
-    teacher_logits = None
-    teacher_compressed_ranges = None
-    teacher_compressed_logits = None
-    teacher_compressed_masks = None
-    teacher_alphas = None
-
-    if teacher_model is None:
-        use_pkd = False
-        use_teacher_simple_proj = False
-        use_alphas = False
-        use_beam_search = False
-    else:
-        use_pkd = params.use_pkd
-        use_teacher_simple_proj = params.use_teacher_simple_proj
-        use_alphas = params.use_alphas
-        use_beam_search = params.use_beam_search
-
-    if use_beam_search:
-        from beam_search import (
-            modified_beam_search,
-            modified_beam_search_for_kd,
-            Hypothesis,
-            HypothesisList
-        )
-
-        # getting beam search results and making pseudo labels
-        # beam search
-        # There is a problem with how to get the logits of the teacher model.
-        # option 1. from modified_beam_search
-        #
-        # option 2. from usual training process
-        ids = list()
-        for i in range(len(batch["supervisions"]["cut"])):
-            ids.append(batch["supervisions"]["cut"][i].id)
-
-        with torch.no_grad():
-            # check cache memory
-            all_in_cache = True
-            if hyp_cache is not None:
-                for i in range(len(ids)):
-                    if hyp_cache.get(ids[i]) is None:
-                        all_in_cache = False
-                        break
-
-            if all_in_cache is False:
-                hyp_tokens = modified_beam_search_for_kd(
-                    model=teacher_model,
-                    x=feature,
-                    x_lens=feature_lens,
-                    beam=params.teacher_n_best,
-                )
-                for i in range(len(hyp_tokens)):
-                    hyp_cache[ids[i]] = hyp_tokens[i]
-            else:
-                hyp_tokens = list()
-                for i in range(len(ids)):
-                    hyp_tokens.append(hyp_cache.get(ids[i]))
-
-            # make pseudo labels
-            pseudo_labels = list()
-            for i in range(len(hyp_tokens)):
-                tmp_pseudo_label = ()
-                for j in hyp_tokens[i]:
-                    tmp_pseudo_label = [ t for t in j if t != 0 ]
-                pseudo_labels.append(tmp_pseudo_label)
-
-            # remove duplicated labels with maintaing order
-            non_duplicated_pseudo_labels = list()
-            for i in range(len(pseudo_labels)):
-                non_duplicated_pseudo_label = list()
-                if pseudo_labels[i] != []:
-                    non_duplicated_pseudo_label.append(pseudo_labels[i][0])
-                    for j in range(1, len(pseudo_labels[i])):
-                        if pseudo_labels[i][j] != pseudo_labels[i][j-1]:
-                            non_duplicated_pseudo_label.append(pseudo_labels[i][j])
-                else:
-                    print(f"{i=}" + "th pseudo label is empty")
-                    print(f"inserting the original label {y[i].tolist()}")
-                    non_duplicated_pseudo_label = y[i].tolist()
-                non_duplicated_pseudo_labels.append(non_duplicated_pseudo_label)
-
-            # convert list(list()) to k2.RaggedTensor
-            pseudo_y = k2.RaggedTensor(non_duplicated_pseudo_labels).to(device)
-            y = pseudo_y.clone()
-
-    if use_pkd:
-        with torch.no_grad():
-            #print(f"{batch=}")
-            ret = teacher_model.get_ranges_and_logits(
-                x=feature,
-                x_lens=feature_lens,
-                y=y,
-                prune_range=params.prune_range,
-                am_scale=params.am_scale,
-                lm_scale=params.lm_scale,
-                use_teacher_ctc_alignment=params.use_teacher_ctc_alignment,
-                use_efficient=params.use_efficient,
-                use_time_compression=params.use_time_compression,
-                compression_threshold=params.time_compression_threshold,
-                use_beam_search=use_beam_search,
-                beam_size=params.teacher_n_best,
-            )
-
-        teacher_ranges = ret[0]
-        teacher_logits = ret[1]
-        if params.use_time_compression:
-            teacher_compressed_ranges = ret[-3]
-            teacher_compressed_logits = ret[-2]
-            teacher_compressed_masks = ret[-1]
-
-            ret = teacher_model.get_ranges_and_logits(
-                x=feature,
-                x_lens=feature_lens,
-                y=y,
-                prune_range=params.prune_range,
-                am_scale=params.am_scale,
-                lm_scale=params.lm_scale,
-                use_teacher_ctc_alignment=params.use_teacher_ctc_alignment,
-                use_efficient=params.use_efficient,
-                use_time_compression=params.use_time_compression,
-                compression_threshold=params.time_compression_threshold,
-            )
-
-            teacher_ranges = ret[0]
-            teacher_logits = ret[1]
-
-        with torch.no_grad():
-            teacher_alphas = teacher_model.get_alphas(
-                x=feature,
-                x_lens=feature_lens,
-                y=y,
-                prune_range=params.prune_range,
-                ranges=teacher_ranges,
-            )
-
-    """
-    if params.use_ctc:
-        use_ctc = True
-    else:
-        use_ctc = False
-    """
     with torch.set_grad_enabled(is_training):
-        simple_loss = torch.tensor(0.0, device=device)
-        pruned_loss = torch.tensor(0.0, device=device)
-        pkd_loss = torch.tensor(0.0, device=device)
-        ctc_loss = torch.tensor(0.0, device=device)
-        teacher_simple_loss = torch.tensor(0.0, device=device)
-        alphas_loss = torch.tensor(0.0, device=device)
-        """
-        # It doesn't need
-        if use_pkd:
-            ret = (simple_loss, pruned_loss, pkd_loss)
-        else:
-            ret = (simple_loss, pruned_loss)
-
-        """
-        ret = model(
+        simple_loss, pruned_loss = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
             prune_range=params.prune_range,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
-            use_pkd=use_pkd,
-            teacher_ranges=teacher_ranges,
-            teacher_logits=teacher_logits,
-            use_ctc=params.use_ctc,
-            use_teacher_simple_proj=params.use_teacher_simple_proj,
-            teacher_model=teacher_model,
-            use_time_compression=params.use_time_compression,
-            teacher_compressed_ranges=teacher_compressed_ranges,
-            teacher_compressed_logits=teacher_compressed_logits,
-            teacher_compressed_masks=teacher_compressed_masks,
-            use_alphas=use_alphas,
-            teacher_alphas=teacher_alphas,
         )
+
         s = params.simple_loss_scale
         # take down the scale on the simple loss from 1.0 at the start
         # to params.simple_loss scale by warm_step.
@@ -1032,28 +782,7 @@ def compute_loss(
             else 0.1 + 0.9 * (batch_idx_train / warm_step)
         )
 
-        pkd_loss_scale = params.pkd_loss_scale
-        ctc_loss_scale = params.pkd_loss_scale
-        teacher_simple_loss_scale = params.pkd_loss_scale
-        alphas_loss_scale = params.pkd_loss_scale
-
-        simple_loss = ret["simple_loss"]
-        pruned_loss = ret["pruned_loss"]
-        if use_pkd:
-            pkd_loss = ret["pkd_loss"]
-            if use_teacher_simple_proj:
-                teacher_simple_loss = ret["teacher_simple_loss"]
-        if params.use_ctc:
-            ctc_loss = ret["ctc_loss"]
-        if use_alphas:
-            alphas_loss = ret["alphas_loss"]
-
-        loss = simple_loss_scale * simple_loss + \
-            pruned_loss_scale * pruned_loss + \
-            pkd_loss_scale * pkd_loss + \
-            ctc_loss_scale * ctc_loss + \
-            teacher_simple_loss_scale * teacher_simple_loss + \
-            alphas_loss_scale * alphas_loss
+        loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
 
     assert loss.requires_grad == is_training
 
@@ -1066,14 +795,7 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
-    if params.use_pkd:
-        info["pkd_loss"] = pkd_loss.detach().cpu().item()
-        if params.use_teacher_simple_proj:
-            info["teacher_simple_loss"] = teacher_simple_loss.detach().cpu().item()
-    if params.use_ctc:
-        info["ctc_loss"] = ctc_loss.detach().cpu().item()
-    if params.use_alphas:
-        info["alphas_loss"] = alphas_loss.detach().cpu().item()
+
     return loss, info
 
 
@@ -1124,7 +846,6 @@ def train_one_epoch(
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
-    teacher_model: Optional[nn.Module] = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -1179,7 +900,6 @@ def train_one_epoch(
                     sp=sp,
                     batch=batch,
                     is_training=True,
-                    teacher_model=teacher_model,
                 )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
@@ -1236,9 +956,9 @@ def train_one_epoch(
             )
 
         if batch_idx % 100 == 0 and params.use_fp16:
-            # If the grad scale was less than 1, try increasing it.    The _growth_interval
-            # of the grad scaler is configurable, but we can't configure it to have different
-            # behavior depending on the current grad scale.
+            # If the grad scale was less than 1, try increasing it. The _growth_interval
+            # of the grad scaler is configurable, but we can't configure it to have
+            # different behavior depending on the current grad scale.
             cur_grad_scale = scaler._scale.item()
             if cur_grad_scale < 1.0 or (cur_grad_scale < 8.0 and batch_idx % 400 == 0):
                 scaler.update(cur_grad_scale * 2.0)
@@ -1317,8 +1037,6 @@ def run(rank, world_size, args):
     """
     params = get_params()
     params.update(vars(args))
-    if params.full_libri is False:
-        params.valid_interval = 1600
 
     fix_random_seed(params.seed)
     if world_size > 1:
@@ -1352,54 +1070,28 @@ def run(rank, world_size, args):
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
 
-    # load the model from checkpoint if available
-    teacher_model = None
-    if params.use_pkd or params.use_alphas:
-        teacher_params = copy.deepcopy(params)
-        teacher_params.num_encoder_layers = params.teacher_num_encoder_layers
-        teacher_params.feedforward_dims = params.teacher_feedforward_dims
-        teacher_params.nhead = params.teacher_nhead
-        teacher_params.encoder_dims = params.teacher_encoder_dims
-        teacher_model = get_transducer_model(teacher_params)
-        load_teacher_checkpoint(teacher_model, params.teacher_checkpoint)
-
-        assert teacher_model is not None
-        teacher_model.to(device)
-        teacher_model.eval()
-
-        if params.use_teacher_simple_proj:
-            teacher_model.reset_simple_layer()
-            logging.info("Resetting simple layer in teacher model")
-            #TODO hard coded
-            model.set_teacher_simple_layer(384, #teacher_model.encoder.encoder_dims,
-                                           512, #teacher_model.decoder.dims,
-                                           500, #teacher_model.decoder.vocab_size,
-                                           device)
-        logging.info("Teacher model loaded")
-        num_param = sum([p.numel() for p in teacher_model.parameters()])
-        logging.info(f"Number of teacher model parameters: {num_param}")
-
-    if params.use_ctc:
-        model.set_ctc_loss(reduction="sum", zero_infinity=True, blank=params.blank_id)
-        logging.info("Using CTC loss")
-
     assert params.save_every_n >= params.average_period
     model_avg: Optional[nn.Module] = None
     if rank == 0:
         # model_avg is only used with rank 0
         model_avg = copy.deepcopy(model).to(torch.float64)
 
-    assert params.start_epoch > 0, params.start_epoch
-    checkpoints = load_checkpoint_if_available(
-        params=params, model=model, model_avg=model_avg
-    )
+    # load model parameters for model fine-tuning
+    if params.do_finetune:
+        modules = params.init_modules.split(",") if params.init_modules else None
+        checkpoints = load_model_params(
+            ckpt=params.finetune_ckpt, model=model, init_modules=modules
+        )
+    else:
+        assert params.start_epoch > 0, params.start_epoch
+        checkpoints = load_checkpoint_if_available(
+            params=params, model=model, model_avg=model_avg
+        )
 
     model.to(device)
     if world_size > 1:
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-        if params.use_pkd:
-            teacher_model = DDP(teacher_model, device_ids=[rank])
 
     parameters_names = []
     parameters_names.append(
@@ -1435,12 +1127,9 @@ def run(rank, world_size, args):
     if params.inf_check:
         register_inf_check_hooks(model)
 
-    librispeech = LibriSpeechAsrDataModule(args)
+    gigaspeech = GigaSpeechAsrDataModule(args)
 
-    if params.full_libri:
-        train_cuts = librispeech.train_all_shuf_cuts()
-    else:
-        train_cuts = librispeech.train_clean_100_cuts()
+    train_cuts = gigaspeech.train_cuts()
 
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 20 seconds
@@ -1488,13 +1177,12 @@ def run(rank, world_size, args):
     else:
         sampler_state_dict = None
 
-    train_dl = librispeech.train_dataloaders(
+    train_dl = gigaspeech.train_dataloaders(
         train_cuts, sampler_state_dict=sampler_state_dict
     )
 
-    valid_cuts = librispeech.dev_clean_cuts()
-    valid_cuts += librispeech.dev_other_cuts()
-    valid_dl = librispeech.valid_dataloaders(valid_cuts)
+    valid_cuts = gigaspeech.dev_cuts()
+    valid_dl = gigaspeech.valid_dataloaders(valid_cuts)
 
     if not params.print_diagnostics:
         scan_pessimistic_batches_for_oom(
@@ -1533,7 +1221,6 @@ def run(rank, world_size, args):
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,
-            teacher_model=teacher_model,
         )
 
         if params.print_diagnostics:
@@ -1634,7 +1321,9 @@ def scan_pessimistic_batches_for_oom(
 
 def main():
     parser = get_parser()
-    LibriSpeechAsrDataModule.add_arguments(parser)
+    GigaSpeechAsrDataModule.add_arguments(
+        parser
+    )  # you may replace this with your own dataset
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
 

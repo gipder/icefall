@@ -143,6 +143,7 @@ class Transducer(nn.Module):
         #print(f"{encoder_out=}")
         #print(f"{x_lens=}")
         # Now for the decoder, i.e., the prediction network
+        #print(f"{y=}")
         row_splits = y.shape.row_splits(1)
         y_lens = row_splits[1:] - row_splits[:-1]
 
@@ -262,9 +263,23 @@ class Transducer(nn.Module):
                     ranges=ranges,
                     termination_symbol=blank_id,
                     boundary=boundary,
-                    reduction="sum",
+                    reduction="none",
                 )
 
+            if torch.isnan(pruned_loss).any() or torch.isinf(pruned_loss).any():
+                idx = torch.where(torch.isnan(pruned_loss) | torch.isinf(pruned_loss))
+                print(f"{pruned_loss=}")
+                print("pruned_loss is nan or inf, then terminate training")
+                print(f"{idx=}")
+                #print(f"{logits=}")
+                print(f"{x_lens=}")
+                print(f"{y_lens=}")
+                print(f"{ranges[idx]=}")
+                print(f"{y_padded[idx]=}")
+                print(f"{y_padded[0]=}")
+                import sys
+                sys.exit(0)
+            pruned_loss = pruned_loss.sum()
         #print(f"{pruned_loss=}")
         #if not torch.isfinite(pruned_loss):
         #    print("pruned_loss is inf or nan, then terminate training")
@@ -284,23 +299,30 @@ class Transducer(nn.Module):
         """
 
         if use_pkd:
-            if use_time_compression:
-                assert teacher_compressed_masks is not None
-                compressed_encoder_out, compressed_x_lens = compress_time(encoder_out, x_lens, teacher_compressed_masks)
-                am_pruned, lm_pruned = k2.do_rnnt_pruning(
-                    am=self.joiner.encoder_proj(compressed_encoder_out),
-                    lm=self.joiner.decoder_proj(decoder_out),
-                    ranges=teacher_compressed_ranges,
-                )
-                logits = self.joiner(am_pruned, lm_pruned, project_input=False)
-                teacher_logits = teacher_compressed_logits
-            #print(f"before {logits[0, 0, 0, 0:5]=}")
             student = F.log_softmax(logits, dim=-1)
             teacher = F.softmax(teacher_logits, dim=-1)
-            pkd_loss = self.pkd_criterion(student, teacher)
-            #print(f"after {student[0, 0, 0, 0:5]=}")
-            #print(f"{pkd_loss=}")
 
+            pkd_loss = self.pkd_criterion(student, teacher)
+            """
+            torch.set_printoptions(threshold=100000)
+            if torch.isnan(pkd_loss):
+                print("pkd_loss is nan, then terminate training")
+                torch.set_printoptions(threshold=100000)
+                #print(f"{student=}")
+                print(f"{teacher=}")
+                #print(f"{teacher_ranges=}")
+                for i in range(y.shape.dim0):
+                    print(f"{y[i].size(0)=}")
+                #print all tensor
+
+                import sys
+                sys.exit(0)
+            else:
+                for i in range(y.shape.dim0):
+                    print(f"{y[i].size(0)=}")
+            print(f"after {student[0, 0, 0, 0:5]=}")
+            print(f"{pkd_loss=}")
+            """
         if use_ctc:
             # print(f"{y_padded=}")
             # print(f"{y_lens=}")
@@ -454,7 +476,7 @@ class Transducer(nn.Module):
         use_time_compression: bool = False,
         compression_threshold: float = 0.95,
         use_beam_search: bool = False,
-        beam_size: int = 1,
+        beam_search_alignment: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         this function works in teacher model when use_pkd is True
@@ -483,6 +505,10 @@ class Transducer(nn.Module):
           use_time_compression:
             If True, compress the logits in time-axis by ignoring the t-th frame
             when the probability of blank is higher than a threshold
+          use_beam_search:
+            If True, use beam search alignment from teacher instead of ctc alignment
+          beam_size_alignment:
+            The alignment from beam search
 
         Returns:
           Return Tensor (the pruned range, logits, compressed length)
@@ -527,6 +553,8 @@ class Transducer(nn.Module):
         lm = self.simple_lm_proj(decoder_out)
         am = self.simple_am_proj(encoder_out)
 
+        #print("GARBAGE " * 10)
+        #print(f"{use_teacher_ctc_alignment=}")
         if use_teacher_ctc_alignment:
             assert self.ctc_layer is not None
             ctc_logits = self.ctc_layer(encoder_out)
@@ -553,9 +581,6 @@ class Transducer(nn.Module):
                     ctc_ranges[i, x_lens[i]:] = self.decoder.blank_id
 
             ctc_ranges = ctc_ranges.to(torch.int32)
-            torch.set_printoptions(profile="full")
-            print(f"{ctc_ranges=}")
-            print(f"{ctc_ranges.size()=}")
             # something to do with ctc_range
             # ctc_range : from [B, T, 1] to [B, T, prune_range]
             ranges = torch.zeros((ctc_ranges.size(0), ctc_ranges.size(-1), prune_range),
@@ -593,8 +618,53 @@ class Transducer(nn.Module):
             # TODO: optimization
             for i in range(0, idx.size(0)):
                 ranges[i, idx[i]:] = padding_values[i]
-
+            """
+            torch.set_printoptions(threshold=100000)
+            print(f"{ctc_ranges[-1]=}")
+            print(f"{ranges[-1]=}")
+            print(f"{idx=}")
+            print(f"{x_lens=}")
+            print(f"{y_lens=}")
+            print("HERE HERE")
+            import sys
+            sys.exit(0)
+            """
             #print(f"ranges: {ranges}")
+        elif use_beam_search:
+            # beam_search_alignment [B, T]
+            ranges = torch.zeros((beam_search_alignment.size(0), beam_search_alignment.size(-1), prune_range),
+                                dtype=torch.int64, device=decoder_out.device)
+
+            idx = beam_search_alignment + prune_range - 1 >= y_lens.unsqueeze(-1)
+            # change the first idx to fit the boundary
+            for i in range(0, idx.size(0)):
+                beam_search_alignment[i, idx[i]] = y_lens[i] - ( prune_range - 1 )
+            # check if the ctc_ranges is out of boundary
+            # the logic is a little bit weird, but it works
+            for i in range(0, idx.size(0)):
+                beam_search_alignment[i][beam_search_alignment[i] < 0] = 0
+            ranges[:, :, 0] = beam_search_alignment
+            for i in range(1, prune_range):
+                ranges[:, :, i] = ranges[:, :, i-1] + 1
+
+            # padding beyound x_lens with max values
+            idx = torch.argmax(ranges[:, :, 0], dim=-1)
+            padding_values = ranges[range(ranges.size(0)), idx, :]
+            for i in range(0, idx.size(0)):
+                ranges[i, idx[i]:] = padding_values[i]
+            #if torch.any(idx == 0):
+                #print full tensor in pytorch
+            """
+            torch.set_printoptions(threshold=100000)
+            print(f"{beam_search_alignment[-1]=}")
+            print(f"{ranges[-1]=}")
+            print(f"{idx=}")
+            print(f"{x_lens=}")
+            print(f"{y_lens=}")
+            print("HERE HERE")
+            import sys
+            sys.exit(0)
+            """
         else:
             with torch.no_grad():
                 simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
@@ -616,32 +686,6 @@ class Transducer(nn.Module):
                 boundary=boundary,
                 s_range=prune_range,
             )
-        """
-        elif use_beam_search:
-            from beam_search import (
-                modified_beam_search,
-                Hypothesis,
-                HypothesisList
-            )
-            hyp_tokens = modified_beam_search(
-                model=self,
-                encoder_out=encoder_out,
-                encoder_out_lens=x_lens,
-                beam=beam_size,
-                temperature=1.0,
-                return_timestamps=False,
-                return_topk=True,
-            )
-            print(f"{y_padded=}")
-            print(f"{hyp_tokens=}")
-            filtered_hyp_tokens = []
-            for i in hyp_tokens:
-                for j in i:
-                    filtered_hyp_tokens.append([h for h in j if h != 0])
-            print(f"{filtered_hyp_tokens=}")
-            import sys
-            sys.exit(0)
-        """
 
         # am_pruned : [B, T, prune_range, encoder_dim]
         # lm_pruned : [B, T, prune_range, decoder_dim]
@@ -664,173 +708,7 @@ class Transducer(nn.Module):
 
         ret = (ranges, logits)
 
-        if use_time_compression:
-            tc_logits = self.ctc_layer(encoder_out)
-            tc_emission = F.softmax(tc_logits, dim=-1)
-            compressed_masks = tc_emission[:, :, blank_id] < compression_threshold
-            tc_encoder_out, tc_x_lens = compress_time(encoder_out, x_lens, compressed_masks)
-            tc_boundary = boundary
-            tc_boundary[:, 3] = tc_x_lens
-            tc_lm = self.simple_lm_proj(decoder_out)
-            tc_am = self.simple_am_proj(tc_encoder_out)
-
-            with torch.no_grad():
-                simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
-                    lm=tc_lm.float(),
-                    am=tc_am.float(),
-                    symbols=y_padded,
-                    termination_symbol=blank_id,
-                    lm_only_scale=lm_scale,
-                    am_only_scale=am_scale,
-                    boundary=tc_boundary,
-                    reduction="sum",
-                    return_grad=True,
-                )
-
-            # ranges : [B, T, prune_range]
-            compressed_ranges = k2.get_rnnt_prune_ranges(
-                px_grad=px_grad,
-                py_grad=py_grad,
-                boundary=tc_boundary,
-                s_range=prune_range,
-            )
-
-            # am_pruned : [B, T, prune_range, encoder_dim]
-            # lm_pruned : [B, T, prune_range, decoder_dim]
-            tc_am_pruned, tc_lm_pruned = k2.do_rnnt_pruning(
-                am=self.joiner.encoder_proj(tc_encoder_out),
-                lm=self.joiner.decoder_proj(decoder_out),
-                ranges=compressed_ranges,
-            )
-
-            compressed_logits = self.joiner(tc_am_pruned, tc_lm_pruned, project_input=False)
-
-            ret += (compressed_ranges, compressed_logits, compressed_masks)
-
         return ret
-
-    def get_ranges_and_logits_with_time_compression(
-        self,
-        x: torch.Tensor,
-        x_lens: torch.Tensor,
-        y: k2.RaggedTensor,
-        prune_range: int = 5,
-        am_scale: float = 0.0,
-        lm_scale: float = 0.0,
-        threshold: float = 1.0,
-    ) -> torch.Tensor:
-        """
-        Args:
-          x:
-            A 3-D tensor of shape (N, T, C).
-          x_lens:
-            A 1-D tensor of shape (N,). It contains the number of frames in `x`
-            before padding.
-          y:
-            A ragged tensor with 2 axes [utt][label]. It contains labels of each
-            utterance.
-          prune_range:
-            The prune range for rnnt loss, it means how many symbols(context)
-            we are considering for each frame to compute the loss.
-        Returns:
-          Return Tensor (the pruned range and logits)
-
-        Note:
-           Regarding am_scale & lm_scale, it will make the loss-function one of
-           the form:
-              lm_scale * lm_probs + am_scale * am_probs +
-              (1-lm_scale-am_scale) * combined_probs
-        """
-        assert x.ndim == 3, x.shape
-        assert x_lens.ndim == 1, x_lens.shape
-        assert y.num_axes == 2, y.num_axes
-
-        assert x.size(0) == x_lens.size(0) == y.dim0
-
-        encoder_out, x_lens = self.encoder(x, x_lens)
-        assert torch.all(x_lens > 0)
-
-        # Now for the decoder, i.e., the prediction network
-        row_splits = y.shape.row_splits(1)
-        y_lens = row_splits[1:] - row_splits[:-1]
-
-        blank_id = self.decoder.blank_id
-        sos_y = add_sos(y, sos_id=blank_id)
-
-        # sos_y_padded: [B, S + 1], start with SOS.
-        sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
-
-        # decoder_out: [B, S + 1, decoder_dim]
-        decoder_out = self.decoder(sos_y_padded)
-
-        # Note: y does not start with SOS
-        # y_padded : [B, S]
-        y_padded = y.pad(mode="constant", padding_value=0)
-
-        y_padded = y_padded.to(torch.int64)
-        boundary = torch.zeros((x.size(0), 4), dtype=torch.int64, device=x.device)
-        boundary[:, 2] = y_lens
-        boundary[:, 3] = x_lens
-
-        # Compress in time axis
-        logits = self.ctc_layer(encoder_out)
-        emission = F.softmax(logits, dim=-1)
-        #print(f"{threshold=}")
-        mask = emission[:, :, blank_id] < threshold
-
-        #print(f"{mask.shape=}")
-        #print(f"{encoder_out.shape=}")
-        #print(f"{x_lens=}")
-        encoder_out, x_lens = compress_time(encoder_out, x_lens, mask)
-        boundary[:, 3] = x_lens
-        #print(f"{encoder_out.shape=}")
-        lm = self.simple_lm_proj(decoder_out)
-        am = self.simple_am_proj(encoder_out)
-        #print(f"{am.shape=}")
-        #print(f"{encoder_out.shape=}")
-        #print(f"{lm.shape=}")
-        #print(f"{decoder_out.shape=}")
-        #import sys
-        #sys.exit(0)
-        #with torch.cuda.amp.autocast(enabled=False):
-        with torch.no_grad():
-            simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
-                lm=lm.float(),
-                am=am.float(),
-                symbols=y_padded,
-                termination_symbol=blank_id,
-                lm_only_scale=lm_scale,
-                am_only_scale=am_scale,
-                boundary=boundary,
-                reduction="sum",
-                return_grad=True,
-            )
-
-        # ranges : [B, T, prune_range]
-        ranges = k2.get_rnnt_prune_ranges(
-            px_grad=px_grad,
-            py_grad=py_grad,
-            boundary=boundary,
-            s_range=prune_range,
-        )
-
-        # am_pruned : [B, T, prune_range, encoder_dim]
-        # lm_pruned : [B, T, prune_range, decoder_dim]
-        am_pruned, lm_pruned = k2.do_rnnt_pruning(
-            am=self.joiner.encoder_proj(encoder_out),
-            lm=self.joiner.decoder_proj(decoder_out),
-            ranges=ranges,
-        )
-
-        # logits : [B, T, prune_range, vocab_size]
-
-        # project_input=False since we applied the decoder's input projections
-        # prior to do_rnnt_pruning (this is an optimization for speed).
-        logits = self.joiner(am_pruned, lm_pruned, project_input=False)
-
-        ranges.requires_grad_(False)
-        logits = logits.detach_()
-        return (ranges, logits, mask)
 
     def reset_simple_layer(self):
         self.simple_lm_proj.reset_parameters()
@@ -1401,60 +1279,6 @@ if __name__ == "__main__":
 
     # print(f"{x.shape=}")
     # tmp_predicted_ids = torch.unique_consecutive(predicted_ids[i, :])
-    print("*" * 100)
-    print("Test use_efficient: p_y, p_blank, p_remainder")
-
-    for idx, batch in enumerate(test_clean_dl):
-        feature = batch["inputs"].to(device)
-        supervisions = batch["supervisions"]
-        feature_lens = supervisions["num_frames"].to(device)
-        encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
-        y = sp.encode(supervisions["text"], out_type=int)
-        y[-1] = [5, 298, 23]
-        print(f"{y=}")
-        y = k2.RaggedTensor(y).to(device)
-        #ranges, logits = model.forced_alignment(feature, feature_lens, y)
-        #ranges, logits, masks = model.get_ranges_and_logits(x=feature, x_lens=feature_lens, y=y, prune_range=5,
-        ret = model.get_ranges_and_logits(x=feature, x_lens=feature_lens, y=y, prune_range=5,
-                                                     am_scale=0.5, lm_scale=0.5, use_teacher_ctc_alignment=True,
-                                                     use_efficient=False, use_time_compression=True)
-        print(f"{ret[0]=}")
-        #print(f"{ret[1][-1]=}")
-        use_time_compression = True
-        if use_time_compression:
-            teacher_ranges = ret[0]
-            teacher_logits = ret[1]
-            compressed_ranges = ret[2]
-            compressed_logits = ret[3]
-            compressed_masks = ret[-1]
-        print(f"{ranges.shape=}")
-        print(f"{logits.shape=}")
-        print(f"{compressed_ranges.shape=}")
-        print(f"{compressed_ranges=}")
-        print(f"{y=}")
-        print(f"{compressed_logits.shape=}")
-
-        ret = smodel(
-            x=feature,
-            x_lens=feature_lens,
-            y=y,
-            prune_range=5,
-            am_scale=0.5,
-            lm_scale=0.5,
-            use_pkd=True,
-            teacher_ranges=teacher_ranges,
-            teacher_logits=teacher_logits,
-            use_ctc=True,
-            use_teacher_simple_proj=False,
-            teacher_model=model,
-            use_time_compression=True,
-            teacher_compressed_ranges=compressed_ranges,
-            teacher_compressed_logits=compressed_logits,
-            teacher_compressed_masks=compressed_masks,
-            use_efficient=False,
-        )
-
-        break
     """
     print("*" * 100)
     print("Test compress_time_axis")
@@ -1561,51 +1385,10 @@ if __name__ == "__main__":
             return_timestamps=False,
             return_topk=True,
         )
-
         print(f"{hyp_tokens[0]=}")
         print(f"{hyp_tokens[1]=}")
-
-        import pickle
-        batch_file_dump = "batch.example.pkl"
-        with open(batch_file_dump, "wb") as f:
-            pickle.dump(batch, f)
-
-        with open(batch_file_dump, "rb") as f:
-            pkl_batch = pickle.load(f)
-        print(pkl_batch)
         #print(f"{len(hyp_tokens[0].ys[1:-1])=}")
         #print(f"{len(hyp_tokens[0].timestamp)=}")
         #print(f"{hyp_tokens[1]=}")
         break
-
-    print("#" * 100)
-    print("To check null hypotheses")
-    import pickle
-    batch_file_dump = "batch.example.pkl"
-    with open(batch_file_dump, "rb") as f:
-        pkl_batch = pickle.load(f)
-        batch = pkl_batch
-    print(f"{batch=}")
-    feature = batch["inputs"].to(device)
-    supervisions = batch["supervisions"]
-    feature_lens = supervisions["num_frames"].to(device)
-    encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
-    hyp_tokens = modified_beam_search(
-        model=model,
-        encoder_out=encoder_out,
-        encoder_out_lens=encoder_out_lens,
-        beam=1,
-        temperature=1.0,
-        return_timestamps=False,
-        return_topk=True,
-    )
-
-    #print(f"{hyp_tokens=}")
-    import sentencepiece as spm
-    sp = spm.SentencePieceProcessor()
-    sp.Load("data/lang_bpe_500/bpe.model")
-    for i in hyp_tokens:
-        for j in i:
-            kk = [ x for x in j if x != 0 ]
-            print(f"{sp.decode(kk)=}")
 
