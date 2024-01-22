@@ -1045,7 +1045,7 @@ def modified_beam_search_for_kd(
                 B[i].add(new_hyp)
 
     B = B + finalized_B
-    best_hyps = [b.get_most_probable(length_norm=False) for b in B]
+    best_hyps = [b.get_most_probable(length_norm=True) for b in B]
     sorted_ans = [h.ys[context_size:] for h in best_hyps]
     sorted_timestamps = [h.timestamp for h in best_hyps]
     ans = []

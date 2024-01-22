@@ -87,6 +87,7 @@ class Transducer(nn.Module):
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
         use_pkd: bool = False,
+        pkd_range: int = 5,
         teacher_ranges: torch.tensor = None,
         teacher_logits: torch.tensor = None,
         use_ctc: bool = False,
@@ -99,6 +100,7 @@ class Transducer(nn.Module):
         use_efficient: bool = False,
         use_alphas: bool = False,
         teacher_alphas: torch.tensor = None,
+        teacher_alignments: torch.tensor = None,
     ) -> torch.tensor:
         """
         Args:
@@ -219,7 +221,34 @@ class Transducer(nn.Module):
         #    sys.exit(0)
         #print(f"inside model.py, {teacher_logits=}")
         if use_pkd:
-            ranges = teacher_ranges
+            if pkd_range == prune_range and pkd_range != 1:
+                ranges = teacher_ranges
+            else:
+                #print(f"{teacher_ranges.squeeze(-1)=}")
+                #print(f"{teacher_ranges.squeeze(-1).size()=}")
+                #print(f"{teacher_ranges.squeeze(-1).type()=}")
+                tmp_alignment = teacher_alignments
+                ranges = torch.zeros((tmp_alignment.size(0), tmp_alignment.size(-1), prune_range),
+                                    dtype=torch.int64, device=decoder_out.device)
+                idx = tmp_alignment + prune_range - 1 >= y_lens.unsqueeze(-1)
+
+                # change the first idx to fit the boundary
+                for i in range(0, idx.size(0)):
+                    tmp_alignment[i, idx[i]] = y_lens[i] - ( prune_range - 1 )
+                # check if the ctc_ranges is out of boundary
+                # the logic is a little bit weird, but it works
+                for i in range(0, idx.size(0)):
+                    tmp_alignment[i][tmp_alignment[i] < 0] = 0
+                ranges[:, :, 0] = tmp_alignment
+                for i in range(1, prune_range):
+                    ranges[:, :, i] = ranges[:, :, i-1] + 1
+
+                # padding beyound x_lens with max values
+                idx = torch.argmax(ranges[:, :, 0], dim=-1)
+                padding_values = ranges[range(ranges.size(0)), idx, :]
+                for i in range(0, idx.size(0)):
+                    ranges[i, idx[i]:] = padding_values[i]
+                #print(f"{ranges=}")
         else:
             # ranges : [B, T, prune_range]
             ranges = k2.get_rnnt_prune_ranges(
@@ -302,6 +331,33 @@ class Transducer(nn.Module):
             student = F.log_softmax(logits, dim=-1)
             teacher = F.softmax(teacher_logits, dim=-1)
 
+            #in the case of pkd_range=1, we need to shrink student to match teacher
+            #TODO: merging with else part
+            if pkd_range == 1:
+                tmp_student = teacher.clone()
+                for i in range(tmp_student.shape[0]):
+                    for j in range(tmp_student.shape[1]):
+                        idx = torch.where(ranges[i, j, :] == teacher_ranges[i, j, 0])
+                        tmp_student[i, j, 0, :] = student[i, j, idx, :]
+                student = tmp_student
+            else:
+                tmp_student = teacher.clone()
+                #print(f"{tmp_student.size()=}")
+                for i in range(tmp_student.shape[0]):
+                    for j in range(tmp_student.shape[1]):
+                        #print(f"{ranges[i, j, :]=}")
+                        #print(f"{teacher_ranges[i, j, :]=}")
+                        indices = [ torch.where(ranges[i, j, :]==teacher_ranges[i, j, k])[0] for k in range(pkd_range) ]
+                        #print(f"{indices=}")
+                        combined_indices = torch.cat(indices, dim=-1)
+                        #print(f"{combined_indices=}")
+                        tmp_student[i, j, :, :] = student[i, j, combined_indices, :]
+                student = tmp_student
+            #print(f"{tmp_student.size()=}")
+            #print(f"{student.size()=}")
+            #print(f"{teacher.size()=}")
+            #print(f"{ranges=}")
+            #print(f"{teacher_ranges=}")
             pkd_loss = self.pkd_criterion(student, teacher)
             """
             torch.set_printoptions(threshold=100000)
@@ -634,8 +690,12 @@ class Transducer(nn.Module):
             # beam_search_alignment [B, T]
             ranges = torch.zeros((beam_search_alignment.size(0), beam_search_alignment.size(-1), prune_range),
                                 dtype=torch.int64, device=decoder_out.device)
+            #beam_search_alignment = beam_search_alignment - prune_range//2
+            #torch.set_printoptions(threshold=100000)
+            #print(f"{beam_search_alignment[-1]=}")
 
             idx = beam_search_alignment + prune_range - 1 >= y_lens.unsqueeze(-1)
+
             # change the first idx to fit the boundary
             for i in range(0, idx.size(0)):
                 beam_search_alignment[i, idx[i]] = y_lens[i] - ( prune_range - 1 )
@@ -654,17 +714,15 @@ class Transducer(nn.Module):
                 ranges[i, idx[i]:] = padding_values[i]
             #if torch.any(idx == 0):
                 #print full tensor in pytorch
-            """
-            torch.set_printoptions(threshold=100000)
-            print(f"{beam_search_alignment[-1]=}")
-            print(f"{ranges[-1]=}")
-            print(f"{idx=}")
-            print(f"{x_lens=}")
-            print(f"{y_lens=}")
-            print("HERE HERE")
-            import sys
-            sys.exit(0)
-            """
+
+            #torch.set_printoptions(threshold=100000)
+            #print(f"{beam_search_alignment[-1]=}")
+            #print(f"{ranges[-1]=}")
+            #print(f"{idx=}")
+            #print(f"{x_lens=}")
+            #print(f"{y_lens=}")
+            #print("HERE HERE")
+
         else:
             with torch.no_grad():
                 simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(

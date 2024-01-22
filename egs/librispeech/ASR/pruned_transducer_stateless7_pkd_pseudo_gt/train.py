@@ -488,7 +488,7 @@ def get_parser():
     parser.add_argument(
         "--pkd-range",
         type=int,
-        default=1,
+        default=5,
         help="The prune range for pkd loss when using teacher ctc alignment.",
     )
 
@@ -1021,7 +1021,7 @@ def compute_loss(
                 x=feature,
                 x_lens=feature_lens,
                 y=y,
-                prune_range=params.prune_range,
+                prune_range=params.pkd_range,
                 am_scale=params.am_scale,
                 lm_scale=params.lm_scale,
                 use_teacher_ctc_alignment=params.use_teacher_ctc_alignment,
@@ -1043,7 +1043,7 @@ def compute_loss(
                 x=feature,
                 x_lens=feature_lens,
                 y=y,
-                prune_range=params.prune_range,
+                prune_range=params.pkd_range,
                 am_scale=params.am_scale,
                 lm_scale=params.lm_scale,
                 use_teacher_ctc_alignment=params.use_teacher_ctc_alignment,
@@ -1093,6 +1093,7 @@ def compute_loss(
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
             use_pkd=use_pkd,
+            pkd_range=params.pkd_range,
             teacher_ranges=teacher_ranges,
             teacher_logits=teacher_logits,
             use_ctc=params.use_ctc,
@@ -1104,6 +1105,7 @@ def compute_loss(
             teacher_compressed_masks=teacher_compressed_masks,
             use_alphas=use_alphas,
             teacher_alphas=teacher_alphas,
+            teacher_alignments=beam_search_alignment,
         )
         s = params.simple_loss_scale
         # take down the scale on the simple loss from 1.0 at the start
@@ -1161,6 +1163,10 @@ def compute_loss(
         info["ctc_loss"] = ctc_loss.detach().cpu().item()
     if params.use_alphas:
         info["alphas_loss"] = alphas_loss.detach().cpu().item()
+
+    #if use_beam_search:
+    #    import sys
+    #    sys.exit(0)
     return loss, info
 
 
