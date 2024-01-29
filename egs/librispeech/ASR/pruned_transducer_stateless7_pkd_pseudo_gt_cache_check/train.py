@@ -90,6 +90,8 @@ from icefall.utils import (
     str2bool,
 )
 
+import math
+
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
 def load_teacher_checkpoint(model: Union[nn.Module, DDP], filename: str, strict: bool = False) -> None:
@@ -534,6 +536,13 @@ def get_parser():
         help="How many hyphotheses do you take when doing knowledge distillation",
     )
 
+    parser.add_argument(
+        "--dump-hyp",
+        type=str,
+        default=None,
+        help="Dump file location to save hypotheses from teacher model",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -882,6 +891,7 @@ def compute_loss(
         for i in range(len(batch["supervisions"]['cut'])):
             ids.append(batch["supervisions"]['cut'][i].id)
 
+        import math
         with torch.no_grad():
             # check cache memory
             all_in_cache = True
@@ -901,7 +911,6 @@ def compute_loss(
                 )
 
                 # adding
-                import math
                 hyp_alignment = torch.zeros(feature_lens.size()[0], math.ceil((feature_lens[0]-8)/4), dtype=torch.int)
                 for i in range(feature_lens.size()[0]):
                     for j in range(len(decoding_result.hyps[i])):
@@ -913,6 +922,26 @@ def compute_loss(
                     hyp_cache[ids[i]] = hyp_tokens[i]
 
             else:
+                #print("Cache hit!")
+                # check whether the length of hyp and the length of batch are the same
+                for i in range(feature_lens.size()[0]):
+                    # feature lens to encoder lens
+                    encoder_len = math.ceil((feature_lens[i]-8)/4)
+                    hyp_len = len(hyp_cache[ids[i]])
+                    if hyp_len != encoder_len:
+                        tmp_hyp = hyp_cache[ids[i]]
+                        # case 1. hyp_cache[ids[i]] is shorter than encoder_lens
+                        if hyp_len < encoder_len:
+                            #print(f"{hyp_cache[ids[i]]}")
+                            #print(f"{hyp_len=} is shorter than {encoder_len=}")
+                            hyp_cache[ids[i]] = tmp_hyp.extend([0]*(encoder_len-hyp_len))
+                        # case 2. hyp_cache[ids[i]] is longer than encoder_lens
+                        if hyp_len > encoder_len:
+                            #print(f"{hyp_cache[ids[i]]}")
+                            #print(f"{hyp_len=} is longer than {encoder_len=}")
+                            hyp_cache[ids[i]] = tmp_hyp[:encoder_len]
+
+                # loading hyp_tokens from cache
                 hyp_tokens = list()
                 for i in range(len(ids)):
                     hyp_tokens.append(hyp_cache[ids[i]])
@@ -927,54 +956,9 @@ def compute_loss(
 
             # don't need
             # remove duplicated labels with maintaing order
-            non_duplicated_pseudo_labels = list()
-            for i in range(len(pseudo_labels)):
-                non_duplicated_pseudo_label = list()
-                if pseudo_labels[i] != []:
-                    non_duplicated_pseudo_label.append(pseudo_labels[i][0])
-                    for j in range(1, len(pseudo_labels[i])):
-                        if pseudo_labels[i][j] != pseudo_labels[i][j-1]:
-                            non_duplicated_pseudo_label.append(pseudo_labels[i][j])
-                else:
-                    print(f"{i=}" + "th pseudo label is empty")
-                    print(f"inserting the original label {y[i].tolist()}")
-                    print(f"{len(y[i].tolist())}")
-                    #import pickld
-                    #dump_file = "batch_dump.pkl"
-                    #with open(dump_file, "wb") as f:
-                    #    pickle.dump(batch, f)
-                    non_duplicated_pseudo_label = y[i].tolist()
-                    # make a new alignment with the original label
-                    # 424 / 72 = 5.88
-                    # period = 5
-                    import math
-                    x_len = math.ceil((feature_lens[i] - 8) / 4) ## heuristics
-                    new_alignment = list([ 0 for i in range(x_len) ])
-                    period = x_len // len(non_duplicated_pseudo_label)
-                    for j in range(len(non_duplicated_pseudo_label)):
-                        new_alignment[period//2 + j*period] = non_duplicated_pseudo_label[j]
-                    #print(f"{feature_lens=}")
-                    #print(f"{new_alignment=}")
-                    #print(f"{len(new_alignment)=}")
-                    hyp_tokens[i] = [ new_alignment ]
-
-                non_duplicated_pseudo_labels.append(non_duplicated_pseudo_label)
-
             # convert list(list()) to k2.RaggedTensor
-            #print(f"{non_duplicated_pseudo_labels=}")
-            pseudo_y = k2.RaggedTensor(non_duplicated_pseudo_labels).to(device)
+            pseudo_y = k2.RaggedTensor(pseudo_labels).to(device)
             y = pseudo_y.clone()
-            #row_splits = y.shape.row_splits(1)
-            #y_lens = row_splits[1:] - row_splits[:-1]
-            #blank_id = params.blank_id
-            #sos_id = add_sos(y, sos_id=blank_id)
-
-            # change hyp_tokens to alignment for icefall
-            # for example (vocab_size=10)
-            # labels: [ 2, 4, 5, 9 ]
-            # hyp_tokens =        [[ 0, 0, 2, 4, 0, 5, 0, 0, 9, 0 ]]
-            # icefall_alignment = [[ 0, 0, 1, 2, 2, 3, 3, 3, 4, 4 ]]
-            # currently I assume that hypothesis is 1-best result
 
             # first, check if the first token is blank
             for i in range(len(hyp_tokens)):
@@ -990,33 +974,13 @@ def compute_loss(
             # remove duplicated labels in hyp_tokens
             # and convert the sequence to monotonic increasing sequence
             for i in range(len(hyp_tokens)):
-                prev = hyp_tokens[i][0]
-                for j in range(1, len(hyp_tokens[i])):
-                    if hyp_tokens[i][j] != 0:
-                        if prev != hyp_tokens[i][j]:
-                            prev = hyp_tokens[i][j]
-                        else:
-                            hyp_tokens[i][j] = 0
-
                 mask = (torch.tensor(hyp_tokens[i], dtype=torch.bool) != 0)
                 alignment[i, :len(hyp_tokens[i])] = torch.cumsum(mask.int(), dim=-1, dtype=torch.int32)
 
             beam_search_alignment = alignment.to(device)
-            # for debugging
-            #print(f"{beam_search_alignment.size()=}")
-            #for i in range(beam_search_alignment.size(0)):
-            #    print(f"{beam_search_alignment[i]=}")
-            #for i in range(alignment.size(0)):
-            #    hyp = [ x for x in hyp_tokens[i][0] if x != 0 ]
-            #    print(f"{sp.decode(hyp)=}")
-            #    print(f"{sp.decode(y[i].tolist())=}")
-            #    #print(f"{hyp_tokens[i][0]=}")
 
     if use_pkd:
         with torch.no_grad():
-            #print(f"{y=}")
-            #print(f"{use_beam_search=}")
-            #print(f"{beam_search_alignment=}")
             ret = teacher_model.get_ranges_and_logits(
                 x=feature,
                 x_lens=feature_lens,
@@ -1034,26 +998,6 @@ def compute_loss(
 
         teacher_ranges = ret[0]
         teacher_logits = ret[1]
-        if params.use_time_compression:
-            teacher_compressed_ranges = ret[-3]
-            teacher_compressed_logits = ret[-2]
-            teacher_compressed_masks = ret[-1]
-
-            ret = teacher_model.get_ranges_and_logits(
-                x=feature,
-                x_lens=feature_lens,
-                y=y,
-                prune_range=params.prune_range,
-                am_scale=params.am_scale,
-                lm_scale=params.lm_scale,
-                use_teacher_ctc_alignment=params.use_teacher_ctc_alignment,
-                use_efficient=params.use_efficient,
-                use_time_compression=params.use_time_compression,
-                compression_threshold=params.time_compression_threshold,
-            )
-
-            teacher_ranges = ret[0]
-            teacher_logits = ret[1]
 
         with torch.no_grad():
             teacher_alphas = teacher_model.get_alphas(
@@ -1599,7 +1543,15 @@ def run(rank, world_size, args):
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 
-    hyp_cache = dict()
+    # loading dump hypotheses
+    if params.dump_hyp is None or params.dump_hyp == "":
+        hyp_cache = dict()
+        logging.info("No dump hypotheses provided")
+    else:
+        import pickle
+        hyp_cache = pickle.load(open(params.dump_hyp, "rb"))
+        logging.info(f"Loaded {len(hyp_cache)} hypotheses from {params.dump_hyp}")
+
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)
         fix_random_seed(params.seed + epoch - 1)
