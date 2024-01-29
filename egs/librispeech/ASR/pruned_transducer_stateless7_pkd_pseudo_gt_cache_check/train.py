@@ -530,6 +530,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--use-beam-search-alignment",
+        type=str2bool,
+        default=False,
+        help="Whether to use beam search alignment when doing knowledge distillation",
+    )
+
+    parser.add_argument(
         "--teacher-n-best",
         type=int,
         default=1,
@@ -911,6 +918,7 @@ def compute_loss(
                 )
 
                 # adding
+                # the equation is heuristically determined
                 hyp_alignment = torch.zeros(feature_lens.size()[0], math.ceil((feature_lens[0]-8)/4), dtype=torch.int)
                 for i in range(feature_lens.size()[0]):
                     for j in range(len(decoding_result.hyps[i])):

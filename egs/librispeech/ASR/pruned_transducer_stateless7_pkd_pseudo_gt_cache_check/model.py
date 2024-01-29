@@ -630,7 +630,7 @@ class Transducer(nn.Module):
             sys.exit(0)
             """
             #print(f"ranges: {ranges}")
-        elif use_beam_search:
+        elif use_beam_search and beam_search_alignment is not None:
             # beam_search_alignment [B, T]
             ranges = torch.zeros((beam_search_alignment.size(0), beam_search_alignment.size(-1), prune_range),
                                 dtype=torch.int64, device=decoder_out.device)
@@ -654,17 +654,21 @@ class Transducer(nn.Module):
                 ranges[i, idx[i]:] = padding_values[i]
             #if torch.any(idx == 0):
                 #print full tensor in pytorch
-            """
-            torch.set_printoptions(threshold=100000)
-            print(f"{beam_search_alignment[-1]=}")
-            print(f"{ranges[-1]=}")
-            print(f"{idx=}")
-            print(f"{x_lens=}")
-            print(f"{y_lens=}")
-            print("HERE HERE")
-            import sys
-            sys.exit(0)
-            """
+
+            #torch.set_printoptions(threshold=100000)
+            #print(f"{beam_search_alignment[0]=}")
+            #print(f"{ranges[0]=}")
+            #print(f"{beam_search_alignment[-1]=}")
+            #print(f"{ranges[-1]=}")
+            #print(f"{idx=}")
+            #print(f"{x_lens=}")
+            #print(f"{y_lens=}")
+            #print(f"{boundary=}")
+            #print(f"{beam_search_alignment.shape=}")
+            #print("HERE HERE")
+            #import sys
+            #sys.exit(0)
+
         else:
             with torch.no_grad():
                 simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
