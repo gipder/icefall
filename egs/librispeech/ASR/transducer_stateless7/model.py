@@ -20,6 +20,7 @@ import random
 import k2
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchaudio
 from encoder_interface import EncoderInterface
 from scaling import penalize_abs_values_gt
@@ -65,19 +66,21 @@ class Transducer(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.joiner = joiner
-        """
-        self.simple_am_proj = nn.Linear(
-            encoder_dim,
-            vocab_size,
-        )
-        self.simple_lm_proj = nn.Linear(decoder_dim, vocab_size)
-        """
+
+        self.kd_criterion = nn.KLDivLoss(reduction="batchmean")
+        self.ctc_layer = nn.Linear(encoder_dim, vocab_size)
+        self.ctc_criterion = None
 
     def forward(
         self,
         x: torch.Tensor,
         x_lens: torch.Tensor,
         y: k2.RaggedTensor,
+        use_kd: bool = False,
+        teacher_logits: torch.Tensor = None,
+        use_ctc: bool = False,
+        teacher_model: nn.Module = None,
+        use_efficient: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -150,4 +153,101 @@ class Transducer(nn.Module):
             reduction="sum",
         )
 
-        return loss
+        if use_kd:
+            student = F.log_softmax(logits, dim=-1)
+            teacher = F.softmax(teacher_logits, dim=-1)
+
+            if use_efficient:
+                tensor_sos_y_padded = sos_y_padded.to(torch.int64)
+                indices = tensor_sos_y_padded.unsqueeze(1).unsqueeze(-1)
+                logits = torch.softmax(logits, dim=-1)
+                teacher_logits = torch.softmax(teacher_logits, dim=-1)
+                # py
+                py_logits = torch.gather(logits, -1, indices.expand(-1, logits.size(1), -1, -1))
+                teacher_py_logits = torch.gather(teacher_logits, -1, indices.expand(-1, logits.size(1), -1, -1))
+                # blank
+                blank_indices = torch.full_like(indices, blank_id)
+                blank_logits = torch.gather(logits, -1, blank_indices.expand(-1, logits.size(1), -1, -1))
+                teacher_blank_logits = torch.gather(teacher_logits, -1, blank_indices.expand(-1, logits.size(1), -1, -1))
+                # remainder
+                rem_logits = torch.ones(py_logits.shape, device=logits.device) - py_logits - blank_logits
+                teacher_rem_logits = torch.ones(teacher_py_logits.shape, device=teacher_logits.device) - teacher_py_logits - teacher_blank_logits
+
+                # concatenate
+                eps = 1e-10
+                student = torch.cat([py_logits, blank_logits, rem_logits], dim=-1)
+                student = torch.clamp(student, eps, 1.0)
+                student = student.log()
+                teacher = torch.cat([teacher_py_logits, teacher_blank_logits, teacher_rem_logits], dim=-1)
+
+                max_len = logits.size(1)
+                mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
+                mask = mask.unsqueeze(-1).unsqueeze(-1)
+
+                student = student * mask.float()
+                teacher = teacher * mask.float()
+                #print(f"{logits.shape=}")
+                #print(f"{teacher_logits.shape=}")
+                #print(f"{tensor_sos_y_padded.shape=}")
+                #print(f"{tensor_sos_y_padded=}")
+                #print(f"{py_logits.shape=}")
+                #print(f"{teacher_py_logits.shape=}")
+                #print(f"{x_lens=}")
+                #import sys
+                #sys.exit(0)
+
+            kd_loss = self.kd_criterion(student, teacher)
+
+        ret = dict()
+        ret["org_loss"] = loss
+        if use_kd:
+            ret["kd_loss"] = kd_loss
+        else:
+            ret["kd_loss"] = torch.tensor(0.0)
+
+        return ret
+
+    def get_logits(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        y: k2.RaggedTensor,
+        use_grad: bool = False,
+    ) -> torch.Tensor:
+
+        assert x.ndim == 3, x.shape
+        assert x_lens.ndim == 1, x_lens.shape
+        assert y.num_axes == 2, y.num_axes
+
+        assert x.size(0) == x_lens.size(0) == y.dim0
+
+        encoder_out, x_lens = self.encoder(x, x_lens)
+        assert torch.all(x_lens > 0)
+
+        # Now for the decoder, i.e., the prediction network
+        row_splits = y.shape.row_splits(1)
+        y_lens = row_splits[1:] - row_splits[:-1]
+
+        blank_id = self.decoder.blank_id
+        sos_y = add_sos(y, sos_id=blank_id)
+
+        # sos_y_padded: [B, S + 1], start with SOS.
+        sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
+        sos_y_padded = sos_y_padded.to(torch.int64)
+
+        # decoder_out: [B, S + 1, decoder_dim]
+        decoder_out = self.decoder(sos_y_padded)
+
+        encoder_out = self.joiner.encoder_proj(encoder_out)
+        decoder_out = self.joiner.decoder_proj(decoder_out)
+
+        logits = self.joiner(
+            encoder_out=encoder_out,
+            decoder_out=decoder_out,
+            project_input=False,
+        )
+
+        if use_grad is False:
+            logits = logits.detach_()
+
+        return logits

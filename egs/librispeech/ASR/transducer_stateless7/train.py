@@ -90,8 +90,29 @@ from icefall.utils import (
     str2bool,
 )
 
+import math
+
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
+def load_teacher_checkpoint(model: Union[nn.Module, DDP], filename: str, strict: bool = False) -> None:
+    """
+    Load the teacher model from a checkpoint.
+    """
+    logging.info(f"Loading checkpoint from {filename}")
+    checkpoint = torch.load(filename, map_location="cpu")
+
+    if next(iter(checkpoint["model"])).startswith("module."):
+        logging.info("Loading checkpoint saved by DDP")
+
+        dst_state_dict = model.state_dict()
+        src_state_dict = checkpoint["model"]
+        for key in dst_state_dict.keys():
+            src_key = "{}.{}".format("module", key)
+            dst_state_dict[key] = src_state_dict.pop(src_key)
+        assert len(src_state_dict) == 0
+        model.load_state_dict(dst_state_dict, strict=strict)
+    else:
+        model.load_state_dict(checkpoint["model"], strict=strict)
 
 def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
     if isinstance(model, DDP):
@@ -374,6 +395,132 @@ def get_parser():
         help="Whether to use half precision training.",
     )
 
+    parser.add_argument(
+        "--use-kd",
+        type=str2bool,
+        default=False,
+        help="Whether to use Knowledge Distillation (KD) training.",
+    )
+
+    parser.add_argument(
+        "--kd-loss-scale",
+        type=float,
+        default=0.5,
+        help="The scale to smooth the loss with KD part.",
+    )
+
+    parser.add_argument(
+        "--teacher-checkpoint",
+        type=str,
+        default="",
+        help="The checkpoint of the teacher model for KD training.",
+    )
+
+    parser.add_argument(
+        "--teacher-num-encoder-layers",
+        type=str,
+        default="",
+        help="The number of encoder layers of teacher model for knowledge distillation.",
+    )
+
+    parser.add_argument(
+        "--teacher-feedforward-dims",
+        type=str,
+        default="",
+        help="The feedforward dimensions of teacher model for knowledge distillation.",
+    )
+
+    parser.add_argument(
+        "--teacher-nhead",
+        type=str,
+        default="",
+        help="The number of attention heads of teacher model for knowledge distillation.",
+    )
+
+    parser.add_argument(
+        "--teacher-encoder-dims",
+        type=str,
+        default="",
+        help="The encoder dimensions of teacher model for knowledge distillation.",
+    )
+
+    parser.add_argument(
+        "--teacher-attention-dims",
+        type=str,
+        default="",
+        help="The attention dimensions of teacher model for knowledge distillation.",
+    )
+
+    parser.add_argument(
+        "--teacher-encoder-unmasked-dims",
+        type=str,
+        default="",
+        help="The encoder unmasked dimensions of teacher model for knowledge distillation.",
+    )
+
+    parser.add_argument(
+        "--use-reset-simple-layer",
+        type=str2bool,
+        default=False,
+        help="Whether to reset simple layers.",
+    )
+
+    parser.add_argument(
+        "--use-ctc",
+        type=str2bool,
+        default=False,
+        help="Whether to use ctc layers.",
+    )
+
+    parser.add_argument(
+        "--use-teacher-ctc-alignment",
+        type=str2bool,
+        default=False,
+        help="Whether to use teacher ctc alignment.",
+    )
+
+    parser.add_argument(
+        "--use-efficient",
+        type=str2bool,
+        default=False,
+        help="Whether to use p_y, p_blank, p_rem for KD",
+    )
+
+    parser.add_argument(
+        "--use-teacher-simple-proj",
+        type=str2bool,
+        default=False,
+        help="Whether to update simple projection layers of teacher model",
+    )
+
+    parser.add_argument(
+        "--use-beam-search",
+        type=str2bool,
+        default=False,
+        help="Whether to use beam search when doing knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--use-beam-search-alignment",
+        type=str2bool,
+        default=False,
+        help="Whether to use beam search alignment when doing knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--teacher-n-best",
+        type=int,
+        default=1,
+        help="How many hyphotheses do you take when doing knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--dump-hyp",
+        type=str,
+        default=None,
+        help="Dump file location to save hypotheses from teacher model",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -631,6 +778,8 @@ def compute_loss(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
+    teacher_model: Optional[Union[nn.Module, DDP]] = None,
+    hyp_cache: dict = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute transducer loss given the model and its inputs.
@@ -677,13 +826,155 @@ def compute_loss(
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
+    if isinstance(teacher_model, DDP):
+        teacher_model = teacher_model.module
+
+    teacher_logits = None
+    beam_search_alignment = None
+
+    if teacher_model is None:
+        use_kd = False
+        use_teacher_simple_proj = False
+        use_beam_search = False
+    else:
+        use_kd = params.use_kd
+        use_teacher_simple_proj = params.use_teacher_simple_proj
+        use_beam_search = params.use_beam_search
+
+    if use_beam_search:
+        from beam_search import (
+            modified_beam_search,
+            modified_beam_search_for_kd,
+            Hypothesis,
+            HypothesisList,
+        )
+        from icefall.utils import add_sos
+
+        ids = list()
+        for i in range(len(batch["supervisions"]['cut'])):
+            ids.append(batch["supervisions"]['cut'][i].id)
+
+        import math
+        with torch.no_grad():
+            all_in_cache = True
+            if hyp_cache is not None:
+                for i in range(len(ids)):
+                    if hyp_cache.get(ids[i]) is None:
+                        all_in_cache = False
+                        break
+            if all_in_cache is False:
+                decoding_result = modified_beam_search_for_kd(
+                    model=teacher_model,
+                    x=feature,
+                    x_lens=feature_lens,
+                    beam=4,
+                )
+
+                # adding
+                # the equation is heuristically determined
+                hyp_alignment = torch.zeros(feature_lens.size()[0], math.ceil((feature_lens[0]-8)/4), dtype=torch.int)
+                for i in range(feature_lens.size()[0]):
+                    for j in range(len(decoding_result.hyps[i])):
+                        hyp_alignment[i, decoding_result.timestamps[i][j]] = decoding_result.hyps[i][j]
+
+                hyp_tokens = hyp_alignment.tolist()
+                # add the hyp_tokens to cache
+                for i in range(len(hyp_tokens)):
+                    hyp_cache[ids[i]] = hyp_tokens[i]
+
+            else:
+                #print("Cache hit!")
+                # check whether the length of hyp and the length of batch are the same
+                for i in range(feature_lens.size()[0]):
+                    # feature lens to encoder lens
+                    encoder_len = math.ceil((feature_lens[i]-8)/4)
+                    hyp_len = len(hyp_cache[ids[i]])
+                    if hyp_len != encoder_len:
+                        tmp_hyp = hyp_cache[ids[i]]
+                        # case 1. hyp_cache[ids[i]] is shorter than encoder_lens
+                        if hyp_len < encoder_len:
+                            #print(f"{hyp_cache[ids[i]]}")
+                            #print(f"{hyp_len=} is shorter than {encoder_len=}")
+                            hyp_cache[ids[i]] = tmp_hyp.extend([0]*(encoder_len-hyp_len))
+                        # case 2. hyp_cache[ids[i]] is longer than encoder_lens
+                        if hyp_len > encoder_len:
+                            #print(f"{hyp_cache[ids[i]]}")
+                            #print(f"{hyp_len=} is longer than {encoder_len=}")
+                            hyp_cache[ids[i]] = tmp_hyp[:encoder_len]
+
+                # loading hyp_tokens from cache
+                hyp_tokens = list()
+                for i in range(len(ids)):
+                    hyp_tokens.append(hyp_cache[ids[i]])
+
+            # make pseudo labels
+            pseudo_labels = list()
+            for i in range(len(hyp_tokens)):
+                tmp_pseudo_label = [ t for t in hyp_tokens[i] if t != 0 ]
+                #for j in hyp_tokens[i]:
+                #    tmp_pseudo_label = [ t for t in j if t != 0 ]
+                pseudo_labels.append(tmp_pseudo_label)
+
+            # don't need
+            # remove duplicated labels with maintaing order
+            # convert list(list()) to k2.RaggedTensor
+            pseudo_y = k2.RaggedTensor(pseudo_labels).to(device)
+            y = pseudo_y.clone()
+
+            # first, check if the first token is blank
+            for i in range(len(hyp_tokens)):
+                if hyp_tokens[i][0] != 0:
+                    hyp_tokens[i][1:] = hyp_tokens[i][:-1] # shift to right
+                    hyp_tokens[i][0] = 0
+            # get max length of hyp_tokens
+            max_len = 0
+            for i in range(len(hyp_tokens)):
+                if max_len < len(hyp_tokens[i]):
+                    max_len = len(hyp_tokens[i])
+            alignment = torch.zeros((len(hyp_tokens), max_len), dtype=torch.int32)
+            # remove duplicated labels in hyp_tokens
+            # and convert the sequence to monotonic increasing sequence
+            for i in range(len(hyp_tokens)):
+                mask = (torch.tensor(hyp_tokens[i], dtype=torch.bool) != 0)
+                alignment[i, :len(hyp_tokens[i])] = torch.cumsum(mask.int(), dim=-1, dtype=torch.int32)
+
+            beam_search_alignment = alignment.to(device)
+
+    if use_kd:
+        with torch.no_grad():
+            ret = teacher_model.get_logits(
+                x=feature,
+                x_lens=feature_lens,
+                y=y,
+                use_grad=False,
+            )
+        teacher_logits = ret
+
     with torch.set_grad_enabled(is_training):
-        loss = model(
+        org_loss = torch.tensor(0.0, device=device)
+        kd_loss = torch.tensor(0.0, device=device)
+
+        ret = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
+            use_kd=use_kd,
+            teacher_logits=teacher_logits,
+            use_ctc=params.use_ctc,
+            teacher_model=teacher_model,
+            use_efficient=params.use_efficient,
         )
 
+    kd_loss_scale = params.kd_loss_scale
+    org_loss = ret["org_loss"]
+    if use_kd:
+        kd_loss = ret["kd_loss"]
+
+    loss = org_loss + kd_loss_scale * kd_loss
+
+    assert org_loss.requires_grad == is_training
+    if use_kd:
+        assert kd_loss.requires_grad == is_training
     assert loss.requires_grad == is_training
 
     info = MetricsTracker()
@@ -693,6 +984,9 @@ def compute_loss(
 
     # Note: We use reduction=sum while computing the loss.
     info["loss"] = loss.detach().cpu().item()
+    info["org_loss"] = ret["org_loss"].detach().cpu().item()
+    if params.use_kd:
+        info["kd_loss"] = ret["kd_loss"].detach().cpu().item()
 
     return loss, info
 
@@ -744,6 +1038,8 @@ def train_one_epoch(
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
+    teacher_model: Optional[nn.Module] = None,
+    hyp_cache: dict = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -798,6 +1094,8 @@ def train_one_epoch(
                     sp=sp,
                     batch=batch,
                     is_training=True,
+                    teacher_model=teacher_model,
+                    hyp_cache=hyp_cache,
                 )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
@@ -970,6 +1268,37 @@ def run(rank, world_size, args):
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
 
+    # load the model from checkpoint if available
+    teacher_model = None
+    if params.use_kd:
+        teacher_params = copy.deepcopy(params)
+        teacher_params.num_encoder_layers = params.teacher_num_encoder_layers
+        teacher_params.feedforward_dims = params.teacher_feedforward_dims
+        teacher_params.nhead = params.teacher_nhead
+        teacher_params.encoder_dims = params.teacher_encoder_dims
+        teacher_model = get_transducer_model(teacher_params)
+        load_teacher_checkpoint(teacher_model, params.teacher_checkpoint)
+
+        assert teacher_model is not None
+        teacher_model.to(device)
+        teacher_model.eval()
+
+        if params.use_teacher_simple_proj:
+            teacher_model.reset_simple_layer()
+            logging.info("Resetting simple layer in teacher model")
+            #TODO hard coded
+            model.set_teacher_simple_layer(384, #teacher_model.encoder.encoder_dims,
+                                           512, #teacher_model.decoder.dims,
+                                           500, #teacher_model.decoder.vocab_size,
+                                           device)
+        logging.info("Teacher model loaded")
+        num_param = sum([p.numel() for p in teacher_model.parameters()])
+        logging.info(f"Number of teacher model parameters: {num_param}")
+
+    if params.use_ctc:
+        model.set_ctc_loss(reduction="sum", zero_infinity=True, blank=params.blank_id)
+        logging.info("Using CTC loss")
+
     assert params.save_every_n >= params.average_period
     model_avg: Optional[nn.Module] = None
     if rank == 0:
@@ -1095,6 +1424,15 @@ def run(rank, world_size, args):
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 
+    # loading dump hypotheses
+    if params.dump_hyp is None or params.dump_hyp == "":
+        hyp_cache = dict()
+        logging.info("No dump hypotheses provided")
+    else:
+        import pickle
+        hyp_cache = pickle.load(open(params.dump_hyp, "rb"))
+        logging.info(f"Loaded {len(hyp_cache)} hypotheses from {params.dump_hyp}")
+
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)
         fix_random_seed(params.seed + epoch - 1)
@@ -1118,6 +1456,8 @@ def run(rank, world_size, args):
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,
+            teacher_model=teacher_model,
+            hyp_cache=hyp_cache,
         )
 
         if params.print_diagnostics:
