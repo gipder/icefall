@@ -568,11 +568,17 @@ def decode_one_batch(
         hyp_tokens = hyp_alignment.tolist()
         for i in range(len(hyp_tokens)):
             cache[ids[i]] = hyp_tokens[i]
-
+        #a = list(filter(lambda x:x != 0, hyp_tokens[0]))
+        #print(f"{list(filter(lambda x:x != 0, hyp_tokens[0]))=}")
+        #print(f"{len(list(filter(lambda x:x != 0, hyp_tokens[0])))=}")
+        #print(f"{hyp_tokens[0]=}")
         # real hyp_tokens
         hyp_tokens = decoding_result.hyps
         for hyp in sp.decode(hyp_tokens):
             hyps.append(hyp.split())
+        #print(f"{len(hyp_tokens[0])=}")
+        #print(f"{hyp_tokens[0]=}")
+        #print(f"{a==hyp_tokens[0]}")
 
     elif params.decoding_method == "modified_beam_search_lm_shallow_fusion":
         hyp_tokens = modified_beam_search_lm_shallow_fusion(
@@ -1010,7 +1016,8 @@ def main():
     test_clean_cuts = librispeech.test_clean_cuts()
     #test_other_cuts = librispeech.test_other_cuts()
 
-    train_clean_100_dl = librispeech.train_dataloaders(train_clean_100_cuts)
+    train_clean_100_dl = librispeech.test_dataloaders(train_clean_100_cuts)
+    #train_clean_100_dl = librispeech.train_dataloaders(train_clean_100_cuts)
     #train_small_dl = librispeech.train_pure_dataloaders(train_small_cuts)
     #train_small_dl = librispeech.train_dataloaders(train_small_cuts)
     test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
@@ -1024,7 +1031,7 @@ def main():
 
     #test_sets = ["test-clean"]
     #test_dl = [test_clean_dl]
-    epoch = 30
+    epoch = 1
     for e in range(1, epoch + 1):
         cache = dict()
         test_sets = ["train-clean-100"]
@@ -1051,7 +1058,6 @@ def main():
                 test_set_name=test_set,
                 results_dict=results_dict,
                 cache=cache,
-                epoch=e,
             )
         logging.info(f"epoch {e} is done")
 
