@@ -201,8 +201,14 @@ class Transducer(nn.Module):
 
             if use_1best:
                 # getting the 1-best pash
+                # pseudo_y: [B, U]
+                # pseudo_y_alignment: [B, S, U]
+                print(f"{logits.shape=}")
+                import sys
+                sys.exit(0)
                 teacher_logits = teacher_model.get_logits(x, x_lens, pseudo_y, use_grad=False)
                 student_logits = self.get_logits(x, x_lens, pseudo_y, use_grad=True)
+
 
             kd_loss = self.kd_criterion(student, teacher)
 
