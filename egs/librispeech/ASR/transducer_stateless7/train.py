@@ -521,6 +521,20 @@ def get_parser():
         help="Dump file location to save hypotheses from teacher model",
     )
 
+    parser.add_argument(
+        "--use-1best",
+        type=str2bool,
+        default=False,
+        help="Whether to use 1best when doing knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--use-sequence",
+        type=str2bool,
+        default=False,
+        help="Whether to use sequence-level learning when doing knowledge distillation",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -830,7 +844,9 @@ def compute_loss(
         teacher_model = teacher_model.module
 
     teacher_logits = None
+    pseudo_y = None
     beam_search_alignment = None
+    pseudo_y_sequence = None
 
     if teacher_model is None:
         use_kd = False
@@ -919,6 +935,8 @@ def compute_loss(
             # remove duplicated labels with maintaing order
             # convert list(list()) to k2.RaggedTensor
             pseudo_y = k2.RaggedTensor(pseudo_labels).to(device)
+
+            # I didn't copy the pseudo_y to y
             y = pseudo_y.clone()
 
             # first, check if the first token is blank
@@ -932,6 +950,12 @@ def compute_loss(
                 if max_len < len(hyp_tokens[i]):
                     max_len = len(hyp_tokens[i])
             alignment = torch.zeros((len(hyp_tokens), max_len), dtype=torch.int32)
+
+            # get pseudo_y_sequence
+            pseudo_y_sequence = alignment.clone().to(device)
+            for i in range(len(hyp_tokens)):
+                pseudo_y_sequence[i, :len(hyp_tokens[i])] = torch.tensor(hyp_tokens[i], dtype=torch.int32)
+
             # remove duplicated labels in hyp_tokens
             # and convert the sequence to monotonic increasing sequence
             for i in range(len(hyp_tokens)):
@@ -942,6 +966,12 @@ def compute_loss(
 
     if use_kd:
         with torch.no_grad():
+            """
+            if use_beam_search:
+                teacher_y = pseudo_y
+            else:
+                teacher_y = y
+            """
             ret = teacher_model.get_logits(
                 x=feature,
                 x_lens=feature_lens,
@@ -963,6 +993,10 @@ def compute_loss(
             use_ctc=params.use_ctc,
             teacher_model=teacher_model,
             use_efficient=params.use_efficient,
+            use_1best=params.use_1best,
+            pseudo_y_alignment=beam_search_alignment,
+            use_sequence=params.use_sequence,
+            pseudo_y_sequence=pseudo_y_sequence,
         )
 
     kd_loss_scale = params.kd_loss_scale

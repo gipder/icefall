@@ -82,8 +82,9 @@ class Transducer(nn.Module):
         teacher_model: nn.Module = None,
         use_efficient: bool = False,
         use_1best: bool = False,
-        pseudo_y: k2.RaggedTensor = None,
         pseudo_y_alignment: torch.Tensor = None,
+        use_sequence: bool = False,
+        pseudo_y_sequence: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -110,6 +111,7 @@ class Transducer(nn.Module):
 
         assert x.size(0) == x_lens.size(0) == y.dim0
 
+        org_x_lens = x_lens.clone()
         encoder_out, x_lens = self.encoder(x, x_lens)
         assert torch.all(x_lens > 0)
 
@@ -160,9 +162,15 @@ class Transducer(nn.Module):
             student = F.log_softmax(logits, dim=-1)
             teacher = F.softmax(teacher_logits, dim=-1)
 
+            # the case when use_efficient is True and use_1best is True
+            # is not supported yet.
+            assert not (use_efficient and use_1best)
+            assert not (use_efficient and use_sequence)
+            assert not (use_1best and use_sequence)
+
             if use_efficient:
-                tensor_sos_y_padded = sos_y_padded.to(torch.int64)
-                indices = tensor_sos_y_padded.unsqueeze(1).unsqueeze(-1)
+                tensor_y_padded = y_padded.to(torch.int64)
+                indices = tensor_y_padded.unsqueeze(1).unsqueeze(-1)
                 logits = torch.softmax(logits, dim=-1)
                 teacher_logits = torch.softmax(teacher_logits, dim=-1)
                 # py
@@ -183,26 +191,87 @@ class Transducer(nn.Module):
                 student = student.log()
                 teacher = torch.cat([teacher_py_logits, teacher_blank_logits, teacher_rem_logits], dim=-1)
 
+                # T-axis direction masking
                 max_len = logits.size(1)
                 mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
                 mask = mask.unsqueeze(-1).unsqueeze(-1)
-
                 student = student * mask.float()
                 teacher = teacher * mask.float()
-                #print(f"{logits.shape=}")
-                #print(f"{teacher_logits.shape=}")
-                #print(f"{tensor_sos_y_padded.shape=}")
-                #print(f"{tensor_sos_y_padded=}")
-                #print(f"{py_logits.shape=}")
-                #print(f"{teacher_py_logits.shape=}")
-                #print(f"{x_lens=}")
-                #import sys
-                #sys.exit(0)
+
+                # U-axis direction masking
+                max_len = torch.max(y_lens)
+                mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), logits.size(1), max_len) < y_lens.unsqueeze(-1).unsqueeze(-1)
+                mask = mask.unsqueeze(-1)
+                student = student * mask.float()
+                teacher = teacher * mask.float()
+                """
+                use_debug = False
+                if use_debug:
+                    print(f"{logits.shape=}")
+                    print(f"{teacher_logits.shape=}")
+                    print(f"{tensor_y_padded.shape=}")
+                    print(f"{tensor_y_padded=}")
+                    print(f"{py_logits.shape=}")
+                    print(f"{teacher_py_logits.shape=}")
+                    print(f"{x_lens=}")
+                    print(f"{y_lens=}")
+                    print(f"{student[-1,0,:,:]=}")
+                    print(f"{teacher[-1,0,:,:]=}")
+                    import sys
+                    sys.exit(0)
+                """
 
             if use_1best:
                 # getting the 1-best pash
-                teacher_logits = teacher_model.get_logits(x, x_lens, pseudo_y, use_grad=False)
-                student_logits = self.get_logits(x, x_lens, pseudo_y, use_grad=True)
+                # pseudo_y: [B, U]
+                # pseudo_y_alignment: [B, S, U]
+                #print(f"{logits.shape=}")
+                #print(f"{pseudo_y=}")
+                #print(f"{pseudo_y_alignment=}")
+
+                # memory explosion
+                #teacher_logits = teacher_model.get_logits(x, org_x_lens, pseudo_y, use_grad=False)
+                #student_logits = self.get_logits(x, org_x_lens, pseudo_y, use_grad=True)
+                #student = F.log_softmax(student_logits, dim=-1)
+                #teacher = F.softmax(teacher_logits, dim=-1)
+                idx = pseudo_y_alignment.unsqueeze(-1).expand(-1, -1, logits.shape[-1]).unsqueeze(2)
+                idx = idx.to(torch.int64)
+                teacher = torch.gather(teacher, 2, idx)
+                student = torch.gather(student, 2, idx)
+                max_len = logits.size(1)
+                mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
+                mask = mask.unsqueeze(-1).unsqueeze(-1)
+                student = student * mask.float()
+                teacher = teacher * mask.float()
+                #print(f"{student[-1,-1,:,:]=}")
+                #print(f"{teacher[-1,-1,:,:]=}")
+
+            if use_sequence:
+                idx = pseudo_y_alignment.unsqueeze(-1).expand(-1, -1, logits.shape[-1]).unsqueeze(2)
+                idx = idx.to(torch.int64)
+                teacher = torch.gather(teacher, 2, idx)
+                student = torch.gather(student, 2, idx)
+                # print all tensor
+                #torch.set_printoptions(profile="full")
+                #print(f"selected {student[-1, 12:14]=}")
+                #print(f"selected {teacher[-1, 12:14]=}")
+                # pick only the seq values
+                pseudo_y_sequence = pseudo_y_sequence.to(torch.int64)
+                teacher = torch.gather(teacher, -1, pseudo_y_sequence.unsqueeze(-1).unsqueeze(-1))
+                student = torch.gather(student, -1, pseudo_y_sequence.unsqueeze(-1).unsqueeze(-1))
+                max_len = logits.size(1)
+                mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
+                mask = mask.unsqueeze(-1).unsqueeze(-1)
+                student = student * mask.float()
+                teacher = teacher * mask.float()
+                #print(f"{pseudo_y_sequence[-1]=}")
+                #print(f"{student[-1, 12:14]=}")
+                #print(f"{teacher[-1, 12:14]=}")
+                #print(f"{student[-1,-1,:,:]=}")
+                #print(f"{teacher[-1,-1,:,:]=}")
+
+                #import sys
+                #sys.exit(0)
 
             kd_loss = self.kd_criterion(student, teacher)
 
