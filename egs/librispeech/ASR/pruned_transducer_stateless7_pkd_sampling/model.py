@@ -317,6 +317,14 @@ class Transducer(nn.Module):
             student = F.log_softmax(student_logits, dim=-1)
             teacher = F.softmax(teacher_logits, dim=-1)
 
+            # T-axis direction masking
+            max_len = logits.size(1)
+            mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
+            mask = mask.unsqueeze(-1).unsqueeze(-1)
+
+            student = student * mask.float()
+            teacher = teacher * mask.float()
+
             pkd_loss = self.pkd_criterion(student, teacher)
 
         if use_ctc:
@@ -344,6 +352,14 @@ class Transducer(nn.Module):
 
                 student_sampling = F.log_softmax(student_sampling_logits, dim=-1)
                 teacher_sampling = F.softmax(teacher_sampling_logits[i], dim=-1)
+
+                # T-axis direction masking
+                max_len = student_sampling_logits.size(1)
+                mask = torch.arange(max_len, device=student_sampling_logits.device).expand(student_sampling_logits.size(0), max_len) < x_lens.unsqueeze(1)
+                mask = mask.unsqueeze(-1).unsqueeze(-1)
+
+                student_sampling = student_sampling * mask.float()
+                teacher_sampling = teacher_sampling * mask.float()
 
                 sampling_loss += self.pkd_criterion(student_sampling, teacher_sampling)
             # getting average for the sampling loss
