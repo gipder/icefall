@@ -490,7 +490,7 @@ def get_parser():
     parser.add_argument(
         "--pkd-range",
         type=int,
-        default=1,
+        default=5,
         help="The prune range for pkd loss when using teacher ctc alignment.",
     )
 
@@ -1001,12 +1001,13 @@ def compute_loss(
     teacher_sampling_logits = None
 
     if use_pkd:
+        assert params.prune_range >= params.pkd_range
         with torch.no_grad():
             ret = teacher_model.get_ranges_and_logits(
                 x=feature,
                 x_lens=feature_lens,
                 y=y,
-                prune_range=params.prune_range,
+                prune_range=params.pkd_range,
                 am_scale=params.am_scale,
                 lm_scale=params.lm_scale,
                 use_teacher_ctc_alignment=params.use_teacher_ctc_alignment,
@@ -1040,7 +1041,7 @@ def compute_loss(
                     x=feature,
                     x_lens=feature_lens,
                     y=sampling_y[-1],
-                    prune_range=params.prune_range,
+                    prune_range=params.pkd_range,
                     am_scale=params.am_scale,
                     lm_scale=params.lm_scale,
                     use_teacher_ctc_alignment=params.use_teacher_ctc_alignment,
@@ -1085,6 +1086,7 @@ def compute_loss(
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
             use_pkd=use_pkd,
+            pkd_range=params.pkd_range,
             teacher_ranges=teacher_ranges,
             teacher_logits=teacher_logits,
             use_ctc=params.use_ctc,

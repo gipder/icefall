@@ -87,6 +87,7 @@ class Transducer(nn.Module):
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
         use_pkd: bool = False,
+        pkd_range: int = 5,
         teacher_ranges: torch.tensor = None,
         teacher_logits: torch.tensor = None,
         use_ctc: bool = False,
@@ -223,16 +224,17 @@ class Transducer(nn.Module):
         #    import sys
         #    sys.exit(0)
         #print(f"inside model.py, {teacher_logits=}")
-        if use_pkd:
-            ranges = teacher_ranges
-        else:
-            # ranges : [B, T, prune_range]
-            ranges = k2.get_rnnt_prune_ranges(
-                px_grad=px_grad,
-                py_grad=py_grad,
-                boundary=boundary,
-                s_range=prune_range,
-            )
+        #if use_pkd:
+        #    ranges = teacher_ranges
+        #else:
+
+        # ranges : [B, T, prune_range]
+        ranges = k2.get_rnnt_prune_ranges(
+            px_grad=px_grad,
+            py_grad=py_grad,
+            boundary=boundary,
+            s_range=prune_range,
+        )
 
         # am_pruned : [B, T, prune_range, encoder_dim]
         # lm_pruned : [B, T, prune_range, decoder_dim]
@@ -246,6 +248,28 @@ class Transducer(nn.Module):
         # project_input=False since we applied the decoder's input projections
         # prior to do_rnnt_pruning (this is an optimization for speed).
         logits = self.joiner(am_pruned, lm_pruned, project_input=False)
+
+        # get logit with pkd_range
+        if use_pkd:
+            student_ranges = k2.get_rnnt_prune_ranges(
+                px_grad=px_grad,
+                py_grad=py_grad,
+                boundary=boundary,
+                s_range=pkd_range,
+            )
+
+            # am_pruned : [B, T, prune_range, encoder_dim]
+            # lm_pruned : [B, T, prune_range, decoder_dim]
+            student_am_pruned, student_lm_pruned = k2.do_rnnt_pruning(
+                am=self.joiner.encoder_proj(encoder_out),
+                lm=self.joiner.decoder_proj(decoder_out),
+                ranges=student_ranges,
+            )
+            # logits : [B, T, prune_range, vocab_size]
+
+            # project_input=False since we applied the decoder's input projections
+            # prior to do_rnnt_pruning (this is an optimization for speed).
+            student_logits = self.joiner(student_am_pruned, student_lm_pruned, project_input=False)
 
         if use_alphas:
             with torch.cuda.amp.autocast(enabled=False):
@@ -289,30 +313,12 @@ class Transducer(nn.Module):
         #    sys.exit(0)
 
         if use_pkd:
-            student = F.log_softmax(logits, dim=-1)
+            assert student_logits.shape == teacher_logits.shape
+            student = F.log_softmax(student_logits, dim=-1)
             teacher = F.softmax(teacher_logits, dim=-1)
 
             pkd_loss = self.pkd_criterion(student, teacher)
-            """
-            torch.set_printoptions(threshold=100000)
-            if torch.isnan(pkd_loss):
-                print("pkd_loss is nan, then terminate training")
-                torch.set_printoptions(threshold=100000)
-                #print(f"{student=}")
-                print(f"{teacher=}")
-                #print(f"{teacher_ranges=}")
-                for i in range(y.shape.dim0):
-                    print(f"{y[i].size(0)=}")
-                #print all tensor
 
-                import sys
-                sys.exit(0)
-            else:
-                for i in range(y.shape.dim0):
-                    print(f"{y[i].size(0)=}")
-            print(f"after {student[0, 0, 0, 0:5]=}")
-            print(f"{pkd_loss=}")
-            """
         if use_ctc:
             # print(f"{y_padded=}")
             # print(f"{y_lens=}")
@@ -327,7 +333,7 @@ class Transducer(nn.Module):
                     encoder_out=encoder_out,
                     encoder_out_lens=x_lens,
                     y=sampling_y[i],
-                    prune_range=prune_range,
+                    prune_range=pkd_range,
                     am_scale=am_scale,
                     lm_scale=lm_scale,
                     ranges=teacher_sampling_ranges[i],
