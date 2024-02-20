@@ -162,6 +162,14 @@ class Transducer(nn.Module):
             student = F.log_softmax(logits, dim=-1)
             teacher = F.softmax(teacher_logits, dim=-1)
 
+            if use_efficient is False and use_1best is False and use_sequence is False:
+                # T-axis direction masking
+                max_len = logits.size(1)
+                mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
+                mask = mask.unsqueeze(-1).unsqueeze(-1)
+                student = student * mask.float()
+                teacher = teacher * mask.float()
+
             # the case when use_efficient is True and use_1best is True
             # is not supported yet.
             assert not (use_efficient and use_1best)
