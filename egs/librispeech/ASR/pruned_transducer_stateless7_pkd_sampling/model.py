@@ -738,6 +738,256 @@ class Transducer(nn.Module):
 
         return ret
 
+    def get_ranges_and_logits_with_encoder_out(
+        self,
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+        y: k2.RaggedTensor,
+        prune_range: int = 5,
+        am_scale: float = 0.0,
+        lm_scale: float = 0.0,
+        use_teacher_ctc_alignment: bool = False,
+        use_efficient: bool = False,
+        use_time_compression: bool = False,
+        compression_threshold: float = 0.95,
+        use_beam_search: bool = False,
+        use_beam_search_alignment: bool = False,
+        beam_search_alignment: torch.Tensor = None,
+        use_grad: bool = False,
+    ) -> torch.Tensor:
+        """
+        this function works in teacher model when use_pkd is True
+        Args:
+          x:
+            A 3-D tensor of shape (N, T, C).
+          x_lens:
+            A 1-D tensor of shape (N,). It contains the number of frames in `x`
+            before padding.
+          y:
+            A ragged tensor with 2 axes [utt][label]. It contains labels of each
+            utterance.
+          prune_range:
+            The prune range for rnnt loss, it means how many symbols(context)
+            we are considering for each frame to compute the loss.
+          am_scale:
+            The weight for am probs
+          lm_scale:
+            The weight for lm probs
+          use_teacher_ctc_alignment:
+            If True, use teacher ctc alignment to get the pruned range
+          use_efficient:
+            If True, compress the logits for RNN-T from K-dims to 3-dims
+            The 3-dims consists of Prob of y, Prob. of blank, and Prob. of others
+            The Prob. of others can be calculated as 1 - Prob. of y - Prob. of blank
+          use_time_compression:
+            If True, compress the logits in time-axis by ignoring the t-th frame
+            when the probability of blank is higher than a threshold
+          use_beam_search:
+            If True, use beam search alignment from teacher instead of ctc alignment
+          beam_size_alignment:
+            The alignment from beam search
+
+        Returns:
+          Return Tensor (the pruned range, logits, compressed length)
+
+        Note:
+           Regarding am_scale & lm_scale, it will make the loss-function one of
+           the form:
+              lm_scale * lm_probs + am_scale * am_probs +
+              (1-lm_scale-am_scale) * combined_probs
+        """
+        assert y.num_axes == 2, y.num_axes
+        assert torch.all(encoder_out_lens > 0)
+
+        # Now for the decoder, i.e., the prediction network
+        row_splits = y.shape.row_splits(1)
+        y_lens = row_splits[1:] - row_splits[:-1]
+
+        blank_id = self.decoder.blank_id
+        sos_y = add_sos(y, sos_id=blank_id)
+
+        # sos_y_padded: [B, S + 1], start with SOS.
+        sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
+
+        # decoder_out: [B, S + 1, decoder_dim]
+        decoder_out = self.decoder(sos_y_padded)
+
+        # Note: y does not start with SOS
+        # y_padded : [B, S]
+        y_padded = y.pad(mode="constant", padding_value=0)
+
+        y_padded = y_padded.to(torch.int64)
+        boundary = torch.zeros((encoder_out.size(0), 4), dtype=torch.int64, device=encoder_out.device)
+        boundary[:, 2] = y_lens
+        boundary[:, 3] = encoder_out_lens
+
+        lm = self.simple_lm_proj(decoder_out)
+        am = self.simple_am_proj(encoder_out)
+
+        #print("GARBAGE " * 10)
+        #print(f"{use_teacher_ctc_alignment=}")
+        if use_teacher_ctc_alignment:
+            assert self.ctc_layer is not None
+            ctc_logits = self.ctc_layer(encoder_out)
+            ctc_logits = F.log_softmax(ctc_logits, dim=-1)
+            emission = ctc_logits
+
+            ctc_ranges = torch.zeros(
+                emission.shape[0], emission.shape[1],
+                dtype=torch.int32, device=emission.device
+            )
+            # get forced alignment results from CTC model
+            with torch.no_grad():
+                for i in range(0, emission.shape[0]):
+                    trellis = get_trellis(emission[i].cpu(), y.tolist()[i], self.decoder.blank_id)
+                    path = backtrack(trellis, emission[i].cpu(), y.tolist()[i], self.decoder.blank_id)
+                    fpath, mpath = get_alignment(path, emission[i].cpu(), y.tolist()[i], self.decoder.blank_id)
+                    ctc_ranges[i] = torch.tensor(fpath, dtype=torch.int32, device=emission.device)
+                    #print(f"{ctc_ranges[i]=}")
+                    # if the first position is not 0, then we need to
+                    # shift one step to the right and prepend 0 to the first position
+                    if ctc_ranges[i, 0] != 0:
+                        ctc_ranges[i] = torch.roll(ctc_ranges[i], shifts=1, dims=-1)
+                        ctc_ranges[i, 0] = 0
+                    ctc_ranges[i, encoder_out_lens[i]:] = self.decoder.blank_id
+
+            ctc_ranges = ctc_ranges.to(torch.int32)
+            # something to do with ctc_range
+            # ctc_range : from [B, T, 1] to [B, T, prune_range]
+            ranges = torch.zeros((ctc_ranges.size(0), ctc_ranges.size(-1), prune_range),
+                                dtype=torch.int64, device=ctc_ranges.device)
+
+            idx = ctc_ranges + prune_range - 1 >= y_lens.unsqueeze(-1)
+            # change the first idx to fit the boundary
+            for i in range(0, idx.size(0)):
+                ctc_ranges[i, idx[i]] = y_lens[i] - ( prune_range - 1 )
+            # check if the ctc_ranges is out of boundary
+            # the logic is a little bit weird, but it works
+            for i in range(0, idx.size(0)):
+                ctc_ranges[i][ctc_ranges[i] < 0] = 0
+            ranges[:, :, 0] = ctc_ranges
+            for i in range(1, prune_range):
+                ranges[:, :, i] = ranges[:, :, i-1] + 1
+
+            # padding beyound x_lens with max values
+            idx = torch.argmax(ranges[:, :, 0], dim=-1)
+            padding_values = ranges[range(ranges.size(0)), idx, :]
+
+            # TODO: optimization
+            for i in range(0, idx.size(0)):
+                ranges[i, idx[i]:] = padding_values[i]
+            #print(f"ranges: {ranges}")
+        elif use_beam_search_alignment:
+            ranges = torch.zeros((beam_search_alignment.size(0), beam_search_alignment.size(-1), prune_range),
+                                dtype=torch.int64, device=decoder_out.device)
+
+            # to make alignments in the middle of ranges
+            beam_search_alignment -= prune_range//2
+            idx = beam_search_alignment + prune_range - 1 >= y_lens.unsqueeze(-1)
+            # change the first idx to fit the boundary
+            for i in range(0, idx.size(0)):
+                beam_search_alignment[i, idx[i]] = y_lens[i] - ( prune_range - 1 )
+            # check if the ctc_ranges is out of boundary
+            # the logic is a little bit weird, but it works
+            for i in range(0, idx.size(0)):
+                beam_search_alignment[i][beam_search_alignment[i] < 0] = 0
+            ranges[:, :, 0] = beam_search_alignment
+            for i in range(1, prune_range):
+                ranges[:, :, i] = ranges[:, :, i-1] + 1
+
+            # padding beyound x_lens with max values
+            idx = torch.argmax(ranges[:, :, 0], dim=-1)
+            padding_values = ranges[range(ranges.size(0)), idx, :]
+            for i in range(0, idx.size(0)):
+                ranges[i, idx[i]:] = padding_values[i]
+
+        else:
+            with torch.no_grad():
+                simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
+                    lm=lm.float(),
+                    am=am.float(),
+                    symbols=y_padded,
+                    termination_symbol=blank_id,
+                    lm_only_scale=lm_scale,
+                    am_only_scale=am_scale,
+                    boundary=boundary,
+                    reduction="sum",
+                    return_grad=True,
+                )
+
+            # ranges : [B, T, prune_range]
+            ranges = k2.get_rnnt_prune_ranges(
+                px_grad=px_grad,
+                py_grad=py_grad,
+                boundary=boundary,
+                s_range=prune_range,
+            )
+
+        # am_pruned : [B, T, prune_range, encoder_dim]
+        # lm_pruned : [B, T, prune_range, decoder_dim]
+        am_pruned, lm_pruned = k2.do_rnnt_pruning(
+            am=self.joiner.encoder_proj(encoder_out),
+            lm=self.joiner.decoder_proj(decoder_out),
+            ranges=ranges,
+        )
+
+        # logits : [B, T, prune_range, vocab_size]
+
+        # project_input=False since we applied the decoder's input projections
+        # prior to do_rnnt_pruning (this is an optimization for speed).
+        logits = self.joiner(am_pruned, lm_pruned, project_input=False)
+
+        ranges.requires_grad_(False)
+        if use_grad is False:
+            logits = logits.detach_()
+
+        masks = None
+
+        ret = (ranges, logits)
+
+        return ret
+
+    def get_encoder_out(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        y: k2.RaggedTensor,
+        use_grad: bool = False,
+    ):
+        """
+        This function is used to retrieve the model's encoder output and
+        the lengths of the encoder outputs.
+        Args:
+          x:
+            A 3-D tensor of shape (N, T, C).
+          x_lens:
+            A 1-D tensor of shape (N,). It contains the number of frames in `x`
+            before padding.
+          y:
+            A ragged tensor with 2 axes [utt][label]. It contains labels of each
+            utterance.
+          use_grad:
+            If False, the returned tensors will be detached from the computation
+            graph. If True, the returned tensors will have gradients.
+
+        Returns:
+          Return Tensor (encoder_out, encoder_out_lens)
+
+        """
+        assert x.ndim == 3, x.shape
+        assert x_lens.ndim == 1, x_lens.shape
+        assert y.num_axes == 2, y.num_axes
+
+        assert x.size(0) == x_lens.size(0) == y.dim0
+
+        encoder_out, encoder_out_lens = self.encoder(x, x_lens)
+        assert torch.all(x_lens > 0)
+        if use_grad is False:
+            encoder_out = encoder_out.detach()
+            x_lens = x_lens.detach()
+
+        return encoder_out, encoder_out_lens
+
     def get_logits(
         self,
         encoder_out: torch.Tensor,
@@ -1327,7 +1577,7 @@ if __name__ == "__main__":
     eps = np.finfo(np.float32).eps
     feats = np.log10(np.maximum(eps, np.dot(spc, mel_basis.T)))
     """
-    load_checkpoint("./teacher_model_ctc/epoch-30.pt", model)
+    load_checkpoint("./teacher_model/epoch-30.pt", model)
     #model.set_ctc_loss(blank=0, reduction="mean", zero_infinity=True)
 
     import sentencepiece as spm
@@ -1479,39 +1729,6 @@ if __name__ == "__main__":
         break
 
     print("#" * 100)
-    print("To get hypotheses from modified_beam_search")
-
-    from beam_search import (
-        modified_beam_search,
-        Hypothesis,
-        HypothesisList
-    )
-    for idx, batch in enumerate(test_clean_dl):
-        feature = batch["inputs"].to(device)
-        supervisions = batch["supervisions"]
-        feature_lens = supervisions["num_frames"].to(device)
-        feature = feature[:2]
-        feature_lens = feature_lens[:2]
-        print(f"{feature.shape=}")
-        print(f"{feature_lens.shape=}")
-        encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
-        hyp_tokens = modified_beam_search(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=3,
-            temperature=1.0,
-            return_timestamps=False,
-            return_topk=True,
-        )
-        print(f"{hyp_tokens[0]=}")
-        print(f"{hyp_tokens[1]=}")
-        #print(f"{len(hyp_tokens[0].ys[1:-1])=}")
-        #print(f"{len(hyp_tokens[0].timestamp)=}")
-        #print(f"{hyp_tokens[1]=}")
-        break
-
-    print("#" * 100)
     print("To check ragens and logits")
     for idx, batch in enumerate(test_clean_dl):
         feature = batch["inputs"].to(device)
@@ -1523,4 +1740,41 @@ if __name__ == "__main__":
         print(f"{ranges=}")
         print(f"{logits=}")
         break
+
+    print("#" * 100)
+    print("To get hypotheses from modified_beam_search")
+
+    from beam_search import (
+        modified_beam_search,
+        modified_beam_search2,
+        Hypothesis,
+        HypothesisList
+    )
+    for idx, batch in enumerate(test_clean_dl):
+        feature = batch["inputs"].to(device)
+        supervisions = batch["supervisions"]
+        feature_lens = supervisions["num_frames"].to(device)
+        feature = feature[:2]
+        feature_lens = feature_lens[:2]
+        print(f"{feature.shape=}")
+        print(f"{feature_lens.shape=}")
+        beam = 4
+        encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
+        hyp_tokens, hyp_timestamps = modified_beam_search2(
+            model=model,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens,
+            beam=beam,
+            temperature=1.0,
+            return_timestamps=False,
+            return_topk=True,
+        )
+        print(f"{hyp_tokens[-1]=}")
+        print(f"{hyp_timestamps[-1]=}")
+        print(f"{sp.decode(hyp_tokens[-1])=}")
+
+        hyp_alignment = torch.zeros(beam, encoder_out_lens[-1], dtype=torch.int)
+
+        break
+
 

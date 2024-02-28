@@ -1003,9 +1003,16 @@ def compute_loss(
     if use_pkd:
         assert params.prune_range >= params.pkd_range
         with torch.no_grad():
-            ret = teacher_model.get_ranges_and_logits(
+            teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
                 x=feature,
                 x_lens=feature_lens,
+                y=y,
+                use_grad=False,
+            )
+
+            ret = teacher_model.get_ranges_and_logits_with_encoder_out(
+                encoder_out=teacher_encoder_out,
+                encoder_out_lens=teacher_encoder_out_lens,
                 y=y,
                 prune_range=params.pkd_range,
                 am_scale=params.am_scale,
@@ -1037,9 +1044,9 @@ def compute_loss(
                 sampling_y.append(k2.RaggedTensor(yy).to(device))
                 # the yy is the less probable label sequence
 
-                sampling_ret = teacher_model.get_ranges_and_logits(
-                    x=feature,
-                    x_lens=feature_lens,
+                sampling_ret = teacher_model.get_ranges_and_logits_with_encoder_out(
+                    encoder_out=teacher_encoder_out,
+                    encoder_out_lens=teacher_encoder_out_lens,
                     y=sampling_y[-1],
                     prune_range=params.pkd_range,
                     am_scale=params.am_scale,
