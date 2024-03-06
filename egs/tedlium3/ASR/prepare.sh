@@ -5,7 +5,7 @@ export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
 set -eou pipefail
 
-stage=0
+stage=1
 stop_stage=100
 
 # We assume dl_dir (download dir) contains the following
@@ -31,9 +31,9 @@ dl_dir=$PWD/download
 # It will generate data/lang_bpe_xxx,
 # data/lang_bpe_yyy if the array contains xxx, yyy
 vocab_sizes=(
-  5000
-  2000
-  1000
+  #5000
+  #2000
+  #1000
   500
 )
 
