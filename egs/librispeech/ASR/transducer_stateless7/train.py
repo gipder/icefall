@@ -529,6 +529,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--use-nbest",
+        type=str2bool,
+        default=False,
+        help="Whether to use n-1best(4-best) when doing knowledge distillation",
+    )
+
+    parser.add_argument(
         "--use-sequence",
         type=str2bool,
         default=False,
@@ -899,8 +906,12 @@ def compute_loss(
                     hyp_cache[ids[i]] = hyp_tokens[i]
 
             else:
-                #print("Cache hit!")
+                print("Cache hit!")
+                print(f"{hyp_cache[ids[i]]=}")
+                assert not (params.use_1best and params.use_nbest)
+
                 # check whether the length of hyp and the length of batch are the same
+                print(f"{feature_lens.size()[0]=}")
                 for i in range(feature_lens.size()[0]):
                     # feature lens to encoder lens
                     encoder_len = math.ceil((feature_lens[i]-8)/4)
@@ -1389,6 +1400,7 @@ def run(rank, world_size, args):
         train_cuts = librispeech.train_all_shuf_cuts()
     else:
         train_cuts = librispeech.train_clean_100_cuts()
+        #train_cuts = librispeech.train_small_cuts()
 
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 20 seconds

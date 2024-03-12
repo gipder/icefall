@@ -282,6 +282,22 @@ class Transducer(nn.Module):
                 #sys.exit(0)
 
             kd_loss = self.kd_criterion(student, teacher)
+        """
+        if use_sq_sampling:
+            sampling_loss = torch.tensor(0.0).to(logits.device)
+            for i in range(sq_sampling_num):
+                sampling_logits = self.get_logits_with_encoder_out(
+                    encoder_out=encoder_out,
+                    encoder_out_lens=x_lens,
+                    y=sampling_y[i],
+                    use_grad=True,
+                )
+
+                student_sampling_logits = sampling_logits
+
+                student_sampling = F.log_softmax(student_sampling_logits, dim=-1)
+                teacher_sampling = F.softmax(teacher_sampling_logits[i], dim=-1)
+        """
 
         ret = dict()
         ret["org_loss"] = loss
@@ -308,6 +324,46 @@ class Transducer(nn.Module):
 
         encoder_out, x_lens = self.encoder(x, x_lens)
         assert torch.all(x_lens > 0)
+
+        # Now for the decoder, i.e., the prediction network
+        row_splits = y.shape.row_splits(1)
+        y_lens = row_splits[1:] - row_splits[:-1]
+
+        blank_id = self.decoder.blank_id
+        sos_y = add_sos(y, sos_id=blank_id)
+
+        # sos_y_padded: [B, S + 1], start with SOS.
+        sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
+        sos_y_padded = sos_y_padded.to(torch.int64)
+
+        # decoder_out: [B, S + 1, decoder_dim]
+        decoder_out = self.decoder(sos_y_padded)
+
+        encoder_out = self.joiner.encoder_proj(encoder_out)
+        decoder_out = self.joiner.decoder_proj(decoder_out)
+
+        logits = self.joiner(
+            encoder_out=encoder_out,
+            decoder_out=decoder_out,
+            project_input=False,
+        )
+
+        if use_grad is False:
+            logits = logits.detach_()
+
+        return logits
+
+    def get_logits_with_encoder_out(
+        self,
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+        y: k2.RaggedTensor,
+        use_grad: bool = False,
+    ) -> torch.Tensor:
+
+        assert y.num_axes == 2, y.num_axes
+
+        assert torch.all(encoder_out_lens > 0)
 
         # Now for the decoder, i.e., the prediction network
         row_splits = y.shape.row_splits(1)
