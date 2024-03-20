@@ -542,6 +542,27 @@ def get_parser():
         help="Whether to use sequence-level learning when doing knowledge distillation",
     )
 
+    parser.add_argument(
+        "--use-sq-sampling",
+        type=str2bool,
+        default=False,
+        help="Whether to use sequence-level sampling in knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--sq-sampling-num",
+        type=int,
+        default=1,
+        help="Determine how many samples to take in sequence-level sampling",
+    )
+
+    parser.add_argument(
+        "--sq-sampling-scale",
+        type=float,
+        default=1.0,
+        help="ratio between sampling loss and kd_loss, default is 1",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -859,10 +880,14 @@ def compute_loss(
         use_kd = False
         use_teacher_simple_proj = False
         use_beam_search = False
+        use_sq_sampling = False
+        sq_sampling_num = 0
     else:
         use_kd = params.use_kd
         use_teacher_simple_proj = params.use_teacher_simple_proj
         use_beam_search = params.use_beam_search
+        use_sq_sampling = params.use_sq_sampling
+        sq_sampling_num = params.sq_sampling_num
 
     if use_beam_search:
         from beam_search import (
@@ -975,14 +1000,59 @@ def compute_loss(
 
             beam_search_alignment = alignment.to(device)
 
+    # initialize teacher sampling y and logits
+    sampling_y = None
+    teacher_sampling_logits = None
+
     if use_kd:
         with torch.no_grad():
-            """
-            if use_beam_search:
-                teacher_y = pseudo_y
-            else:
-                teacher_y = y
-            """
+            teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
+                x=feature,
+                x_lens=feature_lens,
+                y=y,
+                use_grad=False,
+            )
+
+            ret = teacher_model.get_logits_with_encoder_out(
+                encoder_out=teacher_encoder_out,
+                encoder_out_lens=teacher_encoder_out_lens,
+                y=y,
+                use_grad=False,
+            )
+
+        teacher_logits = ret
+
+        if use_sq_sampling:
+            teacher_sampling_logits = list()
+            sampling_y = list()
+            for n in range(1, sq_sampling_num+1):
+                yy = list()
+                y_list = y.tolist()
+                # in the case of the number of samples is 1
+                # y_list[(i+1)%len(y_list)] means the next sample in a batch
+                for i in range(len(y_list)):
+                    yy.append(y_list[(i+n)%len(y_list)])
+
+                sampling_y.append(k2.RaggedTensor(yy).to(device))
+                # the yy is the less probable label sequence
+
+                sampling_ret = teacher_model.get_logits_with_encoder_out(
+                    encoder_out=teacher_encoder_out,
+                    encoder_out_lens=teacher_encoder_out_lens,
+                    y=sampling_y[-1],
+                    use_grad=False,
+                )
+
+                teacher_sampling_logits.append(sampling_ret)
+
+        """
+        with torch.no_grad():
+
+            #if use_beam_search:
+            #    teacher_y = pseudo_y
+            #else:
+            #    teacher_y = y
+
             ret = teacher_model.get_logits(
                 x=feature,
                 x_lens=feature_lens,
@@ -990,10 +1060,12 @@ def compute_loss(
                 use_grad=False,
             )
         teacher_logits = ret
+        """
 
     with torch.set_grad_enabled(is_training):
         org_loss = torch.tensor(0.0, device=device)
         kd_loss = torch.tensor(0.0, device=device)
+        sampling_loss = torch.tensor(0.0, device=device)
 
         ret = model(
             x=feature,
@@ -1008,14 +1080,22 @@ def compute_loss(
             pseudo_y_alignment=beam_search_alignment,
             use_sequence=params.use_sequence,
             pseudo_y_sequence=pseudo_y_sequence,
+            use_sq_sampling=use_sq_sampling,
+            sampling_y=sampling_y,
+            teacher_sampling_logits=teacher_sampling_logits,
+            sq_sampling_num=sq_sampling_num,
         )
 
     kd_loss_scale = params.kd_loss_scale
+    sampling_loss_scale = params.kd_loss_scale * params.sq_sampling_scale
     org_loss = ret["org_loss"]
     if use_kd:
         kd_loss = ret["kd_loss"]
+    if use_sq_sampling:
+        sampling_loss = ret["sampling_loss"]
 
-    loss = org_loss + kd_loss_scale * kd_loss
+    loss = org_loss + kd_loss_scale * kd_loss + \
+        sampling_loss_scale * sampling_loss
 
     assert org_loss.requires_grad == is_training
     if use_kd:
@@ -1032,6 +1112,8 @@ def compute_loss(
     info["org_loss"] = ret["org_loss"].detach().cpu().item()
     if params.use_kd:
         info["kd_loss"] = ret["kd_loss"].detach().cpu().item()
+    if params.use_sq_sampling:
+        info["sampling_loss"] = ret["sampling_loss"].detach().cpu().item()
 
     return loss, info
 

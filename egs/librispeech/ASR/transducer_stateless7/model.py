@@ -26,7 +26,7 @@ from encoder_interface import EncoderInterface
 from scaling import penalize_abs_values_gt
 
 from icefall.utils import add_sos
-
+from typing import Union
 
 class Transducer(nn.Module):
     """It implements https://arxiv.org/pdf/1211.3711.pdf
@@ -85,6 +85,11 @@ class Transducer(nn.Module):
         pseudo_y_alignment: torch.Tensor = None,
         use_sequence: bool = False,
         pseudo_y_sequence: torch.Tensor = None,
+        use_sq_sampling: bool = False,
+        sampling_y: Union[list, k2.RaggedTensor] = None,
+        teacher_sampling_ranges: Union[list, torch.tensor] = None,
+        teacher_sampling_logits: Union[list, torch.tensor] = None,
+        sq_sampling_num: int = 1,
     ) -> torch.Tensor:
         """
         Args:
@@ -112,7 +117,7 @@ class Transducer(nn.Module):
         assert x.size(0) == x_lens.size(0) == y.dim0
 
         org_x_lens = x_lens.clone()
-        encoder_out, x_lens = self.encoder(x, x_lens)
+        org_encoder_out, x_lens = self.encoder(x, x_lens)
         assert torch.all(x_lens > 0)
 
         # Now for the decoder, i.e., the prediction network
@@ -129,7 +134,7 @@ class Transducer(nn.Module):
         # decoder_out: [B, S + 1, decoder_dim]
         decoder_out = self.decoder(sos_y_padded)
 
-        encoder_out = self.joiner.encoder_proj(encoder_out)
+        encoder_out = self.joiner.encoder_proj(org_encoder_out)
         decoder_out = self.joiner.decoder_proj(decoder_out)
 
         #print(f"{encoder_out.shape=}")
@@ -197,6 +202,7 @@ class Transducer(nn.Module):
                 student = torch.cat([py_logits, blank_logits, rem_logits], dim=-1)
                 student = torch.clamp(student, eps, 1.0)
                 student = student.log()
+                teacher_rem_logits[torch.where(teacher_rem_logits<0)] = eps
                 teacher = torch.cat([teacher_py_logits, teacher_blank_logits, teacher_rem_logits], dim=-1)
 
                 # T-axis direction masking
@@ -212,7 +218,7 @@ class Transducer(nn.Module):
                 mask = mask.unsqueeze(-1)
                 student = student * mask.float()
                 teacher = teacher * mask.float()
-                """
+
                 use_debug = False
                 if use_debug:
                     print(f"{logits.shape=}")
@@ -225,9 +231,11 @@ class Transducer(nn.Module):
                     print(f"{y_lens=}")
                     print(f"{student[-1,0,:,:]=}")
                     print(f"{teacher[-1,0,:,:]=}")
+                    print(f"{torch.where(teacher<0)=}")
+                    print(f"{teacher[0, 344, 74, 2]=}")
+                    print(f"{teacher[0, 344, 74, 2].log()=}")
                     import sys
                     sys.exit(0)
-                """
 
             if use_1best:
                 # getting the 1-best pash
@@ -280,8 +288,35 @@ class Transducer(nn.Module):
 
                 #import sys
                 #sys.exit(0)
-
             kd_loss = self.kd_criterion(student, teacher)
+
+        if use_sq_sampling:
+            sampling_loss = torch.tensor(0.0).to(logits.device)
+            for i in range(sq_sampling_num):
+                sampling_logits = self.get_logits(
+                    encoder_out=org_encoder_out,
+                    encoder_out_lens=x_lens,
+                    y=sampling_y[i],
+                    use_grad=True,
+                )
+
+                student_sampling_logits = sampling_logits
+
+                student_sampling = F.log_softmax(student_sampling_logits, dim=-1)
+                teacher_sampling = F.softmax(teacher_sampling_logits[i], dim=-1)
+
+                # T-axis direction masking
+                max_len = student_sampling_logits.size(1)
+                mask = torch.arange(max_len, device=student_sampling_logits.device).expand(student_sampling_logits.size(0), max_len) < x_lens.unsqueeze(1)
+                mask = mask.unsqueeze(-1).unsqueeze(-1)
+
+                student_sampling = student_sampling * mask.float()
+                teacher_sampling = teacher_sampling * mask.float()
+
+                sampling_loss += self.kd_criterion(student_sampling, teacher_sampling)
+            # getting average for the sampling loss
+            sampling_loss /= sq_sampling_num
+
         """
         if use_sq_sampling:
             sampling_loss = torch.tensor(0.0).to(logits.device)
@@ -298,7 +333,6 @@ class Transducer(nn.Module):
                 student_sampling = F.log_softmax(student_sampling_logits, dim=-1)
                 teacher_sampling = F.softmax(teacher_sampling_logits[i], dim=-1)
         """
-
         ret = dict()
         ret["org_loss"] = loss
         if use_kd:
@@ -306,24 +340,29 @@ class Transducer(nn.Module):
         else:
             ret["kd_loss"] = torch.tensor(0.0)
 
+        if use_sq_sampling:
+            ret["sampling_loss"] = sampling_loss
+        else:
+            ret["sampling_loss"] = torch.tensor(0.0)
+
         return ret
 
     def get_logits(
         self,
-        x: torch.Tensor,
-        x_lens: torch.Tensor,
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
         y: k2.RaggedTensor,
         use_grad: bool = False,
     ) -> torch.Tensor:
 
-        assert x.ndim == 3, x.shape
-        assert x_lens.ndim == 1, x_lens.shape
+        #assert x.ndim == 3, x.shape
+        #assert x_lens.ndim == 1, x_lens.shape
         assert y.num_axes == 2, y.num_axes
 
-        assert x.size(0) == x_lens.size(0) == y.dim0
+        #assert x.size(0) == x_lens.size(0) == y.dim0
 
-        encoder_out, x_lens = self.encoder(x, x_lens)
-        assert torch.all(x_lens > 0)
+        #encoder_out, x_lens = self.encoder(x, x_lens)
+        assert torch.all(encoder_out_lens > 0)
 
         # Now for the decoder, i.e., the prediction network
         row_splits = y.shape.row_splits(1)
@@ -392,3 +431,45 @@ class Transducer(nn.Module):
             logits = logits.detach_()
 
         return logits
+
+    def get_encoder_out(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        y: k2.RaggedTensor,
+        use_grad: bool = False,
+    ):
+        """
+        This function is used to retrieve the model's encoder output and
+        the lengths of the encoder outputs.
+        Args:
+          x:
+            A 3-D tensor of shape (N, T, C).
+          x_lens:
+            A 1-D tensor of shape (N,). It contains the number of frames in `x`
+            before padding.
+          y:
+            A ragged tensor with 2 axes [utt][label]. It contains labels of each
+            utterance.
+          use_grad:
+            If False, the returned tensors will be detached from the computation
+            graph. If True, the returned tensors will have gradients.
+
+        Returns:
+          Return Tensor (encoder_out, encoder_out_lens)
+
+        """
+        assert x.ndim == 3, x.shape
+        assert x_lens.ndim == 1, x_lens.shape
+        assert y.num_axes == 2, y.num_axes
+
+        assert x.size(0) == x_lens.size(0) == y.dim0
+
+        encoder_out, encoder_out_lens = self.encoder(x, x_lens)
+        assert torch.all(x_lens > 0)
+        if use_grad is False:
+            encoder_out = encoder_out.detach()
+            x_lens = x_lens.detach()
+
+        return encoder_out, encoder_out_lens
+
