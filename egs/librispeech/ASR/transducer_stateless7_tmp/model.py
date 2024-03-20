@@ -75,7 +75,7 @@ class Transducer(nn.Module):
         self,
         x: torch.Tensor,
         x_lens: torch.Tensor,
-        y: k2.RaggedTensor,
+        y_list: list() = None, #k2.RaggedTensor,
         use_kd: bool = False,
         teacher_logits_list: list() = None, #torch.Tensor = None,
         use_ctc: bool = False,
@@ -83,7 +83,8 @@ class Transducer(nn.Module):
         use_efficient: bool = False,
         use_1best: bool = False,
         use_nbest: bool = False,
-        pseudo_y_alignment: torch.Tensor = None,
+        nbest_num: int = 4,
+        pseudo_y_alignment_list: list() = None, #torch.Tensor = None,
         use_sequence: bool = False,
         pseudo_y_sequence: torch.Tensor = None,
     ) -> torch.Tensor:
@@ -106,49 +107,65 @@ class Transducer(nn.Module):
               lm_scale * lm_probs + am_scale * am_probs +
               (1-lm_scale-am_scale) * combined_probs
         """
-        assert x.ndim == 3, x.shape
-        assert x_lens.ndim == 1, x_lens.shape
-        assert y.num_axes == 2, y.num_axes
-
-        assert x.size(0) == x_lens.size(0) == y.dim0
-
         org_x_lens = x_lens.clone()
-        encoder_out, x_lens = self.encoder(x, x_lens)
-        assert torch.all(x_lens > 0)
-
-        # Now for the decoder, i.e., the prediction network
-        row_splits = y.shape.row_splits(1)
-        y_lens = row_splits[1:] - row_splits[:-1]
-
-        blank_id = self.decoder.blank_id
-        sos_y = add_sos(y, sos_id=blank_id)
-
-        # sos_y_padded: [B, S + 1], start with SOS.
-        sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
-        sos_y_padded = sos_y_padded.to(torch.int64)
-
-        # decoder_out: [B, S + 1, decoder_dim]
-        decoder_out = self.decoder(sos_y_padded)
-
+        encoder_out, x_lens = self.encoder(x, org_x_lens)
         encoder_out = self.joiner.encoder_proj(encoder_out)
-        decoder_out = self.joiner.decoder_proj(decoder_out)
+        logits_list = list()
+        y_lens_list = list()
+        y_padded_list = list()
+        assert nbest_num > 0, f"{nbest_num=}"
+        if nbest_num > len(y_list):
+            nbest_num = len(y_list)
 
-        #print(f"{encoder_out.shape=}")
-        #print(f"{decoder_out.shape=}")
-        logits = self.joiner(
-            encoder_out=encoder_out,
-            decoder_out=decoder_out,
-            project_input=False,
-        )
+        for n in range(nbest_num):
+            y = y_list[n]
+            assert x.ndim == 3, x.shape
+            assert org_x_lens.ndim == 1, org_x_lens.shape
+            assert y.num_axes == 2, y.num_axes
 
-        # Note: y does not start with SOS
-        # y_padded : [B, S]
-        y_padded = y.pad(mode="constant", padding_value=0)
+            assert x.size(0) == org_x_lens.size(0) == y.dim0
+
+            # here encoder_out is
+            assert torch.all(x_lens > 0)
+
+            # Now for the decoder, i.e., the prediction network
+            row_splits = y.shape.row_splits(1)
+            y_lens = row_splits[1:] - row_splits[:-1]
+
+            blank_id = self.decoder.blank_id
+            sos_y = add_sos(y, sos_id=blank_id)
+
+            # sos_y_padded: [B, S + 1], start with SOS.
+            sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
+            sos_y_padded = sos_y_padded.to(torch.int64)
+
+            # decoder_out: [B, S + 1, decoder_dim]
+            decoder_out = self.decoder(sos_y_padded)
+
+            decoder_out = self.joiner.decoder_proj(decoder_out)
+
+            logits = self.joiner(
+                encoder_out=encoder_out,
+                decoder_out=decoder_out,
+                project_input=False,
+            )
+
+            # Note: y does not start with SOS
+            # y_padded : [B, S]
+            y_padded = y.pad(mode="constant", padding_value=0)
+            logits_list.append(logits)
+            y_padded_list.append(y_padded)
+            y_lens_list.append(y_lens)
 
         assert hasattr(torchaudio.functional, "rnnt_loss"), (
             f"Current torchaudio version: {torchaudio.__version__}\n"
             "Please install a version >= 0.10.0"
         )
+
+        # etracting the first element
+        logits = logits_list[0]
+        y_padded = y_padded_list[0]
+        y_lens = y_lens_list[0]
 
         loss = torchaudio.functional.rnnt_loss(
             logits=logits,
@@ -160,10 +177,12 @@ class Transducer(nn.Module):
         )
 
         if use_kd:
+            teacher_logits = teacher_logits_list[0]
             student = F.log_softmax(logits, dim=-1)
             teacher = F.softmax(teacher_logits, dim=-1)
 
-            if use_efficient is False and use_1best is False and use_sequence is False:
+            # What does it mean for?
+            if use_efficient is False and use_1best is False and use_sequence is False and use_nbest is False:
                 # T-axis direction masking
                 max_len = logits.size(1)
                 mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
@@ -232,7 +251,7 @@ class Transducer(nn.Module):
                 """
 
             if use_1best:
-                # getting the 1-best pash
+                # getting the 1-best path
                 # pseudo_y: [B, U]
                 # pseudo_y_alignment: [B, S, U]
                 #print(f"{logits.shape=}")
@@ -257,7 +276,7 @@ class Transducer(nn.Module):
                 #print(f"{teacher[-1,-1,:,:]=}")
 
             if use_nbest:
-                # getting the 1-best pash
+                # getting the 1-best path
                 # pseudo_y: [B, U]
                 # pseudo_y_alignment: [B, S, U]
                 #print(f"{logits.shape=}")
@@ -269,20 +288,28 @@ class Transducer(nn.Module):
                 #student_logits = self.get_logits(x, org_x_lens, pseudo_y, use_grad=True)
                 #student = F.log_softmax(student_logits, dim=-1)
                 #teacher = F.softmax(teacher_logits, dim=-1)
-                idx = pseudo_y_alignment.unsqueeze(-1).expand(-1, -1, logits.shape[-1]).unsqueeze(2)
-                idx = idx.to(torch.int64)
-                print(f"{idx=}")
-                import sys
-                sys.exit(0)
-                teacher = torch.gather(teacher, 2, idx)
-                student = torch.gather(student, 2, idx)
-                max_len = logits.size(1)
-                mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
-                mask = mask.unsqueeze(-1).unsqueeze(-1)
-                student = student * mask.float()
-                teacher = teacher * mask.float()
-                #print(f"{student[-1,-1,:,:]=}")
-                #print(f"{teacher[-1,-1,:,:]=}")
+                teacher_list = list()
+                student_list = list()
+                for n in range(nbest_num):
+                    pseudo_y_alignment = pseudo_y_alignment_list[n]
+                    logits = logits_list[n]
+                    teacher_logits = teacher_logits_list[n]
+                    student = F.log_softmax(logits, dim=-1)
+                    teacher = F.softmax(teacher_logits, dim=-1)
+
+                    idx = pseudo_y_alignment.unsqueeze(-1).expand(-1, -1, logits.shape[-1]).unsqueeze(2)
+                    idx = idx.to(torch.int64)
+                    teacher = torch.gather(teacher, 2, idx)
+                    student = torch.gather(student, 2, idx)
+                    max_len = logits.size(1)
+                    mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
+                    mask = mask.unsqueeze(-1).unsqueeze(-1)
+                    student = student * mask.float()
+                    teacher = teacher * mask.float()
+                    student_list.append(student)
+                    teacher_list.append(teacher)
+                    #print(f"{student[-1,-1,:,:]=}")
+                    #print(f"{teacher[-1,-1,:,:]=}")
 
             if use_sequence:
                 idx = pseudo_y_alignment.unsqueeze(-1).expand(-1, -1, logits.shape[-1]).unsqueeze(2)
@@ -311,7 +338,23 @@ class Transducer(nn.Module):
                 #import sys
                 #sys.exit(0)
 
-            kd_loss = self.kd_criterion(student, teacher)
+            if use_nbest is True:
+                kd_loss = torch.tensor(0.0, device=encoder_out.device)
+                for n in range(nbest_num):
+                    student = student_list[n]
+                    teacher = teacher_list[n]
+                    #student = student.to(device=encoder_out.device)
+                    #teacher = teacher.to(device=encoder_out.device)
+                    #print(f"{student=}")
+                    #print(f"{teacher=}")
+                    kd_loss += self.kd_criterion(student, teacher)
+                kd_loss = kd_loss / nbest_num
+                #print(f"{teacher.shape=}")
+                #print(f"{kd_loss=}")
+                #import sys
+                #sys.exit(0)
+            else:
+                kd_loss = self.kd_criterion(student, teacher)
         """
         if use_sq_sampling:
             sampling_loss = torch.tensor(0.0).to(logits.device)

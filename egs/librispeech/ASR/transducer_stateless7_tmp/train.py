@@ -536,10 +536,31 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--nbest-num",
+        type=int,
+        default=4,
+        help="How many beams do we use when doing knowledge distillation",
+    )
+
+    parser.add_argument(
         "--use-sequence",
         type=str2bool,
         default=False,
         help="Whether to use sequence-level learning when doing knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--use-sq-sampling",
+        type=str2bool,
+        default=False,
+        help="Whether to use sequence-level sampling in knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--sq-sampling-num",
+        type=int,
+        default=1,
+        help="Determine how many samples to take in sequence-level sampling",
     )
 
     add_model_arguments(parser)
@@ -846,6 +867,8 @@ def compute_loss(
     texts = batch["supervisions"]["text"]
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
+    y_list = list()
+    y_list.append(y)
 
     if isinstance(teacher_model, DDP):
         teacher_model = teacher_model.module
@@ -853,16 +876,21 @@ def compute_loss(
     teacher_logits = None
     pseudo_y = None
     beam_search_alignment = None
+    beam_search_alignment_list = list()
     pseudo_y_sequence = None
 
     if teacher_model is None:
         use_kd = False
         use_teacher_simple_proj = False
         use_beam_search = False
+        use_sq_sampling = False
+        sq_sampling_num = 0
     else:
         use_kd = params.use_kd
         use_teacher_simple_proj = params.use_teacher_simple_proj
         use_beam_search = params.use_beam_search
+        use_sq_sampling = params.use_sq_sampling
+        sq_sampling_num = params.sq_sampling_num
 
     if use_beam_search:
         from beam_search import (
@@ -906,7 +934,7 @@ def compute_loss(
                     hyp_cache[ids[i]] = hyp_tokens[i]
 
             else:
-                print("Cache hit!")
+                #print("Cache hit!")
                 hyp_tokens_list = list()
                 assert not (params.use_1best and params.use_nbest)
                 num_nbest = 4
@@ -988,13 +1016,31 @@ def compute_loss(
                 beam_search_alignment = alignment.to(device)
                 beam_search_alignment_list.append(beam_search_alignment)
 
+    teacher_logits_list = None
     if use_kd:
+        assert params.prune_range >= params.pkd_range
         with torch.no_grad():
+            teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
+                x=feature,
+                x_lens=feature_lens,
+                y_list=y_list,
+                use_grad=False,
+            )
+
+            ret = teacher_model.get_ranges_and_logits_with_encoder_out(
+                encoder_out=teacher_encoder_out,
+                encoder_out_lens=teacher_encoder_out_lens,
+                y_list=y_list,
+                num_nbest=4
+                use_grad=False,
+            )
+        #with torch.no_grad():
             """
             if use_beam_search:
                 teacher_y = pseudo_y
             else:
                 teacher_y = y
+            """
             """
             ret = teacher_model.get_logits_nbest(
                 x=feature,
@@ -1003,16 +1049,16 @@ def compute_loss(
                 num_nbest=4,
                 use_grad=False,
             )
-        teacher_logits_list = ret
+            """
+        #teacher_logits_list = ret
 
     with torch.set_grad_enabled(is_training):
         org_loss = torch.tensor(0.0, device=device)
         kd_loss = torch.tensor(0.0, device=device)
-
         ret = model(
             x=feature,
             x_lens=feature_lens,
-            y=y,
+            y_list=y_list,
             use_kd=use_kd,
             teacher_logits_list=teacher_logits_list,
             use_ctc=params.use_ctc,
@@ -1020,7 +1066,8 @@ def compute_loss(
             use_efficient=params.use_efficient,
             use_1best=params.use_1best,
             use_nbest=params.use_nbest,
-            pseudo_y_alignment=beam_search_alignment,
+            nbest_num=params.nbest_num,
+            pseudo_y_alignment_list=beam_search_alignment_list,
             use_sequence=params.use_sequence,
             pseudo_y_sequence=pseudo_y_sequence,
         )
@@ -1414,8 +1461,8 @@ def run(rank, world_size, args):
     if params.full_libri:
         train_cuts = librispeech.train_all_shuf_cuts()
     else:
-        #train_cuts = librispeech.train_clean_100_cuts()
-        train_cuts = librispeech.train_small_cuts()
+        train_cuts = librispeech.train_clean_100_cuts()
+        #train_cuts = librispeech.train_small_cuts()
 
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 20 seconds
