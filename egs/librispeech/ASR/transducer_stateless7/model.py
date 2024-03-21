@@ -300,18 +300,29 @@ class Transducer(nn.Module):
                     use_grad=True,
                 )
 
-                student_sampling_logits = sampling_logits
+                if use_efficient:
+                    logits_dict = dict()
+                    logits_dict["student"] = sampling_logits
+                    logits_dict["teacher"] = teacher_sampling_logits[i]
+                    ret = get_efficient(logits_dict=logits_dict,
+                                        x_lens=x_lens,
+                                        y=sampling_y[i],
+                                        )
+                    student_sampling = ret["student"]
+                    teacher_sampling = ret["teacher"]
+                else: #original code
+                    student_sampling_logits = sampling_logits
 
-                student_sampling = F.log_softmax(student_sampling_logits, dim=-1)
-                teacher_sampling = F.softmax(teacher_sampling_logits[i], dim=-1)
+                    student_sampling = F.log_softmax(student_sampling_logits, dim=-1)
+                    teacher_sampling = F.softmax(teacher_sampling_logits[i], dim=-1)
 
-                # T-axis direction masking
-                max_len = student_sampling_logits.size(1)
-                mask = torch.arange(max_len, device=student_sampling_logits.device).expand(student_sampling_logits.size(0), max_len) < x_lens.unsqueeze(1)
-                mask = mask.unsqueeze(-1).unsqueeze(-1)
+                    # T-axis direction masking
+                    max_len = student_sampling_logits.size(1)
+                    mask = torch.arange(max_len, device=student_sampling_logits.device).expand(student_sampling_logits.size(0), max_len) < x_lens.unsqueeze(1)
+                    mask = mask.unsqueeze(-1).unsqueeze(-1)
 
-                student_sampling = student_sampling * mask.float()
-                teacher_sampling = teacher_sampling * mask.float()
+                    student_sampling = student_sampling * mask.float()
+                    teacher_sampling = teacher_sampling * mask.float()
 
                 sampling_loss += self.kd_criterion(student_sampling, teacher_sampling)
             # getting average for the sampling loss
@@ -473,3 +484,57 @@ class Transducer(nn.Module):
 
         return encoder_out, encoder_out_lens
 
+
+def get_efficient(
+    logits_dict: Union[dict, torch.Tensor],
+    x_lens: torch.Tensor,
+    y: torch.Tensor,
+    blank_id=0,
+):
+    y_padded = y.pad(mode="constant", padding_value=0)
+    logits = logits_dict["student"]
+    teacher_logits = logits_dict["teacher"]
+    tensor_y_padded = y_padded.to(torch.int64)
+    indices = tensor_y_padded.unsqueeze(1).unsqueeze(-1)
+    logits = torch.softmax(logits, dim=-1)
+    teacher_logits = torch.softmax(teacher_logits, dim=-1)
+    # py
+    py_logits = torch.gather(logits, -1, indices.expand(-1, logits.size(1), -1, -1))
+    teacher_py_logits = torch.gather(teacher_logits, -1, indices.expand(-1, logits.size(1), -1, -1))
+    # blank
+    blank_indices = torch.full_like(indices, blank_id)
+    blank_logits = torch.gather(logits, -1, blank_indices.expand(-1, logits.size(1), -1, -1))
+    teacher_blank_logits = torch.gather(teacher_logits, -1, blank_indices.expand(-1, logits.size(1), -1, -1))
+    # remainder
+    rem_logits = torch.ones(py_logits.shape, device=logits.device) - py_logits - blank_logits
+    teacher_rem_logits = torch.ones(teacher_py_logits.shape, device=teacher_logits.device) - teacher_py_logits - teacher_blank_logits
+
+    # concatenate
+    eps = 1e-10
+    student = torch.cat([py_logits, blank_logits, rem_logits], dim=-1)
+    student = torch.clamp(student, eps, 1.0)
+    student = student.log()
+    teacher_rem_logits[torch.where(teacher_rem_logits<0)] = eps
+    teacher = torch.cat([teacher_py_logits, teacher_blank_logits, teacher_rem_logits], dim=-1)
+
+    # T-axis direction masking
+    max_len = logits.size(1)
+    mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
+    mask = mask.unsqueeze(-1).unsqueeze(-1)
+    student = student * mask.float()
+    teacher = teacher * mask.float()
+
+    row_splits = y.shape.row_splits(1)
+    y_lens = row_splits[1:] - row_splits[:-1]
+# U-axis direction masking
+    max_len = torch.max(y_lens)
+    mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), logits.size(1), max_len) < y_lens.unsqueeze(-1).unsqueeze(-1)
+    mask = mask.unsqueeze(-1)
+    student = student * mask.float()
+    teacher = teacher * mask.float()
+
+    ret = dict()
+    ret["student"] = student
+    ret["teacher"] = teacher
+
+    return ret
