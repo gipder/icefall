@@ -399,7 +399,7 @@ class Transducer(nn.Module):
         )
 
         if use_grad is False:
-            logits = logits.detach_()
+            logits = logits.detach()
 
         return logits
 
@@ -439,7 +439,7 @@ class Transducer(nn.Module):
         )
 
         if use_grad is False:
-            logits = logits.detach_()
+            logits = logits.detach()
 
         return logits
 
