@@ -573,6 +573,13 @@ def get_parser():
         help="Determine how many samples to take in sequence-level sampling",
     )
 
+    parser.add_argument(
+        "--sq-sampling-scale",
+        type=float,
+        default=1.0,
+        help="ratio between sampling loss and kd_loss, default is 1",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -1145,7 +1152,7 @@ def compute_loss(
 
         pkd_loss_scale = params.pkd_loss_scale
         ctc_loss_scale = params.pkd_loss_scale
-        sampling_loss_scale = params.pkd_loss_scale
+        sampling_loss_scale = params.pkd_loss_scale * params.sq_sampling_scale
         teacher_simple_loss_scale = params.pkd_loss_scale
 
         simple_loss = ret["simple_loss"]
