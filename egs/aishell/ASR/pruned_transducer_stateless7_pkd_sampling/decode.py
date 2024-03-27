@@ -141,7 +141,8 @@ import k2
 import sentencepiece as spm
 import torch
 import torch.nn as nn
-from asr_datamodule import TedLiumAsrDataModule
+from aishell import AIShell
+from asr_datamodule import AsrDataModule
 from beam_search import (
     beam_search,
     fast_beam_search_nbest,
@@ -237,7 +238,7 @@ def get_parser():
     parser.add_argument(
         "--lang-dir",
         type=Path,
-        default="data/lang_bpe_500",
+        default="data/lang_char",
         help="The lang dir containing word table and LG graph",
     )
 
@@ -395,7 +396,7 @@ def get_parser():
 def decode_one_batch(
     params: AttributeDict,
     model: nn.Module,
-    sp: spm.SentencePieceProcessor,
+    token_table: k2.SymbolTable,
     batch: dict,
     word_table: Optional[k2.SymbolTable] = None,
     decoding_graph: Optional[k2.Fsa] = None,
@@ -418,8 +419,8 @@ def decode_one_batch(
         It's the return value of :func:`get_params`.
       model:
         The neural model.
-      sp:
-        The BPE model.
+      token_table:
+        It maps token ID to a string.
       batch:
         It is the return value from iterating
         `lhotse.dataset.K2SpeechRecognitionDataset`. See its documentation
@@ -516,8 +517,6 @@ def decode_one_batch(
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
         )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
     elif params.decoding_method == "modified_beam_search":
         hyp_tokens = modified_beam_search(
             model=model,
@@ -525,8 +524,6 @@ def decode_one_batch(
             encoder_out_lens=encoder_out_lens,
             beam=params.beam_size,
         )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
     elif params.decoding_method == "modified_beam_search_lm_shallow_fusion":
         hyp_tokens = modified_beam_search_lm_shallow_fusion(
             model=model,
@@ -560,6 +557,7 @@ def decode_one_batch(
         for hyp in sp.decode(hyps_list):
             hyps.append(hyp.split())
     else:
+        hyp_tokens = []
         batch_size = encoder_out.size(0)
 
         for i in range(batch_size):
@@ -582,7 +580,9 @@ def decode_one_batch(
                 raise ValueError(
                     f"Unsupported decoding method: {params.decoding_method}"
                 )
-            hyps.append(sp.decode(hyp).split())
+            hyp_tokens.append(hyp)
+
+    hyps = [[token_table[t] for t in tokens] for tokens in hyp_tokens]
 
     if params.decoding_method == "greedy_search":
         return {"greedy_search": hyps}
@@ -605,8 +605,7 @@ def decode_dataset(
     dl: torch.utils.data.DataLoader,
     params: AttributeDict,
     model: nn.Module,
-    sp: spm.SentencePieceProcessor,
-    word_table: Optional[k2.SymbolTable] = None,
+    token_table: k2.SymbolTable,
     decoding_graph: Optional[k2.Fsa] = None,
     ngram_lm: Optional[NgramLm] = None,
     ngram_lm_scale: float = 1.0,
@@ -621,10 +620,8 @@ def decode_dataset(
         It is returned by :func:`get_params`.
       model:
         The neural model.
-      sp:
-        The BPE model.
-      word_table:
-        The word symbol table.
+      token_table:
+        It maps a token ID to a string.
       decoding_graph:
         The decoding graph. Can be either a `k2.trivial_graph` or HLG, Used
         only when --decoding_method is fast_beam_search, fast_beam_search_nbest,
@@ -658,9 +655,8 @@ def decode_dataset(
         hyps_dict = decode_one_batch(
             params=params,
             model=model,
-            sp=sp,
+            token_table=token_table,
             decoding_graph=decoding_graph,
-            word_table=word_table,
             batch=batch,
             ngram_lm=ngram_lm,
             ngram_lm_scale=ngram_lm_scale,
@@ -669,6 +665,8 @@ def decode_dataset(
 
         for name, hyps in hyps_dict.items():
             this_batch = []
+            #print(f"{hyps=}")
+            #print(f"{texts=}")
             assert len(hyps) == len(texts)
             for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
                 ref_words = ref_text.split()
@@ -700,9 +698,13 @@ def save_results(
         # The following prints out WERs, per-word error statistics and aligned
         # ref/hyp pairs.
         errs_filename = params.res_dir / f"errs-{test_set_name}-{params.suffix}.txt"
+        # we compute CER for aishell dataset.
+        results_char = []
+        for res in results:
+            results_char.append((res[0], list("".join(res[1])), list("".join(res[2]))))
         with open(errs_filename, "w") as f:
             wer = write_error_stats(
-                f, f"{test_set_name}-{key}", results, enable_log=True
+                f, f"{test_set_name}-{key}", results_char, enable_log=True
             )
             test_set_wers[key] = wer
 
@@ -711,11 +713,11 @@ def save_results(
     test_set_wers = sorted(test_set_wers.items(), key=lambda x: x[1])
     errs_info = params.res_dir / f"wer-summary-{test_set_name}-{params.suffix}.txt"
     with open(errs_info, "w") as f:
-        print("settings\tWER", file=f)
+        print("settings\tCER", file=f)
         for key, val in test_set_wers:
             print("{}\t{}".format(key, val), file=f)
 
-    s = "\nFor {}, WER of different settings are:\n".format(test_set_name)
+    s = "\nFor {}, CER of different settings are:\n".format(test_set_name)
     note = "\tbest for {}".format(test_set_name)
     for key, val in test_set_wers:
         s += "{}\t{}{}\n".format(key, val, note)
@@ -726,13 +728,15 @@ def save_results(
 @torch.no_grad()
 def main():
     parser = get_parser()
-    TedLiumAsrDataModule.add_arguments(parser)
+    AsrDataModule.add_arguments(parser)
     LmScorer.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
+    args.lang_dir = Path(args.lang_dir)
 
     params = get_params()
     params.update(vars(args))
+    params.datatang_prob = 0
 
     assert params.decoding_method in (
         "greedy_search",
@@ -793,13 +797,9 @@ def main():
 
     logging.info(f"Device: {device}")
 
-    sp = spm.SentencePieceProcessor()
-    sp.load(params.bpe_model)
-
-    # <blk> and <unk> are defined in local/train_bpe_model.py
-    params.blank_id = sp.piece_to_id("<blk>")
-    params.unk_id = sp.piece_to_id("<unk>")
-    params.vocab_size = sp.get_piece_size()
+    lexicon = Lexicon(params.lang_dir)
+    params.blank_id = 0
+    params.vocab_size = max(lexicon.tokens) + 1
 
     logging.info(params)
 
@@ -823,7 +823,9 @@ def main():
                 )
             logging.info(f"averaging {filenames}")
             model.to(device)
-            model.load_state_dict(average_checkpoints(filenames, device=device))
+            model.load_state_dict(
+                average_checkpoints(filenames, device=device), strict=False
+            )
         elif params.avg == 1:
             load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
         else:
@@ -834,7 +836,9 @@ def main():
                     filenames.append(f"{params.exp_dir}/epoch-{i}.pt")
             logging.info(f"averaging {filenames}")
             model.to(device)
-            model.load_state_dict(average_checkpoints(filenames, device=device))
+            model.load_state_dict(
+                average_checkpoints(filenames, device=device), strict=False
+            )
     else:
         if params.iter > 0:
             filenames = find_checkpoints(params.exp_dir, iteration=-params.iter)[
@@ -941,24 +945,22 @@ def main():
 
     # we need cut ids to display recognition results.
     args.return_cuts = True
-    tedlium = TedLiumAsrDataModule(args)
+    asr_datamodule = AsrDataModule(args)
+    aishell = AIShell(manifest_dir=args.manifest_dir)
+    test_cuts = aishell.test_cuts()
+    dev_cuts = aishell.valid_cuts()
+    test_dl = asr_datamodule.test_dataloaders(test_cuts)
+    dev_dl = asr_datamodule.test_dataloaders(dev_cuts)
 
-    dev_cuts = tedlium.dev_cuts()
-    test_cuts = tedlium.test_cuts()
+    test_sets = ["test", "dev"]
+    test_dls = [test_dl, dev_dl]
 
-    dev_dl = tedlium.valid_dataloaders(dev_cuts)
-    test_dl = tedlium.test_dataloaders(test_cuts)
-
-    test_sets = ["dev", "test"]
-    test_dl = [dev_dl, test_dl]
-
-    for test_set, test_dl in zip(test_sets, test_dl):
+    for test_set, test_dl in zip(test_sets, test_dls):
         results_dict = decode_dataset(
             dl=test_dl,
             params=params,
             model=model,
-            sp=sp,
-            word_table=word_table,
+            token_table=lexicon.token_table,
             decoding_graph=decoding_graph,
             ngram_lm=ngram_lm,
             ngram_lm_scale=ngram_lm_scale,
