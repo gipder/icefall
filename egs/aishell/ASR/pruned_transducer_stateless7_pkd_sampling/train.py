@@ -560,6 +560,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--use-1best",
+        type=str2bool,
+        default=False,
+        help="Whether to use 1best when doing knowledge distillation",
+    )
+
+    parser.add_argument(
         "--use-sq-sampling",
         type=str2bool,
         default=False,
@@ -1023,6 +1030,7 @@ def compute_loss(
     teacher_sampling_ranges = None
     teacher_sampling_logits = None
 
+    """
     if use_pkd:
         assert params.prune_range >= params.pkd_range
         with torch.no_grad():
@@ -1086,6 +1094,7 @@ def compute_loss(
 
                 teacher_sampling_ranges.append(sampling_ret[0])
                 teacher_sampling_logits.append(sampling_ret[1])
+        """
 
     """
     if params.use_ctc:
@@ -1122,11 +1131,12 @@ def compute_loss(
             use_ctc=params.use_ctc,
             use_teacher_simple_proj=params.use_teacher_simple_proj,
             teacher_model=teacher_model,
+            use_efficient=params.use_efficient,
+            use_1best=params.use_1best,
             use_time_compression=params.use_time_compression,
             teacher_compressed_ranges=teacher_compressed_ranges,
             teacher_compressed_logits=teacher_compressed_logits,
             teacher_compressed_masks=teacher_compressed_masks,
-            use_efficient=params.use_efficient,
             use_alphas=False,
             teacher_alphas=None,
             use_sq_sampling=use_sq_sampling,

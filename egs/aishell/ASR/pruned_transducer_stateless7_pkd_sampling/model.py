@@ -93,11 +93,12 @@ class Transducer(nn.Module):
         use_ctc: bool = False,
         use_teacher_simple_proj: bool = False,
         teacher_model: nn.Module = None,
+        use_efficient: bool = False,
+        use_1best: bool = False,
         use_time_compression: bool = False,
         teacher_compressed_ranges: torch.tensor = None,
         teacher_compressed_logits: torch.tensor = None,
         teacher_compressed_masks: torch.tensor = None,
-        use_efficient: bool = False,
         use_alphas: bool = False,
         teacher_alphas: torch.tensor = None,
         use_sq_sampling: bool = False,
@@ -144,6 +145,7 @@ class Transducer(nn.Module):
             teacher_x_lens = x_lens
         # getting student encoder output and length
         #print(f"{x=}")
+        org_x_lens = x_lens
         encoder_out, x_lens = self.encoder(x, x_lens)
         assert torch.all(x_lens > 0)
         #print(f"{encoder_out=}")
@@ -271,6 +273,64 @@ class Transducer(nn.Module):
             # prior to do_rnnt_pruning (this is an optimization for speed).
             student_logits = self.joiner(student_am_pruned, student_lm_pruned, project_input=False)
 
+            # In this version, teacher's ranges are from student's ranges
+            # However, the teacher's sampling ranges follows the different logic
+            # They are not from student's ranges
+            assert prune_range >= pkd_range
+            with torch.no_grad():
+                teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
+                    x=x,
+                    x_lens=org_x_lens,
+                    y=y,
+                    use_grad=False,
+                )
+
+                ret = teacher_model.get_logits_with_encoder_out_and_ranges(
+                    encoder_out=teacher_encoder_out,
+                    encoder_out_lens=teacher_encoder_out_lens,
+                    y=y,
+                    ranges=student_ranges,
+                    prune_range=pkd_range,
+                )
+
+                teacher_ranges = student_ranges
+                teacher_logits = ret
+
+            if use_sq_sampling:
+                teacher_sampling_ranges = list()
+                teacher_sampling_logits = list()
+                sampling_y = list()
+                for n in range(1, sq_sampling_num+1):
+                    yy = list()
+                    y_list = y.tolist()
+                    # in the case of the number of samples is 1
+                    # y_list[(i+1)%len(y_list)] means the next sample in a batch
+                    for i in range(len(y_list)):
+                        yy.append(y_list[(i+n)%len(y_list)])
+
+                    sampling_y.append(k2.RaggedTensor(yy).to(x.device))
+                    # the yy is the less probable label sequence
+
+                    sampling_ret = teacher_model.get_ranges_and_logits_with_encoder_out(
+                        encoder_out=teacher_encoder_out,
+                        encoder_out_lens=teacher_encoder_out_lens,
+                        y=sampling_y[-1],
+                        prune_range=pkd_range,
+                        am_scale=am_scale,
+                        lm_scale=lm_scale,
+                        use_teacher_ctc_alignment=False,
+                        use_efficient=use_efficient,
+                        use_time_compression=False,
+                        compression_threshold=0.0,
+                        use_beam_search=False,
+                        use_beam_search_alignment=False,
+                        beam_search_alignment=None,
+                        use_grad=False,
+                    )
+
+                    teacher_sampling_ranges.append(sampling_ret[0])
+                    teacher_sampling_logits.append(sampling_ret[1])
+
         if use_alphas:
             with torch.cuda.amp.autocast(enabled=False):
                 pruned_loss, alphas = k2.rnnt_loss_pruned_rt_alphas(
@@ -314,16 +374,44 @@ class Transducer(nn.Module):
 
         if use_pkd:
             assert student_logits.shape == teacher_logits.shape
-            student = F.log_softmax(student_logits, dim=-1)
-            teacher = F.softmax(teacher_logits, dim=-1)
 
-            # T-axis direction masking
-            max_len = logits.size(1)
-            mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
-            mask = mask.unsqueeze(-1).unsqueeze(-1)
+            if use_efficient:
+                logits_dict = dict()
+                logits_dict["student"] = student_logits
+                logits_dict["teacher"] = teacher_logits
+                tmp_ranges = student_ranges
+                print(f"{y=}")
+                expanded_ranges = tmp_ranges.unsqueeze(3).expand(-1, -1, -1, student_logits.size(-1))
+                #indexed_labels = y_padded.unsqueeze(1).expand(-1, tmp_ranges.size(1), -1).gather(2, tmp_ranges)
+                #s_logits = torch.gather(student_logits, 2, expanded_ranges)
+                #student_logits = torch.gather(s_logits, 2, indexed_labels.unsqueeze(-1))
+                #t_logits = torch.gather(teacher_logits, 2, expanded_ranges)
+                #teacher_logits = torch.gather(t_logits, 2, indexed_labels.unsqueeze(-1))
+                #print(f"{expanded_ranges=}")
+                """
+                ret = get_efficient(logits_dict=logits_dict,
+                                    x_lens=x_lens,
+                                    y=y.clone(),
+                                    blank_id=blank_id,
+                                    is_pruned=True,
+                                    ranges=student_ranges,
+                                    )
+                student = ret["student"]
+                teacher = ret["teacher"]
+                """
+                import sys
+                sys.exit(0)
+            else:
+                student = F.log_softmax(student_logits, dim=-1)
+                teacher = F.softmax(teacher_logits, dim=-1)
 
-            student = student * mask.float()
-            teacher = teacher * mask.float()
+                # T-axis direction masking
+                max_len = logits.size(1)
+                mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
+                mask = mask.unsqueeze(-1).unsqueeze(-1)
+
+                student = student * mask.float()
+                teacher = teacher * mask.float()
 
             pkd_loss = self.pkd_criterion(student, teacher)
 
@@ -947,6 +1035,87 @@ class Transducer(nn.Module):
 
         return ret
 
+    def get_logits_with_encoder_out_and_ranges(
+        self,
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+        y: k2.RaggedTensor,
+        ranges: torch.Tensor,
+        prune_range: int = 5,
+        use_grad: bool = False,
+    ) -> torch.Tensor:
+        """
+        this function works in teacher model when use_pkd is True
+        Args:
+          x:
+            A 3-D tensor of shape (N, T, C).
+          x_lens:
+            A 1-D tensor of shape (N,). It contains the number of frames in `x`
+            before padding.
+          y:
+            A ragged tensor with 2 axes [utt][label]. It contains labels of each
+            utterance.
+          ranges:
+            Pre-computed ranges for each utterance
+          prune_range:
+            The prune range for rnnt loss, it means how many symbols(context)
+            we are considering for each frame to compute the loss.
+          use_grad:
+            If True, the logits will have grad
+
+        Returns:
+          Return Tensor logits
+
+        """
+        assert y.num_axes == 2, y.num_axes
+        assert torch.all(encoder_out_lens > 0)
+
+        # Now for the decoder, i.e., the prediction network
+        row_splits = y.shape.row_splits(1)
+        y_lens = row_splits[1:] - row_splits[:-1]
+
+        blank_id = self.decoder.blank_id
+        sos_y = add_sos(y, sos_id=blank_id)
+
+        # sos_y_padded: [B, S + 1], start with SOS.
+        sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
+
+        # decoder_out: [B, S + 1, decoder_dim]
+        decoder_out = self.decoder(sos_y_padded)
+
+        # Note: y does not start with SOS
+        # y_padded : [B, S]
+        y_padded = y.pad(mode="constant", padding_value=0)
+
+        y_padded = y_padded.to(torch.int64)
+        boundary = torch.zeros((encoder_out.size(0), 4), dtype=torch.int64, device=encoder_out.device)
+        boundary[:, 2] = y_lens
+        boundary[:, 3] = encoder_out_lens
+
+        # am_pruned : [B, T, prune_range, encoder_dim]
+        # lm_pruned : [B, T, prune_range, decoder_dim]
+        am_pruned, lm_pruned = k2.do_rnnt_pruning(
+            am=self.joiner.encoder_proj(encoder_out),
+            lm=self.joiner.decoder_proj(decoder_out),
+            ranges=ranges,
+        )
+
+        # logits : [B, T, prune_range, vocab_size]
+
+        # project_input=False since we applied the decoder's input projections
+        # prior to do_rnnt_pruning (this is an optimization for speed).
+        logits = self.joiner(am_pruned, lm_pruned, project_input=False)
+
+        ranges.requires_grad_(False)
+        if use_grad is False:
+            logits = logits.detach_()
+
+        masks = None
+
+        ret = logits
+
+        return ret
+
     def get_encoder_out(
         self,
         x: torch.Tensor,
@@ -1244,6 +1413,83 @@ class Transducer(nn.Module):
 
         return alphas
 
+def get_efficient(
+    logits_dict: Union[dict, torch.Tensor],
+    x_lens: torch.Tensor,
+    y: k2.RaggedTensor,
+    blank_id: int=0,
+    is_pruned: bool=False,
+    ranges: torch.Tensor=None,
+):
+    y_padded = y.pad(mode="constant", padding_value=0)
+    logits = logits_dict["student"]
+    teacher_logits = logits_dict["teacher"]
+    tensor_y_padded = y_padded.to(torch.int64)
+    logits = torch.softmax(logits, dim=-1)
+    teacher_logits = torch.softmax(teacher_logits, dim=-1)
+
+    if is_pruned:
+        print(f"{ranges.shape=}")
+        print(f"{logits.shape=}")
+        expanded_ranges = ranges.unsqueeze(3).expand(-1, -1, -1, logits.shape[-1])
+        u_logits = torch.gather(logits, 2, expanded_ranges)
+        print(f"{y=}")
+        print(f"{y_padded.unsqueeze(1)=}")
+        indexed_labels = tensor_y_padded.unsqueeze(1).expand(-1, ranges.size(1), -1).gather(2, ranges)
+        student_logits = torch.gather(u_logits, 2, indexed_labels.unsqueeze(-1))
+        print(f"{student_logits=}")
+        #result = tensor_y_padded[torch.arange(ranges.shape[0]).view(-1, 1), ranges_indices]
+        #indices = result.view(ranges.shape[0], ranges.shape[1], -1)
+        print(f"{logits.shape=}")
+        print(f"{teacher_logits.shape=}")
+        import sys
+        sys.exit(0)
+        indices = indices.unsqueeze(-1)
+        py_logits = torch.gather(logits, -1, index=indices)
+        teacher_py_logits = torch.gather(teacher_logits, -1, index=indices)
+    else:
+        indices = tensor_y_padded.unsqueeze(1).unsqueeze(-1)
+        py_logits = torch.gather(logits, -1, indices.expand(-1, logits.size(1), -1, -1))
+        teacher_py_logits = torch.gather(teacher_logits, -1, indices.expand(-1, logits.size(1), -1, -1))
+    # blank
+    blank_indices = torch.full_like(indices, blank_id)
+    blank_logits = torch.gather(logits, -1, blank_indices.expand(-1, logits.size(1), -1, -1))
+    teacher_blank_logits = torch.gather(teacher_logits, -1, blank_indices.expand(-1, logits.size(1), -1, -1))
+    # remainder
+    rem_logits = torch.ones(py_logits.shape, device=logits.device) - py_logits - blank_logits
+    teacher_rem_logits = torch.ones(teacher_py_logits.shape, device=teacher_logits.device) - teacher_py_logits - teacher_blank_logits
+
+    # concatenate
+    eps = 1e-10
+    student = torch.cat([py_logits, blank_logits, rem_logits], dim=-1)
+    student = torch.clamp(student, eps, 1.0)
+    student = student.log()
+    idx = torch.where(teacher_rem_logits<0)
+    teacher_rem_logits[idx] = eps
+    teacher = torch.cat([teacher_py_logits, teacher_blank_logits, teacher_rem_logits], dim=-1)
+
+    # T-axis direction masking
+    max_len = logits.size(1)
+    mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
+    mask = mask.unsqueeze(-1).unsqueeze(-1)
+    student = student * mask.float()
+    teacher = teacher * mask.float()
+
+    row_splits = y.shape.row_splits(1)
+    y_lens = row_splits[1:] - row_splits[:-1]
+
+    # U-axis direction masking
+    max_len = torch.max(y_lens)
+    mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), logits.size(1), max_len) < y_lens.unsqueeze(-1).unsqueeze(-1)
+    mask = mask.unsqueeze(-1)
+    student = student * mask.float()
+    teacher = teacher * mask.float()
+
+    ret = dict()
+    ret["student"] = student
+    ret["teacher"] = teacher
+
+    return ret
 
 def get_trellis(emission, tokens, blank_id=0):
      num_frame = emission.size(0)
