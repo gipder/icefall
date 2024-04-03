@@ -557,6 +557,13 @@ def get_parser():
         help="Determine how many samples to take in sequence-level sampling",
     )
 
+    parser.add_argument(
+        "--sq-sampling-scale",
+        type=float,
+        default=1.0,
+        help="ratio between sampling loss and kd_loss, default is 1",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -1000,6 +1007,7 @@ def compute_loss(
     teacher_sampling_ranges = None
     teacher_sampling_logits = None
 
+    """
     if use_pkd:
         assert params.prune_range >= params.pkd_range
         with torch.no_grad():
@@ -1063,7 +1071,7 @@ def compute_loss(
 
                 teacher_sampling_ranges.append(sampling_ret[0])
                 teacher_sampling_logits.append(sampling_ret[1])
-
+    """
     """
     if params.use_ctc:
         use_ctc = True
@@ -1129,7 +1137,7 @@ def compute_loss(
 
         pkd_loss_scale = params.pkd_loss_scale
         ctc_loss_scale = params.pkd_loss_scale
-        sampling_loss_scale = params.pkd_loss_scale
+        sampling_loss_scale = params.pkd_loss_scale * params.sq_sampling_scale
         teacher_simple_loss_scale = params.pkd_loss_scale
 
         simple_loss = ret["simple_loss"]

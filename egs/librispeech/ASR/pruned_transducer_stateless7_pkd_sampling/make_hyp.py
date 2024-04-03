@@ -152,6 +152,7 @@ from beam_search import (
     greedy_search_batch,
     modified_beam_search,
     modified_beam_search_for_kd,
+    modified_beam_search_for_kd_nbest,
     modified_beam_search_lm_shallow_fusion,
     modified_beam_search_LODR,
     modified_beam_search_ngram_rescoring,
@@ -401,6 +402,13 @@ def get_parser():
                 the key is the utterance id and the value is
                 a list of hypotheses.""",
     )
+
+    parser.add_argument(
+        "--topk",
+        type=int,
+        default=4,
+        help="""How many top-k lists we need to keep""",
+    )
     add_model_arguments(parser)
 
     return parser
@@ -580,6 +588,63 @@ def decode_one_batch(
         #print(f"{hyp_tokens[0]=}")
         #print(f"{a==hyp_tokens[0]}")
 
+    elif params.decoding_method == "modified_beam_search_for_kd_nbest":
+        tmp_hyps, timestamps = modified_beam_search_for_kd_nbest(
+            model=model,
+            x=feature,
+            x_lens=feature_lens,
+            beam=params.beam_size,
+            topk=params.topk
+        )
+
+        nbest = params.topk
+        ids = list()
+        #print(f"{hyps=}")
+        #print(f"{timestamps=}")
+        #print(f"{batch['supervisions']['cut'][0].id=}")
+        for i in range(len(batch["supervisions"]['cut'])):
+            ids.append(batch["supervisions"]['cut'][i].id)
+
+        # adding
+        hyp_alignment = torch.zeros(feature_lens.size()[0], nbest, math.ceil((feature_lens[0]-8)/4), dtype=torch.int)
+        #print(f"{hyp_alignment.shape=}")
+        for i in range(feature_lens.size()[0]):
+            for n in range(nbest):
+                for j in range(len(tmp_hyps[i][n])):
+                    hyp_alignment[i, n, timestamps[i][n][j]] = tmp_hyps[i][n][j]
+
+        hyp_tokens = hyp_alignment.tolist()
+        for i in range(len(hyp_tokens)):
+            cache[ids[i]] = hyp_tokens[i]
+            #if ids[i] == '103-1241-0008-17294_sp0.9':
+                #print(f"{tmp_hyps[i]=}")
+                #print(f"{sp.decode(tmp_hyps[i][0])=}")
+                #import sys
+                #sys.exit(0)
+        #a = list(filter(lambda x:x != 0, hyp_tokens[0]))
+        #print(f"{list(filter(lambda x:x != 0, hyp_tokens[0]))=}")
+        #print(f"{len(list(filter(lambda x:x != 0, hyp_tokens[0])))=}")
+        #print(f"{hyp_tokens[0]=}")
+        # real hyp_tokens
+
+        #print(f"{tmp_hyps=}")
+        #print(f"{hyp_tokens=}")
+        #print(f"{cache=}")
+        hyp_tokens = list()
+        for i in tmp_hyps:
+            hyp_tokens.append(i[0]) # 1-best only
+        #hyp_tokens = tmp_hyps
+        for hyp in sp.decode(hyp_tokens):
+
+            hyps.append(hyp.split())
+        #print(f"{len(hyp_tokens[0])=}")
+        #print(f"{hyp_tokens[0]=}")
+        #print(f"{a==hyp_tokens[0]}")
+        #print(f"{len(tmp_hyps)=}")
+        #print(f"{len(hyp_tokens)=}")
+        #print(hyps[-1])
+        #print(hyps[18])
+
     elif params.decoding_method == "modified_beam_search_lm_shallow_fusion":
         hyp_tokens = modified_beam_search_lm_shallow_fusion(
             model=model,
@@ -723,7 +788,6 @@ def decode_dataset(
             LM=LM,
             cache=cache,
         )
-
         for name, hyps in hyps_dict.items():
             this_batch = []
             assert len(hyps) == len(texts)
@@ -739,6 +803,9 @@ def decode_dataset(
             batch_str = f"{batch_idx}/{num_batches}"
 
             logging.info(f"batch {batch_str}, cuts processed until now is {num_cuts}")
+        #break
+        #import sys
+        #sys.exit(0)
     return results
 
 
@@ -812,6 +879,7 @@ def main():
         "modified_beam_search_lm_shallow_fusion",
         "modified_beam_search_LODR",
         "modified_beam_search_for_kd",
+        "modified_beam_search_for_kd_nbest",
         "ctc-decoding"
     )
     params.res_dir = params.exp_dir / params.decoding_method
@@ -1012,13 +1080,13 @@ def main():
     librispeech = LibriSpeechAsrDataModule(args)
 
     train_clean_100_cuts = librispeech.train_clean_100_cuts()
-    #train_small_cuts = librispeech.train_small_cuts()
+    train_small_cuts = librispeech.train_small_cuts()
     test_clean_cuts = librispeech.test_clean_cuts()
     #test_other_cuts = librispeech.test_other_cuts()
 
     train_clean_100_dl = librispeech.test_dataloaders(train_clean_100_cuts)
     #train_clean_100_dl = librispeech.train_dataloaders(train_clean_100_cuts)
-    #train_small_dl = librispeech.train_pure_dataloaders(train_small_cuts)
+    train_small_dl = librispeech.test_dataloaders(train_small_cuts)
     #train_small_dl = librispeech.train_dataloaders(train_small_cuts)
     test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
     #test_other_dl = librispeech.test_dataloaders(test_other_cuts)
@@ -1036,6 +1104,8 @@ def main():
         cache = dict()
         test_sets = ["train-clean-100"]
         test_dl = [train_clean_100_dl]
+        #test_sets = ["train-small"]
+        #test_dl = [train_small_dl]
         #test_sets = ["test-clean"]
         #test_dl = [test_clean_dl]
         logging.info(f"epoch {e} is running")

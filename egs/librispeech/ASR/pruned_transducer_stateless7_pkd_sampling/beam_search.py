@@ -1081,14 +1081,14 @@ def modified_beam_search_for_kd(
         timestamps=ans_timestamps,
     )
 
-def modified_beam_search2(
+def modified_beam_search_for_kd_nbest(
     model: Transducer,
-    encoder_out: torch.Tensor,
-    encoder_out_lens: torch.Tensor,
+    x: torch.Tensor,
+    x_lens: torch.Tensor,
     beam: int = 4,
+    topk: int = 4,
     temperature: float = 1.0,
     return_timestamps: bool = False,
-    return_topk: bool = False,
 ) -> Union[List[List[int]], DecodingResults]:
     """Beam search in batch mode with --max-sym-per-frame=1 being hardcoded.
 
@@ -1111,6 +1111,7 @@ def modified_beam_search2(
       Else, return a DecodingResults object containing
       decoded result and corresponding timestamps.
     """
+    encoder_out, encoder_out_lens = model.encoder(x, x_lens)
     assert encoder_out.ndim == 3, encoder_out.shape
     assert encoder_out.size(0) >= 1, encoder_out.size(0)
 
@@ -1247,42 +1248,41 @@ def modified_beam_search2(
         ans.append(sorted_ans[unsorted_indices[i]])
         ans_timestamps.append(sorted_timestamps[unsorted_indices[i]])
 
-    if return_topk:
-        #print(f"{best_hyps=}")
-        #print(f"{len(B)=}")
-        topk_hyps = list()
-        topk_timestamps = list()
-        topk_best_orig_hyps = [b.topk(k=beam, length_norm=True) for b in B]
-        topk_best_list = list()
-        topk_best_timestamps = list()
-        for a in topk_best_orig_hyps:
-            for h in a:
-                topk_best_list.append(h.ys[context_size:])
-                topk_best_timestamps.append(h.timestamp)
+    #print(f"{best_hyps=}")
+    #print(f"{len(B)=}")
+    topk_hyps = list()
+    topk_timestamps = list()
+    topk_best_orig_hyps = [b.topk(k=topk, length_norm=True) for b in B]
+    topk_unsorted_best_orig_hyps = []
+    for i in range(N):
+        topk_unsorted_best_orig_hyps.append(topk_best_orig_hyps[unsorted_indices[i]])
+    topk_best_orig_hyps = topk_unsorted_best_orig_hyps
+    topk_best_list = list()
+    topk_best_timestamps = list()
+    for a in topk_best_orig_hyps:
+        for h in a:
+            topk_best_list.append(h.ys[context_size:])
+            topk_best_timestamps.append(h.timestamp)
+        if len(a) < topk:
+            for i in range(topk-len(a)):
+                topk_best_list.append(topk_best_list[-1])
+                topk_best_timestamps.append(topk_best_timestamps[-1])
+    #print(f"{topk_best_orig_hyps=}")
+    #print(f"{len(topk_best_list)=}")
+    #for r in range(0, len(topk_best_list), 4):
+    #    print(f"{topk_best_list[r]=}")
+    #print(f"{len(topk_best_timestamps)=}")
+    #print(f"{topk_best_timestamps=}")
+    for b in range(len(B)):
+        hyp = list()
+        timestamp = list()
+        for h in range(topk):
+            hyp.append(topk_best_list[b*topk+h])
+            timestamp.append(topk_best_timestamps[b*topk+h])
+        topk_hyps.append(hyp)
+        topk_timestamps.append(timestamp)
 
-        print(f"{topk_best_orig_hyps=}")
-        print(f"{len(topk_best_list)=}")
-        print(f"{len(topk_best_timestamps)=}")
-        for b in range(len(B)):
-            hyp = list()
-            timestamp = list()
-            for h in range(beam):
-                hyp.append(topk_best_list[b*beam+h])
-                timestamp.append(topk_best_timestamps[b*beam+h])
-            topk_hyps.append(hyp)
-            topk_timestamps.append(timestamp)
-
-    #for b  in B:
-    #    print(b)
-    if return_topk:
-        return topk_hyps, topk_timestamps
-    if not return_timestamps:
-        return ans
-    else:
-        return DecodingResults(
-            hyps=ans,
-            timestamps=ans_timestamps,
-        )
+    return topk_hyps, topk_timestamps
 
 def modified_beam_search(
     model: Transducer,
