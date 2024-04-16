@@ -92,26 +92,6 @@ from icefall.utils import (
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
-def load_teacher_checkpoint(model: Union[nn.Module, DDP], filename: str, strict: bool = False) -> None:
-    """
-    Load the teacher model from a checkpoint.
-    """
-    logging.info(f"Loading checkpoint from {filename}")
-    checkpoint = torch.load(filename, map_location="cpu")
-
-    if next(iter(checkpoint["model"])).startswith("module."):
-        logging.info("Loading checkpoint saved by DDP")
-
-        dst_state_dict = model.state_dict()
-        src_state_dict = checkpoint["model"]
-        for key in dst_state_dict.keys():
-            src_key = "{}.{}".format("module", key)
-            dst_state_dict[key] = src_state_dict.pop(src_key)
-        assert len(src_state_dict) == 0
-        model.load_state_dict(dst_state_dict, strict=strict)
-    else:
-        model.load_state_dict(checkpoint["model"], strict=strict)
-
 
 def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
     if isinstance(model, DDP):
@@ -394,146 +374,6 @@ def get_parser():
         help="Whether to use half precision training.",
     )
 
-    parser.add_argument(
-        "--use-pkd",
-        type=str2bool,
-        default=False,
-        help="Whether to use knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--pkd-loss-scale",
-        type=float,
-        default=0.5,
-        help="The scalefor pruned knowledge distillation loss.",
-    )
-
-    parser.add_argument(
-        "--teacher-checkpoint",
-        type=str,
-        default="",
-        help="The checkpoint of teacher model for knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--teacher-num-encoder-layers",
-        type=str,
-        default="",
-        help="The number of encoder layers of teacher model for knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--teacher-feedforward-dims",
-        type=str,
-        default="",
-        help="The feedforward dimensions of teacher model for knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--teacher-nhead",
-        type=str,
-        default="",
-        help="The number of attention heads of teacher model for knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--teacher-encoder-dims",
-        type=str,
-        default="",
-        help="The encoder dimensions of teacher model for knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--teacher-attention-dims",
-        type=str,
-        default="",
-        help="The attention dimensions of teacher model for knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--teacher-encoder-unmasked-dims",
-        type=str,
-        default="",
-        help="The encoder unmasked dimensions of teacher model for knowledge distillation.",
-    )
-
-    parser.add_argument(
-        "--use-reset-simple-layer",
-        type=str2bool,
-        default=False,
-        help="Whether to reset simple layers.",
-    )
-
-    parser.add_argument(
-        "--use-ctc",
-        type=str2bool,
-        default=False,
-        help="Whether to use ctc layers.",
-    )
-
-    parser.add_argument(
-        "--use-teacher-ctc-alignment",
-        type=str2bool,
-        default=False,
-        help="Whether to use teacher ctc alignment.",
-    )
-
-    parser.add_argument(
-        "--use-efficient",
-        type=str2bool,
-        default=False,
-        help="Whether to use p_y, p_blank, p_rem for KD",
-    )
-
-    parser.add_argument(
-        "--pkd-range",
-        type=int,
-        default=1,
-        help="The prune range for pkd loss when using teacher ctc alignment.",
-    )
-
-    parser.add_argument(
-        "--use-time-compression",
-        type=str2bool,
-        default=False,
-        help="Whether to use time compression",
-    )
-
-    parser.add_argument(
-        "--time-compression-threshold",
-        type=float,
-        default=0.95,
-        help="The threshold when using time compression",
-    )
-
-    parser.add_argument(
-        "--use-teacher-simple-proj",
-        type=str2bool,
-        default=False,
-        help="Whether to update simple projection layers of teacher model",
-    )
-
-    parser.add_argument(
-        "--use-alphas",
-        type=str2bool,
-        default=False,
-        help="Whether to use alphas in knowledge distillatioin",
-    )
-
-    parser.add_argument(
-        "--use-beam-search",
-        type=str2bool,
-        default=False,
-        help="Whether to use beam search when doing knowledge distillation",
-    )
-
-    parser.add_argument(
-        "--teacher-n-best",
-        type=int,
-        default=1,
-        help="How many hyphotheses do you take when doing knowledge distillation",
-    )
-
     add_model_arguments(parser)
 
     return parser
@@ -791,8 +631,6 @@ def compute_loss(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
-    teacher_model: Optional[Union[nn.Module, DDP]] = None,
-    hyp_cache: dict = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute transducer loss given the model and its inputs.
@@ -839,260 +677,16 @@ def compute_loss(
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
-    if isinstance(teacher_model, DDP):
-        teacher_model = teacher_model.module
-
-    teacher_ranges = None
-    teacher_logits = None
-    teacher_compressed_ranges = None
-    teacher_compressed_logits = None
-    teacher_compressed_masks = None
-    teacher_alphas = None
-
-    if teacher_model is None:
-        use_pkd = False
-        use_teacher_simple_proj = False
-        use_alphas = False
-        use_beam_search = False
-    else:
-        use_pkd = params.use_pkd
-        use_teacher_simple_proj = params.use_teacher_simple_proj
-        use_alphas = params.use_alphas
-        use_beam_search = params.use_beam_search
-
-    beam_search_alignment = None
-    if use_beam_search:
-        from beam_search import (
-            modified_beam_search,
-            modified_beam_search_for_kd,
-            Hypothesis,
-            HypothesisList
-        )
-        from icefall.utils import add_sos
-
-        # getting beam search results and making pseudo labels
-        # beam search
-        # There is a problem with how to get the logits of the teacher model.
-        # option 1. from modified_beam_search
-        #
-        # option 2. from usual training process
-        #print(f"{batch=}")
-        ids = list()
-        #print(f"{batch['supervisions']['cut'][0].id=}")
-        for i in range(len(batch["supervisions"]['cut'])):
-            ids.append(batch["supervisions"]['cut'][i].id)
-
-        with torch.no_grad():
-            # check cache memory
-            all_in_cache = True
-            if hyp_cache is not None:
-               for i in range(len(ids)):
-                   if hyp_cache.get(ids[i]) is None:
-                       all_in_cache = False
-                       break
-
-            # if hyps exist in cache, use them or do beam search
-            if all_in_cache is False:
-                print("do beam search")
-                hyp_tokens = modified_beam_search_for_kd(
-                    model=teacher_model,
-                    x=feature,
-                    x_lens=feature_lens,
-                    beam=params.teacher_n_best,
-                )
-                # add the hyp_tokens to cache
-                for i in range(len(hyp_tokens)):
-                    hyp_cache[ids[i]] = hyp_tokens[i]
-            else:
-                print("use hyps in cache")
-                hyp_tokens = list()
-                for i in range(len(ids)):
-                    hyp_tokens.append(hyp_cache[ids[i]])
-
-            # make pseudo labels
-            pseudo_labels = list()
-            for i in range(len(hyp_tokens)):
-                tmp_pseudo_label = ()
-                for j in hyp_tokens[i]:
-                    tmp_pseudo_label = [ t for t in j if t != 0 ]
-                pseudo_labels.append(tmp_pseudo_label)
-
-            # remove duplicated labels with maintaing order
-            non_duplicated_pseudo_labels = list()
-            for i in range(len(pseudo_labels)):
-                non_duplicated_pseudo_label = list()
-                if pseudo_labels[i] != []:
-                    non_duplicated_pseudo_label.append(pseudo_labels[i][0])
-                    for j in range(1, len(pseudo_labels[i])):
-                        if pseudo_labels[i][j] != pseudo_labels[i][j-1]:
-                            non_duplicated_pseudo_label.append(pseudo_labels[i][j])
-                else:
-                    print(f"{i=}" + "th pseudo label is empty")
-                    print(f"inserting the original label {y[i].tolist()}")
-                    print(f"{len(y[i].tolist())}")
-                    #import pickld
-                    #dump_file = "batch_dump.pkl"
-                    #with open(dump_file, "wb") as f:
-                    #    pickle.dump(batch, f)
-                    non_duplicated_pseudo_label = y[i].tolist()
-                    # make a new alignment with the original label
-                    # 424 / 72 = 5.88
-                    # period = 5
-                    import math
-                    x_len = math.ceil((feature_lens[i] - 8) / 4)
-                    new_alignment = list([ 0 for i in range(x_len) ])
-                    period = x_len // len(non_duplicated_pseudo_label)
-                    for j in range(len(non_duplicated_pseudo_label)):
-                        new_alignment[period//2 + j*period] = non_duplicated_pseudo_label[j]
-                    #print(f"{feature_lens=}")
-                    #print(f"{new_alignment=}")
-                    #print(f"{len(new_alignment)=}")
-                    hyp_tokens[i] = [ new_alignment ]
-
-                non_duplicated_pseudo_labels.append(non_duplicated_pseudo_label)
-
-            # convert list(list()) to k2.RaggedTensor
-            #print(f"{non_duplicated_pseudo_labels=}")
-            pseudo_y = k2.RaggedTensor(non_duplicated_pseudo_labels).to(device)
-            y = pseudo_y.clone()
-            #print(f"{y=}")
-            row_splits = y.shape.row_splits(1)
-            y_lens = row_splits[1:] - row_splits[:-1]
-            blank_id = params.blank_id
-            sos_id = add_sos(y, sos_id=blank_id)
-
-            # change hyp_tokens to alignment for icefall
-            # for example (vocab_size=10)
-            # labels: [ 2, 4, 5, 9 ]
-            # hyp_tokens =        [[ 0, 0, 2, 4, 0, 5, 0, 0, 9, 0 ]]
-            # icefall_alignment = [[ 0, 0, 1, 2, 2, 3, 3, 3, 4, 4 ]]
-            # currently I assume that hypothesis is 1-best result
-
-            # first, check if the first token is blank
-            for i in range(len(hyp_tokens)):
-                if hyp_tokens[i][0][0] != 0:
-                    hyp_tokens[i][0][1:] = hyp_tokens[i][0][:-1] # shift to right
-                    hyp_tokens[i][0][0] = 0
-            # get max length of hyp_tokens
-            max_len = 0
-            for i in range(len(hyp_tokens)):
-                if max_len < len(hyp_tokens[i][0]):
-                    max_len = len(hyp_tokens[i][0])
-            alignment = torch.zeros((len(hyp_tokens), max_len), dtype=torch.int32)
-            # remove duplicated labels in hyp_tokens
-            # and convert the sequence to monotonic increasing sequence
-            for i in range(len(hyp_tokens)):
-                prev = hyp_tokens[i][0][0]
-                for j in range(1, len(hyp_tokens[i][0])):
-                    if hyp_tokens[i][0][j] != 0:
-                        if prev != hyp_tokens[i][0][j]:
-                            prev = hyp_tokens[i][0][j]
-                        else:
-                            hyp_tokens[i][0][j] = 0
-
-                mask = (torch.tensor(hyp_tokens[i][0], dtype=torch.bool) != 0)
-                alignment[i, :len(hyp_tokens[i][0])] = torch.cumsum(mask.int(), dim=-1, dtype=torch.int32)
-
-            beam_search_alignment = alignment.to(device)
-            #for i in range(len(hyp_tokens)):
-            #    print(f"{i}: {len(hyp_tokens[i][0])=}")
-            #print(f"{hyp_tokens[ii]=}")
-            #print(f"{len(hyp_tokens[ii][0])=}")
-            #print(f"{beam_search_alignment[ii]=}")
-
-    if use_pkd:
-        with torch.no_grad():
-            #print(f"{y=}")
-            #print(f"{use_beam_search=}")
-            #print(f"{beam_search_alignment=}")
-            ret = teacher_model.get_ranges_and_logits(
-                x=feature,
-                x_lens=feature_lens,
-                y=y,
-                prune_range=params.prune_range,
-                am_scale=params.am_scale,
-                lm_scale=params.lm_scale,
-                use_teacher_ctc_alignment=params.use_teacher_ctc_alignment,
-                use_efficient=params.use_efficient,
-                use_time_compression=params.use_time_compression,
-                compression_threshold=params.time_compression_threshold,
-                use_beam_search=use_beam_search,
-                beam_search_alignment=beam_search_alignment,
-            )
-
-        teacher_ranges = ret[0]
-        teacher_logits = ret[1]
-        if params.use_time_compression:
-            teacher_compressed_ranges = ret[-3]
-            teacher_compressed_logits = ret[-2]
-            teacher_compressed_masks = ret[-1]
-
-            ret = teacher_model.get_ranges_and_logits(
-                x=feature,
-                x_lens=feature_lens,
-                y=y,
-                prune_range=params.prune_range,
-                am_scale=params.am_scale,
-                lm_scale=params.lm_scale,
-                use_teacher_ctc_alignment=params.use_teacher_ctc_alignment,
-                use_efficient=params.use_efficient,
-                use_time_compression=params.use_time_compression,
-                compression_threshold=params.time_compression_threshold,
-            )
-
-            teacher_ranges = ret[0]
-            teacher_logits = ret[1]
-
-        with torch.no_grad():
-            teacher_alphas = teacher_model.get_alphas(
-                x=feature,
-                x_lens=feature_lens,
-                y=y,
-                prune_range=params.prune_range,
-                ranges=teacher_ranges,
-            )
-
-    """
-    if params.use_ctc:
-        use_ctc = True
-    else:
-        use_ctc = False
-    """
     with torch.set_grad_enabled(is_training):
-        simple_loss = torch.tensor(0.0, device=device)
-        pruned_loss = torch.tensor(0.0, device=device)
-        pkd_loss = torch.tensor(0.0, device=device)
-        ctc_loss = torch.tensor(0.0, device=device)
-        teacher_simple_loss = torch.tensor(0.0, device=device)
-        alphas_loss = torch.tensor(0.0, device=device)
-        """
-        # It doesn't need
-        if use_pkd:
-            ret = (simple_loss, pruned_loss, pkd_loss)
-        else:
-            ret = (simple_loss, pruned_loss)
-
-        """
-        ret = model(
+        simple_loss, pruned_loss = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
             prune_range=params.prune_range,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
-            use_pkd=use_pkd,
-            teacher_ranges=teacher_ranges,
-            teacher_logits=teacher_logits,
-            use_ctc=params.use_ctc,
-            use_teacher_simple_proj=params.use_teacher_simple_proj,
-            teacher_model=teacher_model,
-            use_time_compression=params.use_time_compression,
-            teacher_compressed_ranges=teacher_compressed_ranges,
-            teacher_compressed_logits=teacher_compressed_logits,
-            teacher_compressed_masks=teacher_compressed_masks,
-            use_alphas=use_alphas,
-            teacher_alphas=teacher_alphas,
         )
+
         s = params.simple_loss_scale
         # take down the scale on the simple loss from 1.0 at the start
         # to params.simple_loss scale by warm_step.
@@ -1107,28 +701,7 @@ def compute_loss(
             else 0.1 + 0.9 * (batch_idx_train / warm_step)
         )
 
-        pkd_loss_scale = params.pkd_loss_scale
-        ctc_loss_scale = params.pkd_loss_scale
-        teacher_simple_loss_scale = params.pkd_loss_scale
-        alphas_loss_scale = params.pkd_loss_scale
-
-        simple_loss = ret["simple_loss"]
-        pruned_loss = ret["pruned_loss"]
-        if use_pkd:
-            pkd_loss = ret["pkd_loss"]
-            if use_teacher_simple_proj:
-                teacher_simple_loss = ret["teacher_simple_loss"]
-        if params.use_ctc:
-            ctc_loss = ret["ctc_loss"]
-        if use_alphas:
-            alphas_loss = ret["alphas_loss"]
-
-        loss = simple_loss_scale * simple_loss + \
-            pruned_loss_scale * pruned_loss + \
-            pkd_loss_scale * pkd_loss + \
-            ctc_loss_scale * ctc_loss + \
-            teacher_simple_loss_scale * teacher_simple_loss + \
-            alphas_loss_scale * alphas_loss
+        loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
 
     assert loss.requires_grad == is_training
 
@@ -1141,14 +714,7 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
-    if params.use_pkd:
-        info["pkd_loss"] = pkd_loss.detach().cpu().item()
-        if params.use_teacher_simple_proj:
-            info["teacher_simple_loss"] = teacher_simple_loss.detach().cpu().item()
-    if params.use_ctc:
-        info["ctc_loss"] = ctc_loss.detach().cpu().item()
-    if params.use_alphas:
-        info["alphas_loss"] = alphas_loss.detach().cpu().item()
+
     return loss, info
 
 
@@ -1199,8 +765,6 @@ def train_one_epoch(
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
-    teacher_model: Optional[nn.Module] = None,
-    hyp_cache: dict = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -1249,18 +813,13 @@ def train_one_epoch(
 
         try:
             with torch.cuda.amp.autocast(enabled=params.use_fp16):
-                for i in range(2):
-                    loss, loss_info = compute_loss(
-                        params=params,
-                        model=model,
-                        sp=sp,
-                        batch=batch,
-                        is_training=True,
-                        teacher_model=teacher_model,
-                        hyp_cache=hyp_cache,
-                    )
-                import sys
-                sys.exit(0)
+                loss, loss_info = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=True,
+                )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
@@ -1432,37 +991,6 @@ def run(rank, world_size, args):
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
 
-    # load the model from checkpoint if available
-    teacher_model = None
-    if params.use_pkd or params.use_alphas:
-        teacher_params = copy.deepcopy(params)
-        teacher_params.num_encoder_layers = params.teacher_num_encoder_layers
-        teacher_params.feedforward_dims = params.teacher_feedforward_dims
-        teacher_params.nhead = params.teacher_nhead
-        teacher_params.encoder_dims = params.teacher_encoder_dims
-        teacher_model = get_transducer_model(teacher_params)
-        load_teacher_checkpoint(teacher_model, params.teacher_checkpoint)
-
-        assert teacher_model is not None
-        teacher_model.to(device)
-        teacher_model.eval()
-
-        if params.use_teacher_simple_proj:
-            teacher_model.reset_simple_layer()
-            logging.info("Resetting simple layer in teacher model")
-            #TODO hard coded
-            model.set_teacher_simple_layer(384, #teacher_model.encoder.encoder_dims,
-                                           512, #teacher_model.decoder.dims,
-                                           500, #teacher_model.decoder.vocab_size,
-                                           device)
-        logging.info("Teacher model loaded")
-        num_param = sum([p.numel() for p in teacher_model.parameters()])
-        logging.info(f"Number of teacher model parameters: {num_param}")
-
-    if params.use_ctc:
-        model.set_ctc_loss(reduction="sum", zero_infinity=True, blank=params.blank_id)
-        logging.info("Using CTC loss")
-
     assert params.save_every_n >= params.average_period
     model_avg: Optional[nn.Module] = None
     if rank == 0:
@@ -1478,8 +1006,6 @@ def run(rank, world_size, args):
     if world_size > 1:
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-        if params.use_pkd:
-            teacher_model = DDP(teacher_model, device_ids=[rank])
 
     parameters_names = []
     parameters_names.append(
@@ -1590,7 +1116,6 @@ def run(rank, world_size, args):
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 
-    hyp_cache = dict()
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)
         fix_random_seed(params.seed + epoch - 1)
@@ -1614,8 +1139,6 @@ def run(rank, world_size, args):
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,
-            teacher_model=teacher_model,
-            hyp_cache=hyp_cache,
         )
 
         if params.print_diagnostics:

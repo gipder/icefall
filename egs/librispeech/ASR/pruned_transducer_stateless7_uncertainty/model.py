@@ -15,14 +15,15 @@
 # limitations under the License.
 
 
-from typing import Tuple
+import random
 
 import k2
 import torch
 import torch.nn as nn
 from encoder_interface import EncoderInterface
+from scaling import penalize_abs_values_gt
 
-from icefall.utils import add_sos, make_pad_mask
+from icefall.utils import add_sos
 
 
 class Transducer(nn.Module):
@@ -35,8 +36,6 @@ class Transducer(nn.Module):
         encoder: EncoderInterface,
         decoder: nn.Module,
         joiner: nn.Module,
-        lconv: nn.Module,
-        frame_reducer: nn.Module,
         encoder_dim: int,
         decoder_dim: int,
         joiner_dim: int,
@@ -65,20 +64,12 @@ class Transducer(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.joiner = joiner
-        self.lconv = lconv
-        self.frame_reducer = frame_reducer
 
         self.simple_am_proj = nn.Linear(
             encoder_dim,
             vocab_size,
         )
         self.simple_lm_proj = nn.Linear(decoder_dim, vocab_size)
-
-        self.ctc_output = nn.Sequential(
-            nn.Dropout(p=0.1),
-            nn.Linear(encoder_dim, vocab_size),
-            nn.LogSoftmax(dim=-1),
-        )
 
     def forward(
         self,
@@ -88,8 +79,7 @@ class Transducer(nn.Module):
         prune_range: int = 5,
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
-        warmup: float = 1.0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Args:
           x:
@@ -109,15 +99,14 @@ class Transducer(nn.Module):
           lm_scale:
             The scale to smooth the loss with lm (output of predictor network)
             part
-          warmup:
-            A floating point value which decides whether to do blank skip.
         Returns:
-          Return a tuple containing simple loss, pruned loss, and ctc-output.
+          Return the transducer loss.
+
         Note:
-          Regarding am_scale & lm_scale, it will make the loss-function one of
-          the form:
-            lm_scale * lm_probs + am_scale * am_probs +
-            (1-lm_scale-am_scale) * combined_probs
+           Regarding am_scale & lm_scale, it will make the loss-function one of
+           the form:
+              lm_scale * lm_probs + am_scale * am_probs +
+              (1-lm_scale-am_scale) * combined_probs
         """
         assert x.ndim == 3, x.shape
         assert x_lens.ndim == 1, x_lens.shape
@@ -128,36 +117,11 @@ class Transducer(nn.Module):
         encoder_out, x_lens = self.encoder(x, x_lens)
         assert torch.all(x_lens > 0)
 
-        # compute ctc log-probs
-        ctc_output = self.ctc_output(encoder_out)
-
-        # y_lens
+        # Now for the decoder, i.e., the prediction network
         row_splits = y.shape.row_splits(1)
         y_lens = row_splits[1:] - row_splits[:-1]
 
-        # blank skip
         blank_id = self.decoder.blank_id
-
-        if warmup >= 2.0:
-            # lconv
-            encoder_out = self.lconv(
-                x=encoder_out,
-                src_key_padding_mask=make_pad_mask(x_lens),
-            )
-
-            # frame reduce
-            encoder_out_fr, x_lens_fr = self.frame_reducer(
-                encoder_out,
-                x_lens,
-                ctc_output,
-                y_lens,
-                blank_id,
-            )
-        else:
-            encoder_out_fr = encoder_out
-            x_lens_fr = x_lens
-
-        # sos_y
         sos_y = add_sos(y, sos_id=blank_id)
 
         # sos_y_padded: [B, S + 1], start with SOS.
@@ -173,10 +137,15 @@ class Transducer(nn.Module):
         y_padded = y_padded.to(torch.int64)
         boundary = torch.zeros((x.size(0), 4), dtype=torch.int64, device=x.device)
         boundary[:, 2] = y_lens
-        boundary[:, 3] = x_lens_fr
+        boundary[:, 3] = x_lens
 
-        am = self.simple_am_proj(encoder_out_fr)
         lm = self.simple_lm_proj(decoder_out)
+        am = self.simple_am_proj(encoder_out)
+
+        # if self.training and random.random() < 0.25:
+        #    lm = penalize_abs_values_gt(lm, 100.0, 1.0e-04)
+        # if self.training and random.random() < 0.25:
+        #    am = penalize_abs_values_gt(am, 30.0, 1.0e-04)
 
         with torch.cuda.amp.autocast(enabled=False):
             simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
@@ -202,7 +171,7 @@ class Transducer(nn.Module):
         # am_pruned : [B, T, prune_range, encoder_dim]
         # lm_pruned : [B, T, prune_range, decoder_dim]
         am_pruned, lm_pruned = k2.do_rnnt_pruning(
-            am=self.joiner.encoder_proj(encoder_out_fr),
+            am=self.joiner.encoder_proj(encoder_out),
             lm=self.joiner.decoder_proj(decoder_out),
             ranges=ranges,
         )
@@ -223,4 +192,4 @@ class Transducer(nn.Module):
                 reduction="sum",
             )
 
-        return (simple_loss, pruned_loss, ctc_output)
+        return (simple_loss, pruned_loss)
