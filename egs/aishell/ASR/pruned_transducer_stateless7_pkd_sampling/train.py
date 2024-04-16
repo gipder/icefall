@@ -1687,7 +1687,7 @@ def run(rank, world_size, args):
             optimizer=optimizer,
             scheduler=scheduler,
             graph_compiler=graph_compiler,
-            train_dl=train_dl,
+            train_dl=valid_dl,
             valid_dl=valid_dl,
             scaler=scaler,
             tb_writer=tb_writer,

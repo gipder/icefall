@@ -376,29 +376,70 @@ class Transducer(nn.Module):
             assert student_logits.shape == teacher_logits.shape
 
             if use_efficient:
-                logits_dict = dict()
-                logits_dict["student"] = student_logits
-                logits_dict["teacher"] = teacher_logits
-                tmp_ranges = student_ranges
-                print(f"{y=}")
-                expanded_ranges = tmp_ranges.unsqueeze(3).expand(-1, -1, -1, student_logits.size(-1))
-                #indexed_labels = y_padded.unsqueeze(1).expand(-1, tmp_ranges.size(1), -1).gather(2, tmp_ranges)
-                #s_logits = torch.gather(student_logits, 2, expanded_ranges)
-                #student_logits = torch.gather(s_logits, 2, indexed_labels.unsqueeze(-1))
-                #t_logits = torch.gather(teacher_logits, 2, expanded_ranges)
-                #teacher_logits = torch.gather(t_logits, 2, indexed_labels.unsqueeze(-1))
-                #print(f"{expanded_ranges=}")
-                """
-                ret = get_efficient(logits_dict=logits_dict,
-                                    x_lens=x_lens,
-                                    y=y.clone(),
-                                    blank_id=blank_id,
-                                    is_pruned=True,
-                                    ranges=student_ranges,
-                                    )
-                student = ret["student"]
-                teacher = ret["teacher"]
-                """
+                print(f"{student_logits[0, 0]=}")
+                print(f"{teacher_logits[0, 0]=}")
+                student = F.log_softmax(student_logits, dim=-1)
+                teacher = F.log_softmax(teacher_logits, dim=-1)
+
+                # student
+                s_px, s_py = k2.get_rnnt_logprobs_pruned(
+                    logits=student,
+                    symbols=y_padded,
+                    ranges=student_ranges,
+                    termination_symbol=blank_id,
+                    boundary=boundary,
+                )
+                s_px = s_px[:, :, :-1]
+                s_py = s_py[:, :-1, :]
+                #s_px = s_px[ s_px != float("-inf")]
+                #s_py = s_py[ s_py != float("-inf")]
+                #s_px = torch.gather(s_px.permute(0, 2, 1), 2, student_ranges).exp()
+                #s_py = torch.gather(s_py.permute(0, 2, 1), 2, student_ranges).exp()
+                # teacher
+                t_px, t_py = k2.get_rnnt_logprobs_pruned(
+                    logits=student,
+                    symbols=y_padded,
+                    ranges=student_ranges,
+                    termination_symbol=blank_id,
+                    boundary=boundary,
+                )
+                t_px = t_px[:, :, :-1]
+                t_py = t_py[:, :-1, :]
+                #t_px = t_px[ t_px != float("-inf")]
+                #t_py = t_py[ t_py != float("-inf")]
+                #t_px = torch.gather(t_px.permute(0, 2, 1), 2, student_ranges).exp()
+                #t_py = torch.gather(t_py.permute(0, 2, 1), 2, student_ranges).exp()
+                #
+                print(f"{student[0, 0]=}")
+                print(f"{teacher[0, 0]=}")
+                print(f"{s_px.shape=}")
+                print(f"{s_py.shape=}")
+                print(f"{t_px.shape=}")
+                print(f"{t_py.shape=}")
+                assert s_px.shape == t_px.shape
+                assert s_py.shape == t_py.shape
+                assert s_px.shape == s_py.shape
+                assert t_px.shape == t_py.shape
+                s_px = s_px.exp()
+                s_py = s_py.exp()
+                t_px = t_px.exp()
+                t_py = t_py.exp()
+                print(f"{s_px[0]=}")
+                print(f"{s_py[0]=}")
+                print(f"{t_px[0]=}")
+                print(f"{t_py[0]=}")
+                print(f"{s_px.shape=}")
+                print(f"{s_py.shape=}")
+                s_pr = torch.ones_like(s_px)
+                t_pr = torch.ones_like(t_px)
+
+                s_pr = s_pr - s_px - s_py
+                t_pr = t_pr - t_px - t_py
+
+                student = torch.concat([s_px, s_py, s_pr], dim=-1)
+                teacher = torch.concat([t_px, t_py, t_pr], dim=-1)
+                print(f"{student[0, 0]=}")
+                print(f"{teacher[0, 0]=}")
                 import sys
                 sys.exit(0)
             else:

@@ -141,7 +141,8 @@ import k2
 import sentencepiece as spm
 import torch
 import torch.nn as nn
-from asr_datamodule import LibriSpeechAsrDataModule
+from aishell import AIShell
+from asr_datamodule import AsrDataModule
 from beam_search import (
     beam_search,
     fast_beam_search_nbest,
@@ -230,18 +231,19 @@ def get_parser():
         default="pruned_transducer_stateless7/exp",
         help="The experiment dir",
     )
-
+    """
     parser.add_argument(
         "--bpe-model",
         type=str,
         default="data/lang_bpe_500/bpe.model",
         help="Path to the BPE model",
     )
+    """
 
     parser.add_argument(
         "--lang-dir",
         type=Path,
-        default="data/lang_bpe_500",
+        default="data/lang_char",
         help="The lang dir containing word table and LG graph",
     )
 
@@ -417,9 +419,8 @@ def get_parser():
 def decode_one_batch(
     params: AttributeDict,
     model: nn.Module,
-    sp: spm.SentencePieceProcessor,
     batch: dict,
-    word_table: Optional[k2.SymbolTable] = None,
+    token_table: Optional[k2.SymbolTable] = None,
     decoding_graph: Optional[k2.Fsa] = None,
     ngram_lm: Optional[NgramLm] = None,
     ngram_lm_scale: float = 1.0,
@@ -581,11 +582,15 @@ def decode_one_batch(
         #print(f"{len(list(filter(lambda x:x != 0, hyp_tokens[0])))=}")
         #print(f"{hyp_tokens[0]=}")
         # real hyp_tokens
+        hyps = [[token_table[t] for t in tokens] for tokens in hyp_tokens]
+        """
         hyp_tokens = decoding_result.hyps
         for hyp in sp.decode(hyp_tokens):
             hyps.append(hyp.split())
+        """
         #print(f"{len(hyp_tokens[0])=}")
         #print(f"{hyp_tokens[0]=}")
+        #print(f"{hyp_tokens[-1]=}")
         #print(f"{a==hyp_tokens[0]}")
 
     elif params.decoding_method == "modified_beam_search_for_kd_nbest":
@@ -633,10 +638,11 @@ def decode_one_batch(
         hyp_tokens = list()
         for i in tmp_hyps:
             hyp_tokens.append(i[0]) # 1-best only
+        print(f"{hyp_tokens[0]=}")
         #hyp_tokens = tmp_hyps
-        for hyp in sp.decode(hyp_tokens):
+        #for hyp in sp.decode(hyp_tokens):
 
-            hyps.append(hyp.split())
+        #    hyps.append(hyp.split())
         #print(f"{len(hyp_tokens[0])=}")
         #print(f"{hyp_tokens[0]=}")
         #print(f"{a==hyp_tokens[0]}")
@@ -723,8 +729,7 @@ def decode_dataset(
     dl: torch.utils.data.DataLoader,
     params: AttributeDict,
     model: nn.Module,
-    sp: spm.SentencePieceProcessor,
-    word_table: Optional[k2.SymbolTable] = None,
+    token_table: Optional[k2.Fsa] = None,
     decoding_graph: Optional[k2.Fsa] = None,
     ngram_lm: Optional[NgramLm] = None,
     ngram_lm_scale: float = 1.0,
@@ -779,10 +784,9 @@ def decode_dataset(
         hyps_dict = decode_one_batch(
             params=params,
             model=model,
-            sp=sp,
-            decoding_graph=decoding_graph,
-            word_table=word_table,
             batch=batch,
+            token_table=token_table,
+            decoding_graph=decoding_graph,
             ngram_lm=ngram_lm,
             ngram_lm_scale=ngram_lm_scale,
             LM=LM,
@@ -803,9 +807,6 @@ def decode_dataset(
             batch_str = f"{batch_idx}/{num_batches}"
 
             logging.info(f"batch {batch_str}, cuts processed until now is {num_cuts}")
-        #break
-        #import sys
-        #sys.exit(0)
     return results
 
 
@@ -860,7 +861,7 @@ def save_results(
 @torch.no_grad()
 def main():
     parser = get_parser()
-    LibriSpeechAsrDataModule.add_arguments(parser)
+    AsrDataModule.add_arguments(parser)
     LmScorer.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
@@ -929,13 +930,17 @@ def main():
 
     logging.info(f"Device: {device}")
 
-    sp = spm.SentencePieceProcessor()
-    sp.load(params.bpe_model)
+    lexicon = Lexicon(params.lang_dir)
+    params.blank_id = 0
+    params.vocab_size = max(lexicon.tokens) + 1
+
+    #sp = spm.SentencePieceProcessor()
+    #sp.load(params.bpe_model)
 
     # <blk> and <unk> are defined in local/train_bpe_model.py
-    params.blank_id = sp.piece_to_id("<blk>")
-    params.unk_id = sp.piece_to_id("<unk>")
-    params.vocab_size = sp.get_piece_size()
+    #params.blank_id = sp.piece_to_id("<blk>")
+    #params.unk_id = sp.piece_to_id("<unk>")
+    #params.vocab_size = sp.get_piece_size()
 
     logging.info(params)
 
@@ -1077,33 +1082,16 @@ def main():
 
     # we need cut ids to display recognition results.
     args.return_cuts = True
-    librispeech = LibriSpeechAsrDataModule(args)
+    asr_datmodule = AsrDataModule(args)
+    aishell = AIShell(manifest_dir=args.manifest_dir)
+    train_cuts = aishell.train_cuts()
+    train_dl = asr_datmodule.test_dataloaders(train_cuts)
 
-    train_clean_100_cuts = librispeech.train_clean_100_cuts()
-    train_small_cuts = librispeech.train_small_cuts()
-    test_clean_cuts = librispeech.test_clean_cuts()
-    #test_other_cuts = librispeech.test_other_cuts()
-
-    train_clean_100_dl = librispeech.test_dataloaders(train_clean_100_cuts)
-    #train_clean_100_dl = librispeech.train_dataloaders(train_clean_100_cuts)
-    train_small_dl = librispeech.test_dataloaders(train_small_cuts)
-    #train_small_dl = librispeech.train_dataloaders(train_small_cuts)
-    test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
-    #test_other_dl = librispeech.test_dataloaders(test_other_cuts)
-
-    #test_sets = ["test-clean", "test-other"]
-    #test_dl = [test_clean_dl, test_other_dl]
-    #test_sets = ["train-small"]
-    #test_sets = ["train-clean-100"]
-    #test_dl = [train_clean_100_dl]
-
-    #test_sets = ["test-clean"]
-    #test_dl = [test_clean_dl]
     epoch = 1
     for e in range(1, epoch + 1):
         cache = dict()
-        test_sets = ["train-clean-100"]
-        test_dl = [train_clean_100_dl]
+        test_sets = ["train"]
+        test_dl = [train_dl]
         #test_sets = ["train-small"]
         #test_dl = [train_small_dl]
         #test_sets = ["test-clean"]
@@ -1114,8 +1102,7 @@ def main():
                 dl=test_dl,
                 params=params,
                 model=model,
-                sp=sp,
-                word_table=word_table,
+                token_table=lexicon.token_table,
                 decoding_graph=decoding_graph,
                 ngram_lm=ngram_lm,
                 ngram_lm_scale=ngram_lm_scale,
