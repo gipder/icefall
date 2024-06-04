@@ -58,9 +58,11 @@ import sentencepiece as spm
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
-from asr_datamodule import LibriSpeechAsrDataModule
+from aishell import AIShell
+from asr_datamodule import AsrDataModule
 from decoder import Decoder
 from joiner import Joiner
+from lhotse import load_manifest
 from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
@@ -73,6 +75,7 @@ from torch.utils.tensorboard import SummaryWriter
 from zipformer import Zipformer
 
 from icefall import diagnostics
+from icefall.char_graph_compiler import CharCtcTrainingGraphCompiler
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
 from icefall.checkpoint import save_checkpoint as save_checkpoint_impl
 from icefall.checkpoint import (
@@ -81,6 +84,7 @@ from icefall.checkpoint import (
 )
 from icefall.dist import cleanup_dist, setup_dist
 from icefall.env import get_env_info
+from icefall.lexicon import Lexicon
 from icefall.hooks import register_inf_check_hooks
 from icefall.utils import (
     AttributeDict,
@@ -89,6 +93,9 @@ from icefall.utils import (
     setup_logger,
     str2bool,
 )
+
+import math
+import os
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -111,7 +118,6 @@ def load_teacher_checkpoint(model: Union[nn.Module, DDP], filename: str, strict:
         model.load_state_dict(dst_state_dict, strict=strict)
     else:
         model.load_state_dict(checkpoint["model"], strict=strict)
-
 
 def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
     if isinstance(model, DDP):
@@ -261,12 +267,23 @@ def get_parser():
         files, e.g., checkpoints, log, etc, are saved
         """,
     )
-
+    """
     parser.add_argument(
         "--bpe-model",
         type=str,
         default="data/lang_bpe_500/bpe.model",
         help="Path to the BPE model",
+    )
+    """
+
+    parser.add_argument(
+        "--lang-dir",
+        type=str,
+        default="data/lang_char",
+        help="""The lang dir
+        It contains language related input files such as
+        "lexicon.txt"
+        """,
     )
 
     parser.add_argument(
@@ -395,24 +412,24 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--use-pkd",
+        "--use-kd",
         type=str2bool,
         default=False,
-        help="Whether to use knowledge distillation.",
+        help="Whether to use Knowledge Distillation (KD) training.",
     )
 
     parser.add_argument(
-        "--pkd-loss-scale",
+        "--kd-loss-scale",
         type=float,
         default=0.5,
-        help="The scalefor pruned knowledge distillation loss.",
+        help="The scale to smooth the loss with KD part.",
     )
 
     parser.add_argument(
         "--teacher-checkpoint",
         type=str,
         default="",
-        help="The checkpoint of teacher model for knowledge distillation.",
+        help="The checkpoint of the teacher model for KD training.",
     )
 
     parser.add_argument(
@@ -486,38 +503,10 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--pkd-range",
-        type=int,
-        default=1,
-        help="The prune range for pkd loss when using teacher ctc alignment.",
-    )
-
-    parser.add_argument(
-        "--use-time-compression",
-        type=str2bool,
-        default=False,
-        help="Whether to use time compression",
-    )
-
-    parser.add_argument(
-        "--time-compression-threshold",
-        type=float,
-        default=0.95,
-        help="The threshold when using time compression",
-    )
-
-    parser.add_argument(
         "--use-teacher-simple-proj",
         type=str2bool,
         default=False,
         help="Whether to update simple projection layers of teacher model",
-    )
-
-    parser.add_argument(
-        "--use-alphas",
-        type=str2bool,
-        default=False,
-        help="Whether to use alphas in knowledge distillatioin",
     )
 
     parser.add_argument(
@@ -528,10 +517,66 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--use-beam-search-alignment",
+        type=str2bool,
+        default=False,
+        help="Whether to use beam search alignment when doing knowledge distillation",
+    )
+
+    parser.add_argument(
         "--teacher-n-best",
         type=int,
         default=1,
         help="How many hyphotheses do you take when doing knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--dump-hyp",
+        type=str,
+        default=None,
+        help="Dump file location to save hypotheses from teacher model",
+    )
+
+    parser.add_argument(
+        "--use-1best",
+        type=str2bool,
+        default=False,
+        help="Whether to use 1best when doing knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--use-nbest",
+        type=str2bool,
+        default=False,
+        help="Whether to use n-1best(4-best) when doing knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--use-sequence",
+        type=str2bool,
+        default=False,
+        help="Whether to use sequence-level learning when doing knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--use-sq-sampling",
+        type=str2bool,
+        default=False,
+        help="Whether to use sequence-level sampling in knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--sq-sampling-num",
+        type=int,
+        default=1,
+        help="Determine how many samples to take in sequence-level sampling",
+    )
+
+    parser.add_argument(
+        "--sq-sampling-scale",
+        type=float,
+        default=1.0,
+        help="ratio between sampling loss and kd_loss, default is 1",
     )
 
     add_model_arguments(parser)
@@ -788,7 +833,7 @@ def save_checkpoint(
 def compute_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    sp: spm.SentencePieceProcessor,
+    graph_compiler: CharCtcTrainingGraphCompiler,
     batch: dict,
     is_training: bool,
     teacher_model: Optional[Union[nn.Module, DDP]] = None,
@@ -836,75 +881,97 @@ def compute_loss(
     warm_step = params.warm_step
 
     texts = batch["supervisions"]["text"]
-    y = sp.encode(texts, out_type=int)
+    y = graph_compiler.texts_to_ids(texts)
     y = k2.RaggedTensor(y).to(device)
 
     if isinstance(teacher_model, DDP):
         teacher_model = teacher_model.module
 
-    teacher_ranges = None
     teacher_logits = None
-    teacher_compressed_ranges = None
-    teacher_compressed_logits = None
-    teacher_compressed_masks = None
-    teacher_alphas = None
+    pseudo_y = None
+    beam_search_alignment = None
+    pseudo_y_sequence = None
 
     if teacher_model is None:
-        use_pkd = False
+        use_kd = False
         use_teacher_simple_proj = False
-        use_alphas = False
         use_beam_search = False
+        use_sq_sampling = False
+        sq_sampling_num = 0
     else:
-        use_pkd = params.use_pkd
+        use_kd = params.use_kd
         use_teacher_simple_proj = params.use_teacher_simple_proj
-        use_alphas = params.use_alphas
         use_beam_search = params.use_beam_search
+        use_sq_sampling = params.use_sq_sampling
+        sq_sampling_num = params.sq_sampling_num
 
-    beam_search_alignment = None
     if use_beam_search:
         from beam_search import (
             modified_beam_search,
             modified_beam_search_for_kd,
             Hypothesis,
-            HypothesisList
+            HypothesisList,
         )
         from icefall.utils import add_sos
 
-        # getting beam search results and making pseudo labels
-        # beam search
-        # There is a problem with how to get the logits of the teacher model.
-        # option 1. from modified_beam_search
-        #
-        # option 2. from usual training process
-        #print(f"{batch=}")
         ids = list()
-        #print(f"{batch['supervisions']['cut'][0].id=}")
         for i in range(len(batch["supervisions"]['cut'])):
             ids.append(batch["supervisions"]['cut'][i].id)
+        #print(f"{ids=}")
 
+        import math
         with torch.no_grad():
-            # check cache memory
             all_in_cache = True
             if hyp_cache is not None:
-               for i in range(len(ids)):
-                   if hyp_cache.get(ids[i]) is None:
-                       all_in_cache = False
-                       break
-
-            # if hyps exist in cache, use them or do beam search
+                for i in range(len(ids)):
+                    if hyp_cache.get(ids[i]) is None:
+                        all_in_cache = False
+                        break
             if all_in_cache is False:
-                print("do beam search")
-                hyp_tokens = modified_beam_search_for_kd(
+                decoding_result = modified_beam_search_for_kd(
                     model=teacher_model,
                     x=feature,
                     x_lens=feature_lens,
-                    beam=params.teacher_n_best,
+                    beam=4,
                 )
+
+                # adding
+                # the equation is heuristically determined
+                hyp_alignment = torch.zeros(feature_lens.size()[0], math.ceil((feature_lens[0]-8)/4), dtype=torch.int)
+                for i in range(feature_lens.size()[0]):
+                    for j in range(len(decoding_result.hyps[i])):
+                        hyp_alignment[i, decoding_result.timestamps[i][j]] = decoding_result.hyps[i][j]
+
+                hyp_tokens = hyp_alignment.tolist()
                 # add the hyp_tokens to cache
                 for i in range(len(hyp_tokens)):
                     hyp_cache[ids[i]] = hyp_tokens[i]
+
             else:
-                print("use hyps in cache")
+                #print("Cache hit!")
+                #print(f"{hyp_cache[ids[i]]=}")
+                assert not (params.use_1best and params.use_nbest)
+
+                # check whether the length of hyp and the length of batch are the same
+                #print(f"{feature_lens.size()[0]=}")
+                for i in range(feature_lens.size()[0]):
+                    # feature lens to encoder lens
+                    encoder_len = math.ceil((feature_lens[i]-8)/4)
+                    hyp_len = len(hyp_cache[ids[i]])
+                    if hyp_len != encoder_len:
+                        tmp_hyp = hyp_cache[ids[i]]
+                        # case 1. hyp_cache[ids[i]] is shorter than encoder_lens
+                        if hyp_len < encoder_len:
+                            #print(f"{hyp_cache[ids[i]]}")
+                            #print(f"{hyp_len=} is shorter than {encoder_len=}")
+                            hyp_cache[ids[i]] = tmp_hyp.extend([0]*(encoder_len-hyp_len))
+                        # case 2. hyp_cache[ids[i]] is longer than encoder_lens
+                        if hyp_len > encoder_len:
+                            #print(f"{hyp_cache[ids[i]]}")
+                            #print(f"{hyp_len=} is longer than {encoder_len=}")
+                            hyp_cache[ids[i]] = tmp_hyp[:encoder_len]
+
+                # loading hyp_tokens from cache
                 hyp_tokens = list()
                 for i in range(len(ids)):
                     hyp_tokens.append(hyp_cache[ids[i]])
@@ -912,224 +979,144 @@ def compute_loss(
             # make pseudo labels
             pseudo_labels = list()
             for i in range(len(hyp_tokens)):
-                tmp_pseudo_label = ()
-                for j in hyp_tokens[i]:
-                    tmp_pseudo_label = [ t for t in j if t != 0 ]
+                tmp_pseudo_label = [ t for t in hyp_tokens[i] if t != 0 ]
+                #for j in hyp_tokens[i]:
+                #    tmp_pseudo_label = [ t for t in j if t != 0 ]
                 pseudo_labels.append(tmp_pseudo_label)
 
+            # don't need
             # remove duplicated labels with maintaing order
-            non_duplicated_pseudo_labels = list()
-            for i in range(len(pseudo_labels)):
-                non_duplicated_pseudo_label = list()
-                if pseudo_labels[i] != []:
-                    non_duplicated_pseudo_label.append(pseudo_labels[i][0])
-                    for j in range(1, len(pseudo_labels[i])):
-                        if pseudo_labels[i][j] != pseudo_labels[i][j-1]:
-                            non_duplicated_pseudo_label.append(pseudo_labels[i][j])
-                else:
-                    print(f"{i=}" + "th pseudo label is empty")
-                    print(f"inserting the original label {y[i].tolist()}")
-                    print(f"{len(y[i].tolist())}")
-                    #import pickld
-                    #dump_file = "batch_dump.pkl"
-                    #with open(dump_file, "wb") as f:
-                    #    pickle.dump(batch, f)
-                    non_duplicated_pseudo_label = y[i].tolist()
-                    # make a new alignment with the original label
-                    # 424 / 72 = 5.88
-                    # period = 5
-                    import math
-                    x_len = math.ceil((feature_lens[i] - 8) / 4)
-                    new_alignment = list([ 0 for i in range(x_len) ])
-                    period = x_len // len(non_duplicated_pseudo_label)
-                    for j in range(len(non_duplicated_pseudo_label)):
-                        new_alignment[period//2 + j*period] = non_duplicated_pseudo_label[j]
-                    #print(f"{feature_lens=}")
-                    #print(f"{new_alignment=}")
-                    #print(f"{len(new_alignment)=}")
-                    hyp_tokens[i] = [ new_alignment ]
-
-                non_duplicated_pseudo_labels.append(non_duplicated_pseudo_label)
-
             # convert list(list()) to k2.RaggedTensor
-            #print(f"{non_duplicated_pseudo_labels=}")
-            pseudo_y = k2.RaggedTensor(non_duplicated_pseudo_labels).to(device)
-            y = pseudo_y.clone()
-            #print(f"{y=}")
-            row_splits = y.shape.row_splits(1)
-            y_lens = row_splits[1:] - row_splits[:-1]
-            blank_id = params.blank_id
-            sos_id = add_sos(y, sos_id=blank_id)
+            pseudo_y = k2.RaggedTensor(pseudo_labels).to(device)
 
-            # change hyp_tokens to alignment for icefall
-            # for example (vocab_size=10)
-            # labels: [ 2, 4, 5, 9 ]
-            # hyp_tokens =        [[ 0, 0, 2, 4, 0, 5, 0, 0, 9, 0 ]]
-            # icefall_alignment = [[ 0, 0, 1, 2, 2, 3, 3, 3, 4, 4 ]]
-            # currently I assume that hypothesis is 1-best result
+            # I didn't copy the pseudo_y to y
+            y = pseudo_y.clone()
 
             # first, check if the first token is blank
             for i in range(len(hyp_tokens)):
-                if hyp_tokens[i][0][0] != 0:
-                    hyp_tokens[i][0][1:] = hyp_tokens[i][0][:-1] # shift to right
-                    hyp_tokens[i][0][0] = 0
+                if hyp_tokens[i][0] != 0:
+                    hyp_tokens[i][1:] = hyp_tokens[i][:-1] # shift to right
+                    hyp_tokens[i][0] = 0
             # get max length of hyp_tokens
             max_len = 0
             for i in range(len(hyp_tokens)):
-                if max_len < len(hyp_tokens[i][0]):
-                    max_len = len(hyp_tokens[i][0])
+                if max_len < len(hyp_tokens[i]):
+                    max_len = len(hyp_tokens[i])
             alignment = torch.zeros((len(hyp_tokens), max_len), dtype=torch.int32)
+
+            # get pseudo_y_sequence
+            pseudo_y_sequence = alignment.clone().to(device)
+            for i in range(len(hyp_tokens)):
+                pseudo_y_sequence[i, :len(hyp_tokens[i])] = torch.tensor(hyp_tokens[i], dtype=torch.int32)
+
             # remove duplicated labels in hyp_tokens
             # and convert the sequence to monotonic increasing sequence
             for i in range(len(hyp_tokens)):
-                prev = hyp_tokens[i][0][0]
-                for j in range(1, len(hyp_tokens[i][0])):
-                    if hyp_tokens[i][0][j] != 0:
-                        if prev != hyp_tokens[i][0][j]:
-                            prev = hyp_tokens[i][0][j]
-                        else:
-                            hyp_tokens[i][0][j] = 0
-
-                mask = (torch.tensor(hyp_tokens[i][0], dtype=torch.bool) != 0)
-                alignment[i, :len(hyp_tokens[i][0])] = torch.cumsum(mask.int(), dim=-1, dtype=torch.int32)
+                mask = (torch.tensor(hyp_tokens[i], dtype=torch.bool) != 0)
+                alignment[i, :len(hyp_tokens[i])] = torch.cumsum(mask.int(), dim=-1, dtype=torch.int32)
 
             beam_search_alignment = alignment.to(device)
-            #for i in range(len(hyp_tokens)):
-            #    print(f"{i}: {len(hyp_tokens[i][0])=}")
-            #print(f"{hyp_tokens[ii]=}")
-            #print(f"{len(hyp_tokens[ii][0])=}")
-            #print(f"{beam_search_alignment[ii]=}")
 
-    if use_pkd:
+    # initialize teacher sampling y and logits
+    sampling_y = None
+    teacher_sampling_logits = None
+
+    if use_kd:
         with torch.no_grad():
-            #print(f"{y=}")
-            #print(f"{use_beam_search=}")
-            #print(f"{beam_search_alignment=}")
-            ret = teacher_model.get_ranges_and_logits(
+            teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
                 x=feature,
                 x_lens=feature_lens,
                 y=y,
-                prune_range=params.prune_range,
-                am_scale=params.am_scale,
-                lm_scale=params.lm_scale,
-                use_teacher_ctc_alignment=params.use_teacher_ctc_alignment,
-                use_efficient=params.use_efficient,
-                use_time_compression=params.use_time_compression,
-                compression_threshold=params.time_compression_threshold,
-                use_beam_search=use_beam_search,
-                beam_search_alignment=beam_search_alignment,
+                use_grad=False,
             )
 
-        teacher_ranges = ret[0]
-        teacher_logits = ret[1]
-        if params.use_time_compression:
-            teacher_compressed_ranges = ret[-3]
-            teacher_compressed_logits = ret[-2]
-            teacher_compressed_masks = ret[-1]
-
-            ret = teacher_model.get_ranges_and_logits(
-                x=feature,
-                x_lens=feature_lens,
+            ret = teacher_model.get_logits_with_encoder_out(
+                encoder_out=teacher_encoder_out,
+                encoder_out_lens=teacher_encoder_out_lens,
                 y=y,
-                prune_range=params.prune_range,
-                am_scale=params.am_scale,
-                lm_scale=params.lm_scale,
-                use_teacher_ctc_alignment=params.use_teacher_ctc_alignment,
-                use_efficient=params.use_efficient,
-                use_time_compression=params.use_time_compression,
-                compression_threshold=params.time_compression_threshold,
+                use_grad=False,
             )
 
-            teacher_ranges = ret[0]
-            teacher_logits = ret[1]
+        teacher_logits = ret
 
+        if use_sq_sampling:
+            teacher_sampling_logits = list()
+            sampling_y = list()
+            for n in range(1, sq_sampling_num+1):
+                yy = list()
+                y_list = y.tolist()
+                # in the case of the number of samples is 1
+                # y_list[(i+1)%len(y_list)] means the next sample in a batch
+                for i in range(len(y_list)):
+                    yy.append(y_list[(i+n)%len(y_list)])
+
+                sampling_y.append(k2.RaggedTensor(yy).to(device))
+                # the yy is the less probable label sequence
+
+                sampling_ret = teacher_model.get_logits_with_encoder_out(
+                    encoder_out=teacher_encoder_out,
+                    encoder_out_lens=teacher_encoder_out_lens,
+                    y=sampling_y[-1],
+                    use_grad=False,
+                )
+
+                teacher_sampling_logits.append(sampling_ret)
+
+        """
         with torch.no_grad():
-            teacher_alphas = teacher_model.get_alphas(
+
+            #if use_beam_search:
+            #    teacher_y = pseudo_y
+            #else:
+            #    teacher_y = y
+
+            ret = teacher_model.get_logits(
                 x=feature,
                 x_lens=feature_lens,
                 y=y,
-                prune_range=params.prune_range,
-                ranges=teacher_ranges,
+                use_grad=False,
             )
+        teacher_logits = ret
+        """
 
-    """
-    if params.use_ctc:
-        use_ctc = True
-    else:
-        use_ctc = False
-    """
     with torch.set_grad_enabled(is_training):
-        simple_loss = torch.tensor(0.0, device=device)
-        pruned_loss = torch.tensor(0.0, device=device)
-        pkd_loss = torch.tensor(0.0, device=device)
-        ctc_loss = torch.tensor(0.0, device=device)
-        teacher_simple_loss = torch.tensor(0.0, device=device)
-        alphas_loss = torch.tensor(0.0, device=device)
-        """
-        # It doesn't need
-        if use_pkd:
-            ret = (simple_loss, pruned_loss, pkd_loss)
-        else:
-            ret = (simple_loss, pruned_loss)
+        org_loss = torch.tensor(0.0, device=device)
+        kd_loss = torch.tensor(0.0, device=device)
+        sampling_loss = torch.tensor(0.0, device=device)
 
-        """
         ret = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
-            prune_range=params.prune_range,
-            am_scale=params.am_scale,
-            lm_scale=params.lm_scale,
-            use_pkd=use_pkd,
-            teacher_ranges=teacher_ranges,
+            use_kd=use_kd,
             teacher_logits=teacher_logits,
             use_ctc=params.use_ctc,
-            use_teacher_simple_proj=params.use_teacher_simple_proj,
             teacher_model=teacher_model,
-            use_time_compression=params.use_time_compression,
-            teacher_compressed_ranges=teacher_compressed_ranges,
-            teacher_compressed_logits=teacher_compressed_logits,
-            teacher_compressed_masks=teacher_compressed_masks,
-            use_alphas=use_alphas,
-            teacher_alphas=teacher_alphas,
-        )
-        s = params.simple_loss_scale
-        # take down the scale on the simple loss from 1.0 at the start
-        # to params.simple_loss scale by warm_step.
-        simple_loss_scale = (
-            s
-            if batch_idx_train >= warm_step
-            else 1.0 - (batch_idx_train / warm_step) * (1.0 - s)
-        )
-        pruned_loss_scale = (
-            1.0
-            if batch_idx_train >= warm_step
-            else 0.1 + 0.9 * (batch_idx_train / warm_step)
+            use_efficient=params.use_efficient,
+            use_1best=params.use_1best,
+            pseudo_y_alignment=beam_search_alignment,
+            use_sequence=params.use_sequence,
+            pseudo_y_sequence=pseudo_y_sequence,
+            use_sq_sampling=use_sq_sampling,
+            sampling_y=sampling_y,
+            teacher_sampling_logits=teacher_sampling_logits,
+            sq_sampling_num=sq_sampling_num,
         )
 
-        pkd_loss_scale = params.pkd_loss_scale
-        ctc_loss_scale = params.pkd_loss_scale
-        teacher_simple_loss_scale = params.pkd_loss_scale
-        alphas_loss_scale = params.pkd_loss_scale
+    kd_loss_scale = params.kd_loss_scale
+    sampling_loss_scale = params.kd_loss_scale * params.sq_sampling_scale
+    org_loss = ret["org_loss"]
+    if use_kd:
+        kd_loss = ret["kd_loss"]
+    if use_sq_sampling:
+        sampling_loss = ret["sampling_loss"]
 
-        simple_loss = ret["simple_loss"]
-        pruned_loss = ret["pruned_loss"]
-        if use_pkd:
-            pkd_loss = ret["pkd_loss"]
-            if use_teacher_simple_proj:
-                teacher_simple_loss = ret["teacher_simple_loss"]
-        if params.use_ctc:
-            ctc_loss = ret["ctc_loss"]
-        if use_alphas:
-            alphas_loss = ret["alphas_loss"]
+    loss = org_loss + kd_loss_scale * kd_loss + \
+        sampling_loss_scale * sampling_loss
 
-        loss = simple_loss_scale * simple_loss + \
-            pruned_loss_scale * pruned_loss + \
-            pkd_loss_scale * pkd_loss + \
-            ctc_loss_scale * ctc_loss + \
-            teacher_simple_loss_scale * teacher_simple_loss + \
-            alphas_loss_scale * alphas_loss
-
+    assert org_loss.requires_grad == is_training
+    if use_kd:
+        assert kd_loss.requires_grad == is_training
     assert loss.requires_grad == is_training
 
     info = MetricsTracker()
@@ -1139,23 +1126,19 @@ def compute_loss(
 
     # Note: We use reduction=sum while computing the loss.
     info["loss"] = loss.detach().cpu().item()
-    info["simple_loss"] = simple_loss.detach().cpu().item()
-    info["pruned_loss"] = pruned_loss.detach().cpu().item()
-    if params.use_pkd:
-        info["pkd_loss"] = pkd_loss.detach().cpu().item()
-        if params.use_teacher_simple_proj:
-            info["teacher_simple_loss"] = teacher_simple_loss.detach().cpu().item()
-    if params.use_ctc:
-        info["ctc_loss"] = ctc_loss.detach().cpu().item()
-    if params.use_alphas:
-        info["alphas_loss"] = alphas_loss.detach().cpu().item()
+    info["org_loss"] = ret["org_loss"].detach().cpu().item()
+    if params.use_kd:
+        info["kd_loss"] = ret["kd_loss"].detach().cpu().item()
+    if params.use_sq_sampling:
+        info["sampling_loss"] = ret["sampling_loss"].detach().cpu().item()
+
     return loss, info
 
 
 def compute_validation_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    sp: spm.SentencePieceProcessor,
+    graph_compiler: CharCtcTrainingGraphCompiler,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
 ) -> MetricsTracker:
@@ -1168,7 +1151,7 @@ def compute_validation_loss(
         loss, loss_info = compute_loss(
             params=params,
             model=model,
-            sp=sp,
+            graph_compiler=graph_compiler,
             batch=batch,
             is_training=False,
         )
@@ -1191,7 +1174,7 @@ def train_one_epoch(
     model: Union[nn.Module, DDP],
     optimizer: torch.optim.Optimizer,
     scheduler: LRSchedulerType,
-    sp: spm.SentencePieceProcessor,
+    graph_compiler: CharCtcTrainingGraphCompiler,
     train_dl: torch.utils.data.DataLoader,
     valid_dl: torch.utils.data.DataLoader,
     scaler: GradScaler,
@@ -1249,18 +1232,15 @@ def train_one_epoch(
 
         try:
             with torch.cuda.amp.autocast(enabled=params.use_fp16):
-                for i in range(2):
-                    loss, loss_info = compute_loss(
-                        params=params,
-                        model=model,
-                        sp=sp,
-                        batch=batch,
-                        is_training=True,
-                        teacher_model=teacher_model,
-                        hyp_cache=hyp_cache,
-                    )
-                import sys
-                sys.exit(0)
+                loss, loss_info = compute_loss(
+                    params=params,
+                    model=model,
+                    graph_compiler=graph_compiler,
+                    batch=batch,
+                    is_training=True,
+                    teacher_model=teacher_model,
+                    hyp_cache=hyp_cache,
+                )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
@@ -1274,7 +1254,7 @@ def train_one_epoch(
             scaler.update()
             optimizer.zero_grad()
         except:  # noqa
-            display_and_save_batch(batch, params=params, sp=sp)
+            display_and_save_batch(batch, params=params, graph_compiler=graph_compiler)
             raise
 
         if params.print_diagnostics and batch_idx == 5:
@@ -1362,7 +1342,7 @@ def train_one_epoch(
             valid_info = compute_validation_loss(
                 params=params,
                 model=model,
-                sp=sp,
+                graph_compiler=graph_compiler,
                 valid_dl=valid_dl,
                 world_size=world_size,
             )
@@ -1397,8 +1377,6 @@ def run(rank, world_size, args):
     """
     params = get_params()
     params.update(vars(args))
-    if params.full_libri is False:
-        params.valid_interval = 1600
 
     fix_random_seed(params.seed)
     if world_size > 1:
@@ -1417,12 +1395,16 @@ def run(rank, world_size, args):
         device = torch.device("cuda", rank)
     logging.info(f"Device: {device}")
 
-    sp = spm.SentencePieceProcessor()
-    sp.load(params.bpe_model)
+    lexicon = Lexicon(params.lang_dir)
+    graph_compiler = CharCtcTrainingGraphCompiler(
+        lexicon=lexicon,
+        device=device,
+        oov="<unk>",
+    )
 
     # <blk> is defined in local/train_bpe_model.py
-    params.blank_id = sp.piece_to_id("<blk>")
-    params.vocab_size = sp.get_piece_size()
+    params.blank_id = 0
+    params.vocab_size = max(lexicon.tokens) + 1
 
     logging.info(params)
 
@@ -1434,7 +1416,7 @@ def run(rank, world_size, args):
 
     # load the model from checkpoint if available
     teacher_model = None
-    if params.use_pkd or params.use_alphas:
+    if params.use_kd:
         teacher_params = copy.deepcopy(params)
         teacher_params.num_encoder_layers = params.teacher_num_encoder_layers
         teacher_params.feedforward_dims = params.teacher_feedforward_dims
@@ -1478,8 +1460,6 @@ def run(rank, world_size, args):
     if world_size > 1:
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-        if params.use_pkd:
-            teacher_model = DDP(teacher_model, device_ids=[rank])
 
     parameters_names = []
     parameters_names.append(
@@ -1515,12 +1495,9 @@ def run(rank, world_size, args):
     if params.inf_check:
         register_inf_check_hooks(model)
 
-    librispeech = LibriSpeechAsrDataModule(args)
+    aishell = AIShell(manifest_dir=args.manifest_dir)
 
-    if params.full_libri:
-        train_cuts = librispeech.train_all_shuf_cuts()
-    else:
-        train_cuts = librispeech.train_clean_100_cuts()
+    train_cuts = aishell.train_cuts()
 
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 20 seconds
@@ -1543,19 +1520,19 @@ def run(rank, world_size, args):
 
         # In ./zipformer.py, the conv module uses the following expression
         # for subsampling
-        T = ((c.num_frames - 7) // 2 + 1) // 2
-        tokens = sp.encode(c.supervisions[0].text, out_type=str)
+        # T = ((c.num_frames - 7) // 2 + 1) // 2
+        # tokens = sp.encode(c.supervisions[0].text, out_type=str)
 
-        if T < len(tokens):
-            logging.warning(
-                f"Exclude cut with ID {c.id} from training. "
-                f"Number of frames (before subsampling): {c.num_frames}. "
-                f"Number of frames (after subsampling): {T}. "
-                f"Text: {c.supervisions[0].text}. "
-                f"Tokens: {tokens}. "
-                f"Number of tokens: {len(tokens)}"
-            )
-            return False
+        # if T < len(tokens):
+        #    logging.warning(
+        #        f"Exclude cut with ID {c.id} from training. "
+        #        f"Number of frames (before subsampling): {c.num_frames}. "
+        #        f"Number of frames (after subsampling): {T}. "
+        #        f"Text: {c.supervisions[0].text}. "
+        #        f"Tokens: {tokens}. "
+        #        f"Number of tokens: {len(tokens)}"
+        #    )
+        #    return False
 
         return True
 
@@ -1568,20 +1545,27 @@ def run(rank, world_size, args):
     else:
         sampler_state_dict = None
 
-    train_dl = librispeech.train_dataloaders(
-        train_cuts, sampler_state_dict=sampler_state_dict
+    if args.enable_musan:
+        cuts_musan = load_manifest(Path(args.manifest_dir) / "musan_cuts.jsonl.gz")
+    else:
+        cuts_musan = None
+
+    asr_datamodule = AsrDataModule(args)
+    train_dl = asr_datamodule.train_dataloaders(
+        train_cuts,
+        on_the_fly_feats=False,
+        cuts_musan=cuts_musan,
     )
 
-    valid_cuts = librispeech.dev_clean_cuts()
-    valid_cuts += librispeech.dev_other_cuts()
-    valid_dl = librispeech.valid_dataloaders(valid_cuts)
+    valid_cuts = aishell.valid_cuts()
+    valid_dl = asr_datamodule.valid_dataloaders(valid_cuts)
 
     if not params.print_diagnostics:
         scan_pessimistic_batches_for_oom(
             model=model,
             train_dl=train_dl,
             optimizer=optimizer,
-            sp=sp,
+            graph_compiler=graph_compiler,
             params=params,
         )
 
@@ -1590,7 +1574,20 @@ def run(rank, world_size, args):
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 
-    hyp_cache = dict()
+    # loading dump hypotheses
+    if params.dump_hyp is None or params.dump_hyp == "":
+        hyp_cache = dict()
+        logging.info("No dump hypotheses provided")
+    else:
+        import pickle
+
+        if os.path.exists(params.dump_hyp):
+            hyp_cache = pickle.load(open(params.dump_hyp, "rb"))
+            logging.info(f"Loaded {len(hyp_cache)} hypotheses from {params.dump_hyp}")
+        else:
+            hyp_cache = dict()
+            logging.info(f"File {params.dump_hyp} does not exist")
+
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)
         fix_random_seed(params.seed + epoch - 1)
@@ -1607,7 +1604,7 @@ def run(rank, world_size, args):
             model_avg=model_avg,
             optimizer=optimizer,
             scheduler=scheduler,
-            sp=sp,
+            graph_compiler=graph_compiler,
             train_dl=train_dl,
             valid_dl=valid_dl,
             scaler=scaler,
@@ -1643,7 +1640,7 @@ def run(rank, world_size, args):
 def display_and_save_batch(
     batch: dict,
     params: AttributeDict,
-    sp: spm.SentencePieceProcessor,
+    graph_compiler: CharCtcTrainingGraphCompiler,
 ) -> None:
     """Display the batch statistics and save the batch into disk.
 
@@ -1667,7 +1664,7 @@ def display_and_save_batch(
 
     logging.info(f"features shape: {features.shape}")
 
-    y = sp.encode(supervisions["text"], out_type=int)
+    y = graph_compiler.texts_to_ids(supervisions["text"])
     num_tokens = sum(len(i) for i in y)
     logging.info(f"num tokens: {num_tokens}")
 
@@ -1676,7 +1673,7 @@ def scan_pessimistic_batches_for_oom(
     model: Union[nn.Module, DDP],
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
-    sp: spm.SentencePieceProcessor,
+    graph_compiler: CharCtcTrainingGraphCompiler,
     params: AttributeDict,
 ):
     from lhotse.dataset import find_pessimistic_batches
@@ -1692,7 +1689,7 @@ def scan_pessimistic_batches_for_oom(
                 loss, _ = compute_loss(
                     params=params,
                     model=model,
-                    sp=sp,
+                    graph_compiler=graph_compiler,
                     batch=batch,
                     is_training=True,
                 )
@@ -1707,7 +1704,7 @@ def scan_pessimistic_batches_for_oom(
                     f"Failing criterion: {criterion} "
                     f"(={crit_values[criterion]}) ..."
                 )
-            display_and_save_batch(batch, params=params, sp=sp)
+            display_and_save_batch(batch, params=params, graph_compiler=graph_compiler)
             raise
         logging.info(
             f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
@@ -1716,7 +1713,7 @@ def scan_pessimistic_batches_for_oom(
 
 def main():
     parser = get_parser()
-    LibriSpeechAsrDataModule.add_arguments(parser)
+    AsrDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
 
