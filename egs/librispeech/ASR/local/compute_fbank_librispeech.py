@@ -87,6 +87,7 @@ def compute_fbank_librispeech(
             "train-clean-100",
             "train-clean-360",
             "train-other-500",
+            "train-small",
         )
     else:
         dataset_parts = dataset.split(" ", -1)
