@@ -543,6 +543,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--use-pruned",
+        type=str2bool,
+        default=False,
+        help="Whether to use pruned KD",
+    )
+
+    parser.add_argument(
         "--use-sq-sampling",
         type=str2bool,
         default=False,
@@ -561,6 +568,13 @@ def get_parser():
         type=float,
         default=1.0,
         help="ratio between sampling loss and kd_loss, default is 1",
+    )
+
+    parser.add_argument(
+        "--pruned-range",
+        type=int,
+        default=5,
+        help="The range when using use_pruned, default is 5",
     )
 
     add_model_arguments(parser)
@@ -931,12 +945,13 @@ def compute_loss(
                     hyp_cache[ids[i]] = hyp_tokens[i]
 
             else:
-                print("Cache hit!")
-                print(f"{hyp_cache[ids[i]]=}")
+                #print("Cache hit!")
+                #print(f"{hyp_cache[ids[i]]=}")
                 assert not (params.use_1best and params.use_nbest)
+                assert not (params.use_1best and params.use_pruned)
 
                 # check whether the length of hyp and the length of batch are the same
-                print(f"{feature_lens.size()[0]=}")
+                #print(f"{feature_lens.size()[0]=}")
                 for i in range(feature_lens.size()[0]):
                     # feature lens to encoder lens
                     encoder_len = math.ceil((feature_lens[i]-8)/4)
@@ -1077,6 +1092,7 @@ def compute_loss(
             teacher_model=teacher_model,
             use_efficient=params.use_efficient,
             use_1best=params.use_1best,
+            use_pruned=params.use_pruned,
             pseudo_y_alignment=beam_search_alignment,
             use_sequence=params.use_sequence,
             pseudo_y_sequence=pseudo_y_sequence,
@@ -1084,6 +1100,7 @@ def compute_loss(
             sampling_y=sampling_y,
             teacher_sampling_logits=teacher_sampling_logits,
             sq_sampling_num=sq_sampling_num,
+            pruned_range=params.pruned_range,
         )
 
     kd_loss_scale = params.kd_loss_scale
@@ -1558,8 +1575,14 @@ def run(rank, world_size, args):
         logging.info("No dump hypotheses provided")
     else:
         import pickle
-        hyp_cache = pickle.load(open(params.dump_hyp, "rb"))
-        logging.info(f"Loaded {len(hyp_cache)} hypotheses from {params.dump_hyp}")
+        import os
+        # checking if the file exits
+        if os.path.exists(params.dump_hyp):
+            hyp_cache = pickle.load(open(params.dump_hyp, "rb"))
+            logging.info(f"Loaded {len(hyp_cache)} hypotheses from {params.dump_hyp}")
+        else:
+            hyp_cache = dict()
+            logging.warning(f"{params.dump_hyp} doesn't exit")
 
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)

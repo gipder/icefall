@@ -82,6 +82,7 @@ class Transducer(nn.Module):
         teacher_model: nn.Module = None,
         use_efficient: bool = False,
         use_1best: bool = False,
+        use_pruned: bool = False,
         pseudo_y_alignment: torch.Tensor = None,
         use_sequence: bool = False,
         pseudo_y_sequence: torch.Tensor = None,
@@ -90,6 +91,7 @@ class Transducer(nn.Module):
         teacher_sampling_ranges: Union[list, torch.tensor] = None,
         teacher_sampling_logits: Union[list, torch.tensor] = None,
         sq_sampling_num: int = 1,
+        pruned_range: int = 5,
     ) -> torch.Tensor:
         """
         Args:
@@ -261,6 +263,46 @@ class Transducer(nn.Module):
                 teacher = teacher * mask.float()
                 #print(f"{student[-1,-1,:,:]=}")
                 #print(f"{teacher[-1,-1,:,:]=}")
+
+            if use_pruned:
+                # getting the pruned path
+
+                def create_increasing_sublists_torch(original_tensor, length=3):
+                    # 배치 크기와 원소 수
+                    batch_size, num_elements = original_tensor.shape
+
+                    # 최대값, 최소값
+                    max_val = torch.max(original_tensor, dim=1, keepdim=True)[0]
+                    min_val = torch.min(original_tensor, dim=1, keepdim=True)[0]
+
+                    half_length = (length - 1) // 2
+
+                    # 각 원소에 대해 시작값 계산
+                    starts = original_tensor - half_length
+
+                    # 최소값에 따라 시작값 조정
+                    starts = torch.clamp(starts, min_val, max_val - length + 1)
+
+                    # 각 시작점에 대해 서브리스트 생성 (증가하는 범위)
+                    result_tensor = torch.arange(0, length, device=original_tensor.device)
+                    result_tensor = result_tensor.expand(batch_size, num_elements, -1) + starts.unsqueeze(-1)
+
+                    # 최대값에 따라 클램핑 없이 증가 범위 유지
+                    result_tensor = torch.min(result_tensor, max_val.unsqueeze(-1))
+
+                    return result_tensor
+
+                # memory explosion
+                idx = create_increasing_sublists_torch(pseudo_y_alignment, pruned_range)
+                batch_idx = torch.arange(logits.size(0)).view(-1, 1, 1)
+                batch_idx = batch_idx.expand(-1, idx.size(-2), idx.size(-1))
+                teacher = teacher[batch_idx, torch.arange(logits.size(1)).view(1, -1, 1), idx]
+                student = student[batch_idx, torch.arange(logits.size(1)).view(1, -1, 1), idx]
+                max_len = logits.size(1)
+                mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
+                mask = mask.unsqueeze(-1).unsqueeze(-1)
+                student = student * mask.float()
+                teacher = teacher * mask.float()
 
             if use_sequence:
                 idx = pseudo_y_alignment.unsqueeze(-1).expand(-1, -1, logits.shape[-1]).unsqueeze(2)
