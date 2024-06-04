@@ -103,19 +103,3 @@ class Decoder(nn.Module):
             embedding_out = embedding_out.permute(0, 2, 1)
         embedding_out = F.relu(embedding_out)
         return embedding_out
-
-
-if __name__ == "__main__":
-    x = torch.randint(0, 500, (1, 10, ))
-    decoder = Decoder(
-                vocab_size=500,
-                decoder_dim=512,
-                blank_id=0,
-                context_size=2,
-            )
-
-    out = decoder(x)
-    print(f"{x=}")
-    print(f"{out=}")
-    print(f"{x.shape=}")
-    print(f"{out.shape=}")

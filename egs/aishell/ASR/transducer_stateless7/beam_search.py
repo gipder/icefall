@@ -671,14 +671,16 @@ def greedy_search_batch(
         start = offset
         end = offset + batch_size
         current_encoder_out = encoder_out.data[start:end]
-        current_encoder_out = current_encoder_out.unsqueeze(1).unsqueeze(1)
+        #current_encoder_out = current_encoder_out.unsqueeze(1).unsqueeze(1)
+        current_encoder_out = current_encoder_out.unsqueeze(1)
         # current_encoder_out's shape: (batch_size, 1, 1, encoder_out_dim)
         offset = end
 
         decoder_out = decoder_out[:batch_size]
 
         logits = model.joiner(
-            current_encoder_out, decoder_out.unsqueeze(1), project_input=False
+            #current_encoder_out, decoder_out.unsqueeze(1), project_input=False
+            current_encoder_out, decoder_out, project_input=False
         )
         # logits'shape (batch_size, 1, 1, vocab_size)
 
@@ -846,8 +848,6 @@ class HypothesisList(object):
         else:
             hyps = sorted(hyps, key=lambda h: h[1].log_prob, reverse=True)[:k]
 
-        #print(hyps)
-
         ans = HypothesisList(dict(hyps))
         return ans
 
@@ -890,6 +890,177 @@ def get_hyps_shape(hyps: List[HypothesisList]) -> k2.RaggedShape:
         row_splits=row_splits, cached_tot_size=row_splits[-1].item()
     )
     return ans
+
+
+def modified_beam_search(
+    model: Transducer,
+    encoder_out: torch.Tensor,
+    encoder_out_lens: torch.Tensor,
+    beam: int = 4,
+    temperature: float = 1.0,
+    return_timestamps: bool = False,
+) -> Union[List[List[int]], DecodingResults]:
+    """Beam search in batch mode with --max-sym-per-frame=1 being hardcoded.
+
+    Args:
+      model:
+        The transducer model.
+      encoder_out:
+        Output from the encoder. Its shape is (N, T, C).
+      encoder_out_lens:
+        A 1-D tensor of shape (N,), containing number of valid frames in
+        encoder_out before padding.
+      beam:
+        Number of active paths during the beam search.
+      temperature:
+        Softmax temperature.
+      return_timestamps:
+        Whether to return timestamps.
+    Returns:
+      If return_timestamps is False, return the decoded result.
+      Else, return a DecodingResults object containing
+      decoded result and corresponding timestamps.
+    """
+    assert encoder_out.ndim == 3, encoder_out.shape
+    assert encoder_out.size(0) >= 1, encoder_out.size(0)
+
+    packed_encoder_out = torch.nn.utils.rnn.pack_padded_sequence(
+        input=encoder_out,
+        lengths=encoder_out_lens.cpu(),
+        batch_first=True,
+        enforce_sorted=False,
+    )
+
+    blank_id = model.decoder.blank_id
+    unk_id = getattr(model, "unk_id", blank_id)
+    context_size = model.decoder.context_size
+    device = next(model.parameters()).device
+
+    batch_size_list = packed_encoder_out.batch_sizes.tolist()
+    N = encoder_out.size(0)
+    assert torch.all(encoder_out_lens > 0), encoder_out_lens
+    assert N == batch_size_list[0], (N, batch_size_list)
+
+    B = [HypothesisList() for _ in range(N)]
+    for i in range(N):
+        B[i].add(
+            Hypothesis(
+                ys=[blank_id] * context_size,
+                log_prob=torch.zeros(1, dtype=torch.float32, device=device),
+                timestamp=[],
+            )
+        )
+
+    encoder_out = model.joiner.encoder_proj(packed_encoder_out.data)
+
+    offset = 0
+    finalized_B = []
+    for (t, batch_size) in enumerate(batch_size_list):
+        start = offset
+        end = offset + batch_size
+        current_encoder_out = encoder_out.data[start:end]
+        #current_encoder_out = current_encoder_out.unsqueeze(1).unsqueeze(1)
+        current_encoder_out = current_encoder_out.unsqueeze(1)
+        # current_encoder_out's shape is (batch_size, 1, 1, encoder_out_dim)
+        offset = end
+
+        finalized_B = B[batch_size:] + finalized_B
+        B = B[:batch_size]
+
+        hyps_shape = get_hyps_shape(B).to(device)
+
+        A = [list(b) for b in B]
+        B = [HypothesisList() for _ in range(batch_size)]
+
+        ys_log_probs = torch.cat(
+            [hyp.log_prob.reshape(1, 1) for hyps in A for hyp in hyps]
+        )  # (num_hyps, 1)
+
+        decoder_input = torch.tensor(
+            [hyp.ys[-context_size:] for hyps in A for hyp in hyps],
+            device=device,
+            dtype=torch.int64,
+        )  # (num_hyps, context_size)
+
+        #decoder_out = model.decoder(decoder_input, need_pad=False).unsqueeze(1)
+        decoder_out = model.decoder(decoder_input, need_pad=False)
+        decoder_out = model.joiner.decoder_proj(decoder_out)
+        # decoder_out is of shape (num_hyps, 1, 1, joiner_dim)
+
+        # Note: For torch 1.7.1 and below, it requires a torch.int64 tensor
+        # as index, so we use `to(torch.int64)` below.
+        current_encoder_out = torch.index_select(
+            current_encoder_out,
+            dim=0,
+            index=hyps_shape.row_ids(1).to(torch.int64),
+        )  # (num_hyps, 1, 1, encoder_out_dim)
+
+        logits = model.joiner(
+            current_encoder_out,
+            decoder_out,
+            project_input=False,
+        )  # (num_hyps, 1, 1, vocab_size)
+
+        logits = logits.squeeze(1).squeeze(1)  # (num_hyps, vocab_size)
+
+        log_probs = (logits / temperature).log_softmax(dim=-1)  # (num_hyps, vocab_size)
+
+        log_probs.add_(ys_log_probs)
+
+        vocab_size = log_probs.size(-1)
+
+        log_probs = log_probs.reshape(-1)
+
+        row_splits = hyps_shape.row_splits(1) * vocab_size
+        log_probs_shape = k2.ragged.create_ragged_shape2(
+            row_splits=row_splits, cached_tot_size=log_probs.numel()
+        )
+        ragged_log_probs = k2.RaggedTensor(shape=log_probs_shape, value=log_probs)
+
+        for i in range(batch_size):
+            topk_log_probs, topk_indexes = ragged_log_probs[i].topk(beam)
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                topk_hyp_indexes = (topk_indexes // vocab_size).tolist()
+                topk_token_indexes = (topk_indexes % vocab_size).tolist()
+
+            for k in range(len(topk_hyp_indexes)):
+                hyp_idx = topk_hyp_indexes[k]
+                hyp = A[i][hyp_idx]
+
+                new_ys = hyp.ys[:]
+                new_token = topk_token_indexes[k]
+                new_timestamp = hyp.timestamp[:]
+                if new_token not in (blank_id, unk_id):
+                    new_ys.append(new_token)
+                    new_timestamp.append(t)
+
+                new_log_prob = topk_log_probs[k]
+                new_hyp = Hypothesis(
+                    ys=new_ys, log_prob=new_log_prob, timestamp=new_timestamp
+                )
+                B[i].add(new_hyp)
+
+    B = B + finalized_B
+    best_hyps = [b.get_most_probable(length_norm=True) for b in B]
+
+    sorted_ans = [h.ys[context_size:] for h in best_hyps]
+    sorted_timestamps = [h.timestamp for h in best_hyps]
+    ans = []
+    ans_timestamps = []
+    unsorted_indices = packed_encoder_out.unsorted_indices.tolist()
+    for i in range(N):
+        ans.append(sorted_ans[unsorted_indices[i]])
+        ans_timestamps.append(sorted_timestamps[unsorted_indices[i]])
+
+    if not return_timestamps:
+        return ans
+    else:
+        return DecodingResults(
+            hyps=ans,
+            timestamps=ans_timestamps,
+        )
 
 def modified_beam_search_for_kd(
     model: Transducer,
@@ -1081,201 +1252,6 @@ def modified_beam_search_for_kd(
         timestamps=ans_timestamps,
     )
 
-def modified_beam_search(
-    model: Transducer,
-    encoder_out: torch.Tensor,
-    encoder_out_lens: torch.Tensor,
-    beam: int = 4,
-    temperature: float = 1.0,
-    return_timestamps: bool = False,
-    return_topk: bool = False,
-) -> Union[List[List[int]], DecodingResults]:
-    """Beam search in batch mode with --max-sym-per-frame=1 being hardcoded.
-
-    Args:
-      model:
-        The transducer model.
-      encoder_out:
-        Output from the encoder. Its shape is (N, T, C).
-      encoder_out_lens:
-        A 1-D tensor of shape (N,), containing number of valid frames in
-        encoder_out before padding.
-      beam:
-        Number of active paths during the beam search.
-      temperature:
-        Softmax temperature.
-      return_timestamps:
-        Whether to return timestamps.
-    Returns:
-      If return_timestamps is False, return the decoded result.
-      Else, return a DecodingResults object containing
-      decoded result and corresponding timestamps.
-    """
-    assert encoder_out.ndim == 3, encoder_out.shape
-    assert encoder_out.size(0) >= 1, encoder_out.size(0)
-
-    packed_encoder_out = torch.nn.utils.rnn.pack_padded_sequence(
-        input=encoder_out,
-        lengths=encoder_out_lens.cpu(),
-        batch_first=True,
-        enforce_sorted=False,
-    )
-
-    blank_id = model.decoder.blank_id
-    unk_id = getattr(model, "unk_id", blank_id)
-    context_size = model.decoder.context_size
-    device = next(model.parameters()).device
-
-    batch_size_list = packed_encoder_out.batch_sizes.tolist()
-    N = encoder_out.size(0)
-    assert torch.all(encoder_out_lens > 0), encoder_out_lens
-    assert N == batch_size_list[0], (N, batch_size_list)
-
-    B = [HypothesisList() for _ in range(N)]
-    for i in range(N):
-        B[i].add(
-            Hypothesis(
-                ys=[blank_id] * context_size,
-                log_prob=torch.zeros(1, dtype=torch.float32, device=device),
-                timestamp=[],
-            )
-        )
-
-    encoder_out = model.joiner.encoder_proj(packed_encoder_out.data)
-
-    #print(f"{encoder_out.shape=}")
-    offset = 0
-    finalized_B = []
-    for (t, batch_size) in enumerate(batch_size_list):
-        start = offset
-        end = offset + batch_size
-        current_encoder_out = encoder_out.data[start:end]
-        current_encoder_out = current_encoder_out.unsqueeze(1).unsqueeze(1)
-        # current_encoder_out's shape is (batch_size, 1, 1, encoder_out_dim)
-        offset = end
-
-        finalized_B = B[batch_size:] + finalized_B
-        B = B[:batch_size]
-
-        hyps_shape = get_hyps_shape(B).to(device)
-
-        A = [list(b) for b in B]
-        B = [HypothesisList() for _ in range(batch_size)]
-        C = [HypothesisList() for _ in range(batch_size)]
-
-        ys_log_probs = torch.cat(
-            [hyp.log_prob.reshape(1, 1) for hyps in A for hyp in hyps]
-        )  # (num_hyps, 1)
-
-        decoder_input = torch.tensor(
-            [hyp.ys[-context_size:] for hyps in A for hyp in hyps],
-            device=device,
-            dtype=torch.int64,
-        )  # (num_hyps, context_size)
-
-        decoder_out = model.decoder(decoder_input, need_pad=False).unsqueeze(1)
-        decoder_out = model.joiner.decoder_proj(decoder_out)
-        # decoder_out is of shape (num_hyps, 1, 1, joiner_dim)
-
-        # Note: For torch 1.7.1 and below, it requires a torch.int64 tensor
-        # as index, so we use `to(torch.int64)` below.
-        current_encoder_out = torch.index_select(
-            current_encoder_out,
-            dim=0,
-            index=hyps_shape.row_ids(1).to(torch.int64),
-        )  # (num_hyps, 1, 1, encoder_out_dim)
-
-        logits = model.joiner(
-            current_encoder_out,
-            decoder_out,
-            project_input=False,
-        )  # (num_hyps, 1, 1, vocab_size)
-
-        logits = logits.squeeze(1).squeeze(1)  # (num_hyps, vocab_size)
-
-        log_probs = (logits / temperature).log_softmax(dim=-1)  # (num_hyps, vocab_size)
-
-        log_probs.add_(ys_log_probs)
-
-        vocab_size = log_probs.size(-1)
-
-        log_probs = log_probs.reshape(-1)
-
-        row_splits = hyps_shape.row_splits(1) * vocab_size
-        log_probs_shape = k2.ragged.create_ragged_shape2(
-            row_splits=row_splits, cached_tot_size=log_probs.numel()
-        )
-        ragged_log_probs = k2.RaggedTensor(shape=log_probs_shape, value=log_probs)
-
-        for i in range(batch_size):
-            topk_log_probs, topk_indexes = ragged_log_probs[i].topk(beam)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                topk_hyp_indexes = (topk_indexes // vocab_size).tolist()
-                topk_token_indexes = (topk_indexes % vocab_size).tolist()
-
-            for k in range(len(topk_hyp_indexes)):
-                hyp_idx = topk_hyp_indexes[k]
-                hyp = A[i][hyp_idx]
-
-                new_ys = hyp.ys[:]
-                new_token = topk_token_indexes[k]
-                new_timestamp = hyp.timestamp[:]
-
-                if return_topk:
-                    new_ys.append(new_token)
-                    new_timestamp.append(t)
-                else: #original codes
-                    if new_token not in (blank_id, unk_id):
-                        new_ys.append(new_token)
-                        new_timestamp.append(t)
-
-                new_log_prob = topk_log_probs[k]
-                new_hyp = Hypothesis(
-                    ys=new_ys, log_prob=new_log_prob, timestamp=new_timestamp
-                )
-                B[i].add(new_hyp)
-
-    B = B + finalized_B
-    best_hyps = [b.get_most_probable(length_norm=True) for b in B]
-    sorted_ans = [h.ys[context_size:] for h in best_hyps]
-    sorted_timestamps = [h.timestamp for h in best_hyps]
-    ans = []
-    ans_timestamps = []
-    unsorted_indices = packed_encoder_out.unsorted_indices.tolist()
-    for i in range(N):
-        ans.append(sorted_ans[unsorted_indices[i]])
-        ans_timestamps.append(sorted_timestamps[unsorted_indices[i]])
-
-    if return_topk:
-        #print(f"{best_hyps=}")
-        #print(f"{len(B)=}")
-        topk_hyps = list()
-        topk_best_orig_hyps = [b.topk(k=3, length_norm=True) for b in B]
-        topk_best_list = list()
-        for a in topk_best_orig_hyps:
-            for h in a:
-                topk_best_list.append(h.ys[2:])
-
-        for b in range(len(B)):
-            hyp = list()
-            for h in range(beam):
-                hyp.append(topk_best_list[b*beam+h])
-            topk_hyps.append(hyp)
-
-    #for b  in B:
-    #    print(b)
-    if return_topk:
-        return topk_hyps
-    if not return_timestamps:
-        return ans
-    else:
-        return DecodingResults(
-            hyps=ans,
-            timestamps=ans_timestamps,
-        )
-
-
 def _deprecated_modified_beam_search(
     model: Transducer,
     encoder_out: torch.Tensor,
@@ -1334,7 +1310,6 @@ def _deprecated_modified_beam_search(
         # fmt: on
         A = list(B)
         B = HypothesisList()
-        C = HypothesisList()
 
         ys_log_probs = torch.cat([hyp.log_prob.reshape(1, 1) for hyp in A])
         # ys_log_probs is of shape (num_hyps, 1)

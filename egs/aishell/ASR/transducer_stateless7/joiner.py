@@ -51,8 +51,17 @@ class Joiner(nn.Module):
         Returns:
           Return a tensor of shape (N, T, s_range, C).
         """
-        assert encoder_out.ndim == decoder_out.ndim
-        assert encoder_out.ndim in (2, 4)
+        #print(f"inside joiner forward")
+        #print(f"{encoder_out.shape=}")
+        #print(f"{decoder_out.shape=}")
+        #assert encoder_out.ndim == decoder_out.ndim
+        #assert encoder_out.ndim in (2, 4)
+        assert encoder_out.ndim == decoder_out.ndim == 3
+        assert encoder_out.size(0) == decoder_out.size(0)
+        #assert encoder_out.size(2) == decoder_out.size(2)
+
+        encoder_out = encoder_out.unsqueeze(2)
+        decoder_out = decoder_out.unsqueeze(1)
 
         if project_input:
             logit = self.encoder_proj(encoder_out) + self.decoder_proj(decoder_out)
