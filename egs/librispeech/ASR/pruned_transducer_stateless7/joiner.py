@@ -53,11 +53,16 @@ class Joiner(nn.Module):
         """
         assert encoder_out.ndim == decoder_out.ndim
         assert encoder_out.ndim in (2, 4)
+        #print(f"{encoder_out.shape=}")
+        #print(f"{decoder_out.shape=}")
 
         if project_input:
             logit = self.encoder_proj(encoder_out) + self.decoder_proj(decoder_out)
+            #print(f"{logit.shape=}")
         else:
             logit = encoder_out + decoder_out
+        #import sys
+        #sys.exit(0)
 
         logit = self.output_linear(torch.tanh(logit))
 
