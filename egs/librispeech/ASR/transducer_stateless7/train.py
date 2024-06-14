@@ -298,14 +298,6 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--prune-range",
-        type=int,
-        default=5,
-        help="The prune range for rnnt loss, it means how many symbols(context)"
-        "we are using to compute the loss",
-    )
-
-    parser.add_argument(
         "--lm-scale",
         type=float,
         default=0.25,

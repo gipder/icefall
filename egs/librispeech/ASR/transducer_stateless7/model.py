@@ -28,6 +28,9 @@ from scaling import penalize_abs_values_gt
 from icefall.utils import add_sos
 from typing import Union
 
+import numpy as np
+
+
 class Transducer(nn.Module):
     """It implements https://arxiv.org/pdf/1211.3711.pdf
     "Sequence Transduction with Recurrent Neural Networks"
@@ -267,7 +270,7 @@ class Transducer(nn.Module):
             if use_pruned:
                 # getting the pruned path
 
-                def create_increasing_sublists_torch(original_tensor, length=3):
+                def create_increasing_sublists_torch(original_tensor, length=5):
                     # 배치 크기와 원소 수
                     batch_size, num_elements = original_tensor.shape
 
@@ -275,7 +278,7 @@ class Transducer(nn.Module):
                     max_val = torch.max(original_tensor, dim=1, keepdim=True)[0]
                     min_val = torch.min(original_tensor, dim=1, keepdim=True)[0]
 
-                    half_length = (length - 1) // 2
+                    half_length = torch.div(length-1, 2, rounding_mode='floor')  #(length - 1) // 2
 
                     # 각 원소에 대해 시작값 계산
                     starts = original_tensor - half_length
@@ -293,6 +296,9 @@ class Transducer(nn.Module):
                     return result_tensor
 
                 # memory explosion
+                max_len = torch.max(y_lens)
+                if pruned_range > max_len:
+                    pruned_range = max_len
                 idx = create_increasing_sublists_torch(pseudo_y_alignment, pruned_range)
                 batch_idx = torch.arange(logits.size(0)).view(-1, 1, 1)
                 batch_idx = batch_idx.expand(-1, idx.size(-2), idx.size(-1))
@@ -352,6 +358,45 @@ class Transducer(nn.Module):
                                         )
                     student_sampling = ret["student"]
                     teacher_sampling = ret["teacher"]
+
+                elif use_pruned:
+                    logits = sampling_logits
+                    student_sampling = F.log_softmax(sampling_logits, dim=-1)
+                    teacher_sampling = F.softmax(teacher_sampling_logits[i], dim=-1)
+
+                    # to make sampled pseudo alignment
+                    sampled_y_alignments = torch.zeros_like(pseudo_y_alignment,
+                                                            dtype=pseudo_y_alignment.dtype)
+                    sampled_y_lens = [len(i) for i in sampling_y[i].tolist()]
+                    for ii in range(len(sampled_y_lens)):
+                        sampled_y_alignments[ii, :x_lens[ii]] = create_pseudo_alignment(x_lens[ii],
+                                                                                      sampled_y_lens[ii])
+
+                    #print(f"{pseudo_y_alignment.shape=}")
+                    #print(f"{pseudo_y_alignment[0]=}")
+                    #print(f"{sampled_y_alignments.shape=}")
+                    #print(f"{sampled_y_alignments[0]=}")
+                    #print(f"{sampled_y_alignments[-1]=}")
+                    #print(f"{sampling_logits.shape}")
+                    #print(f"{sampling_y[i]=}")
+                    #print(f"{[len(i) for i in sampling_y[i].tolist()]=}")
+                    #print(f"{y_lens=}")
+                    #print(f"{sampling_y[i][0]=}")
+                    #student = F.log_softmax(logits, dim=-1)
+                    #teacher = F.softmax(teacher_logits, dim=-1)
+                    max_len = torch.max(y_lens)
+                    if pruned_range > max_len:
+                        pruned_range = max_len
+                    idx = create_increasing_sublists_torch(sampled_y_alignments, pruned_range)
+                    batch_idx = torch.arange(logits.size(0)).view(-1, 1, 1)
+                    batch_idx = batch_idx.expand(-1, idx.size(-2), idx.size(-1))
+                    teacher = teacher_sampling[batch_idx, torch.arange(logits.size(1)).view(1, -1, 1), idx]
+                    student = student_sampling[batch_idx, torch.arange(logits.size(1)).view(1, -1, 1), idx]
+                    max_len = logits.size(1)
+                    mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
+                    mask = mask.unsqueeze(-1).unsqueeze(-1)
+                    student = student * mask.float()
+                    teacher = teacher * mask.float()
                 else: #original code
                     student_sampling_logits = sampling_logits
 
@@ -578,5 +623,53 @@ def get_efficient(
     ret = dict()
     ret["student"] = student
     ret["teacher"] = teacher
+
+    return ret
+
+def create_increasing_sublists_torch(original_tensor, length=5):
+    # 배치 크기와 원소 수
+    batch_size, num_elements = original_tensor.shape
+
+    # 최대값, 최소값
+    max_val = torch.max(original_tensor, dim=1, keepdim=True)[0]
+    min_val = torch.min(original_tensor, dim=1, keepdim=True)[0]
+
+    half_length = torch.div(length-1, 2, rounding_mode='floor')  #(length - 1) // 2
+
+    # 각 원소에 대해 시작값 계산
+    starts = original_tensor - half_length
+
+    # 최소값에 따라 시작값 조정
+    starts = torch.clamp(starts, min_val, max_val - length + 1)
+
+    # 각 시작점에 대해 서브리스트 생성 (증가하는 범위)
+    Result_tensor = torch.arange(0, length, device=original_tensor.device)
+    result_tensor = result_tensor.expand(batch_size, num_elements, -1) + starts.unsqueeze(-1)
+
+    # 최대값에 따라 클램핑 없이 증가 범위 유지
+    result_tensor = torch.min(result_tensor, max_val.unsqueeze(-1))
+
+    return result_tensor
+
+def create_pseudo_alignment(x_len, y_len):
+    #prepend 0 in the beginning
+    padded_y_len = y_len +1
+    if x_len < padded_y_len:
+        padded_y_len = x_len.item()
+    y = torch.arange(padded_y_len)
+    base_repeats = np.ones(padded_y_len, dtype=int)
+    remaining_len = x_len - padded_y_len
+    #print(f"{x_len=}")
+    #print(f"{y_len=}")
+    #print(f"{padded_y_len=}")
+    #print(f"{y=}")
+    #print(f"{base_repeats=}")
+    #print(f"{remaining_len=}")
+    #random distribution
+    additional_repeats = np.random.multinomial(remaining_len, np.ones(padded_y_len)/padded_y_len)
+    repeats = base_repeats + additional_repeats
+
+    #creating tensor
+    ret = torch.cat([torch.full((count,), num) for num, count in zip(y, repeats)])
 
     return ret
