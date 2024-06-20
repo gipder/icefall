@@ -79,19 +79,21 @@ class Transducer(nn.Module):
         x: torch.Tensor,
         x_lens: torch.Tensor,
         y: k2.RaggedTensor,
+        nbest_y: Union[list, k2.RaggedTensor] = None,
         use_kd: bool = False,
         teacher_logits: torch.Tensor = None,
+        nbest_teacher_logits: Union[list, torch.tensor] = None,
         use_ctc: bool = False,
         teacher_model: nn.Module = None,
         use_efficient: bool = False,
         use_1best: bool = False,
+        use_nbest: bool = False,
         use_pruned: bool = False,
         pseudo_y_alignment: torch.Tensor = None,
-        use_sequence: bool = False,
-        pseudo_y_sequence: torch.Tensor = None,
+        nbest_pseudo_y_alignment: Union[list, torch.tensor] = None,
+        topk: int = 1,
         use_sq_sampling: bool = False,
         sampling_y: Union[list, k2.RaggedTensor] = None,
-        teacher_sampling_ranges: Union[list, torch.tensor] = None,
         teacher_sampling_logits: Union[list, torch.tensor] = None,
         sq_sampling_num: int = 1,
         pruned_range: int = 5,
@@ -169,10 +171,9 @@ class Transducer(nn.Module):
         )
 
         if use_kd:
-            student = F.log_softmax(logits, dim=-1)
-            teacher = F.softmax(teacher_logits, dim=-1)
-
-            if use_efficient is False and use_1best is False and use_sequence is False:
+            if use_efficient is False and use_1best is False:
+                student = F.log_softmax(logits, dim=-1)
+                teacher = F.softmax(teacher_logits, dim=-1)
                 # T-axis direction masking
                 max_len = logits.size(1)
                 mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
@@ -183,10 +184,10 @@ class Transducer(nn.Module):
             # the case when use_efficient is True and use_1best is True
             # is not supported yet.
             assert not (use_efficient and use_1best)
-            assert not (use_efficient and use_sequence)
-            assert not (use_1best and use_sequence)
 
             if use_efficient:
+                student = F.log_softmax(logits, dim=-1)
+                teacher = F.softmax(teacher_logits, dim=-1)
                 tensor_y_padded = y_padded.to(torch.int64)
                 indices = tensor_y_padded.unsqueeze(1).unsqueeze(-1)
                 logits = torch.softmax(logits, dim=-1)
@@ -255,6 +256,8 @@ class Transducer(nn.Module):
                 #student_logits = self.get_logits(x, org_x_lens, pseudo_y, use_grad=True)
                 #student = F.log_softmax(student_logits, dim=-1)
                 #teacher = F.softmax(teacher_logits, dim=-1)
+                student = F.log_softmax(logits, dim=-1)
+                teacher = F.softmax(teacher_logits, dim=-1)
                 idx = pseudo_y_alignment.unsqueeze(-1).expand(-1, -1, logits.shape[-1]).unsqueeze(2)
                 idx = idx.to(torch.int64)
                 teacher = torch.gather(teacher, 2, idx)
@@ -266,6 +269,32 @@ class Transducer(nn.Module):
                 teacher = teacher * mask.float()
                 #print(f"{student[-1,-1,:,:]=}")
                 #print(f"{teacher[-1,-1,:,:]=}")
+
+            if use_nbest:
+                nbest_teacher = None
+                nbest_student = None
+                for n in range(0, topk):
+                    n_logits = self.get_logits(
+                        encoder_out=org_encoder_out,
+                        encoder_out_lens=x_lens,
+                        y=nbest_y[n],
+                        use_grad=True,
+                    )
+                    student = F.log_softmax(n_logits, dim=-1)
+                    teacher = F.softmax(nbest_teacher_logits[n], dim=-1)
+                    idx = nbest_pseudo_y_alignment[n].unsqueeze(-1).expand(-1, -1, logits.shape[-1]).unsqueeze(2)
+                    idx = idx.to(torch.int64)
+                    teacher = torch.gather(teacher, 2, idx)
+                    student = torch.gather(student, 2, idx)
+                    max_len = logits.size(1)
+                    mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
+                    mask = mask.unsqueeze(-1).unsqueeze(-1)
+                    student = student * mask.float()
+                    teacher = teacher * mask.float()
+
+                    # concatenating
+                    nbest_teacher = torch.cat([nbest_teacher, teacher], dim=2) if nbest_teacher is not None else teacher
+                    nbest_student = torch.cat([nbest_student, student], dim=2) if nbest_student is not None else student
 
             if use_pruned:
                 # getting the pruned path
@@ -310,32 +339,6 @@ class Transducer(nn.Module):
                 student = student * mask.float()
                 teacher = teacher * mask.float()
 
-            if use_sequence:
-                idx = pseudo_y_alignment.unsqueeze(-1).expand(-1, -1, logits.shape[-1]).unsqueeze(2)
-                idx = idx.to(torch.int64)
-                teacher = torch.gather(teacher, 2, idx)
-                student = torch.gather(student, 2, idx)
-                # print all tensor
-                #torch.set_printoptions(profile="full")
-                #print(f"selected {student[-1, 12:14]=}")
-                #print(f"selected {teacher[-1, 12:14]=}")
-                # pick only the seq values
-                pseudo_y_sequence = pseudo_y_sequence.to(torch.int64)
-                teacher = torch.gather(teacher, -1, pseudo_y_sequence.unsqueeze(-1).unsqueeze(-1))
-                student = torch.gather(student, -1, pseudo_y_sequence.unsqueeze(-1).unsqueeze(-1))
-                max_len = logits.size(1)
-                mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
-                mask = mask.unsqueeze(-1).unsqueeze(-1)
-                student = student * mask.float()
-                teacher = teacher * mask.float()
-                #print(f"{pseudo_y_sequence[-1]=}")
-                #print(f"{student[-1, 12:14]=}")
-                #print(f"{teacher[-1, 12:14]=}")
-                #print(f"{student[-1,-1,:,:]=}")
-                #print(f"{teacher[-1,-1,:,:]=}")
-
-                #import sys
-                #sys.exit(0)
             kd_loss = self.kd_criterion(student, teacher)
 
         if use_sq_sampling:

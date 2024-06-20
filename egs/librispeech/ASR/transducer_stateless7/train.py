@@ -528,6 +528,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--topk",
+        type=int,
+        default=1,
+        help="How many nbest results we use when doing knowledge distillation",
+    )
+
+    parser.add_argument(
         "--use-sequence",
         type=str2bool,
         default=False,
@@ -878,8 +885,11 @@ def compute_loss(
         teacher_model = teacher_model.module
 
     teacher_logits = None
+    nbest_teacher_logits = None
     pseudo_y = None
+    nbest_pseudo_y = None
     beam_search_alignment = None
+    nbest_beam_search_alignment = None
     pseudo_y_sequence = None
 
     if teacher_model is None:
@@ -909,34 +919,125 @@ def compute_loss(
             ids.append(batch["supervisions"]['cut'][i].id)
 
         import math
-        with torch.no_grad():
-            all_in_cache = True
-            if hyp_cache is not None:
-                for i in range(len(ids)):
-                    if hyp_cache.get(ids[i]) is None:
-                        all_in_cache = False
-                        break
-            if all_in_cache is False:
-                decoding_result = modified_beam_search_for_kd(
-                    model=teacher_model,
-                    x=feature,
-                    x_lens=feature_lens,
-                    beam=4,
-                )
+        if params.use_1best:
+            # the original working code
+            with torch.no_grad():
+                all_in_cache = True
+                if hyp_cache is not None:
+                    for i in range(len(ids)):
+                        if hyp_cache.get(ids[i]) is None:
+                            all_in_cache = False
+                            break
+                if all_in_cache is False:
+                    print("Cache miss!")
+                    print(f"{ids=}")
+                    import os
+                    os.exit(1)
 
-                # adding
-                # the equation is heuristically determined
-                hyp_alignment = torch.zeros(feature_lens.size()[0], math.ceil((feature_lens[0]-8)/4), dtype=torch.int)
-                for i in range(feature_lens.size()[0]):
-                    for j in range(len(decoding_result.hyps[i])):
-                        hyp_alignment[i, decoding_result.timestamps[i][j]] = decoding_result.hyps[i][j]
+                    decoding_result = modified_beam_search_for_kd(
+                        model=teacher_model,
+                        x=feature,
+                        x_lens=feature_lens,
+                        beam=4,
+                    )
 
-                hyp_tokens = hyp_alignment.tolist()
-                # add the hyp_tokens to cache
+                    # adding
+                    # the equation is heuristically determined
+                    hyp_alignment = torch.zeros(feature_lens.size()[0], math.ceil((feature_lens[0]-8)/4), dtype=torch.int)
+                    for i in range(feature_lens.size()[0]):
+                        for j in range(len(decoding_result.hyps[i])):
+                            hyp_alignment[i, decoding_result.timestamps[i][j]] = decoding_result.hyps[i][j]
+
+                    hyp_tokens = hyp_alignment.tolist()
+                    # add the hyp_tokens to cache
+                    for i in range(len(hyp_tokens)):
+                        hyp_cache[ids[i]] = hyp_tokens[i]
+
+                else:
+                    #print("Cache hit!")
+                    #print(f"{hyp_cache[ids[i]]=}")
+                    assert not (params.use_1best and params.use_nbest)
+                    assert not (params.use_1best and params.use_pruned)
+
+                    # check whether the length of hyp and the length of batch are the same
+                    #print(f"{feature_lens.size()[0]=}")
+                    for i in range(feature_lens.size()[0]):
+                        # feature lens to encoder lens
+                        encoder_len = math.ceil((feature_lens[i]-8)/4)
+                        hyp_len = len(hyp_cache[ids[i]])
+                        if hyp_len != encoder_len:
+                            tmp_hyp = hyp_cache[ids[i]]
+                            # case 1. hyp_cache[ids[i]] is shorter than encoder_lens
+                            if hyp_len < encoder_len:
+                                #print(f"{hyp_cache[ids[i]]}")
+                                #print(f"{hyp_len=} is shorter than {encoder_len=}")
+                                hyp_cache[ids[i]] = tmp_hyp.extend([0]*(encoder_len-hyp_len))
+                            # case 2. hyp_cache[ids[i]] is longer than encoder_lens
+                            if hyp_len > encoder_len:
+                                #print(f"{hyp_cache[ids[i]]}")
+                                #print(f"{hyp_len=} is longer than {encoder_len=}")
+                                hyp_cache[ids[i]] = tmp_hyp[:encoder_len]
+
+                    # loading hyp_tokens from cache
+                    hyp_tokens = list()
+                    for i in range(len(ids)):
+                        hyp_tokens.append(hyp_cache[ids[i]])
+
+                # make pseudo labels
+                pseudo_labels = list()
                 for i in range(len(hyp_tokens)):
-                    hyp_cache[ids[i]] = hyp_tokens[i]
+                    tmp_pseudo_label = [ t for t in hyp_tokens[i] if t != 0 ]
+                    #for j in hyp_tokens[i]:
+                    #    tmp_pseudo_label = [ t for t in j if t != 0 ]
+                    pseudo_labels.append(tmp_pseudo_label)
 
-            else:
+                # don't need
+                # remove duplicated labels with maintaing order
+                # convert list(list()) to k2.RaggedTensor
+                pseudo_y = k2.RaggedTensor(pseudo_labels).to(device)
+
+                # I didn't copy the pseudo_y to y
+                y = pseudo_y.clone()
+
+                # first, check if the first token is blank
+                for i in range(len(hyp_tokens)):
+                    if hyp_tokens[i][0] != 0:
+                        hyp_tokens[i][1:] = hyp_tokens[i][:-1] # shift to right
+                        hyp_tokens[i][0] = 0
+                # get max length of hyp_tokens
+                max_len = 0
+                for i in range(len(hyp_tokens)):
+                    if max_len < len(hyp_tokens[i]):
+                        max_len = len(hyp_tokens[i])
+                alignment = torch.zeros((len(hyp_tokens), max_len), dtype=torch.int32)
+
+                # get pseudo_y_sequence
+                pseudo_y_sequence = alignment.clone().to(device)
+                for i in range(len(hyp_tokens)):
+                    pseudo_y_sequence[i, :len(hyp_tokens[i])] = torch.tensor(hyp_tokens[i], dtype=torch.int32)
+
+                # remove duplicated labels in hyp_tokens
+                # and convert the sequence to monotonic increasing sequence
+                for i in range(len(hyp_tokens)):
+                    mask = (torch.tensor(hyp_tokens[i], dtype=torch.bool) != 0)
+                    alignment[i, :len(hyp_tokens[i])] = torch.cumsum(mask.int(), dim=-1, dtype=torch.int32)
+
+                beam_search_alignment = alignment.to(device)
+
+        elif params.use_nbest:
+            with torch.no_grad():
+                all_in_cache = True
+                if hyp_cache is not None:
+                    for i in range(len(ids)):
+                        if hyp_cache.get(ids[i]) is None:
+                            all_in_cache = False
+                            break
+                if all_in_cache is False:
+                    print("Cache miss!")
+                    print(f"{ids=}")
+                    import os
+                    os.exit(1)
+
                 #print("Cache hit!")
                 #print(f"{hyp_cache[ids[i]]=}")
                 assert not (params.use_1best and params.use_nbest)
@@ -944,90 +1045,126 @@ def compute_loss(
 
                 # check whether the length of hyp and the length of batch are the same
                 #print(f"{feature_lens.size()[0]=}")
-                for i in range(feature_lens.size()[0]):
-                    # feature lens to encoder lens
-                    encoder_len = math.ceil((feature_lens[i]-8)/4)
-                    hyp_len = len(hyp_cache[ids[i]])
-                    if hyp_len != encoder_len:
-                        tmp_hyp = hyp_cache[ids[i]]
-                        # case 1. hyp_cache[ids[i]] is shorter than encoder_lens
-                        if hyp_len < encoder_len:
-                            #print(f"{hyp_cache[ids[i]]}")
-                            #print(f"{hyp_len=} is shorter than {encoder_len=}")
-                            hyp_cache[ids[i]] = tmp_hyp.extend([0]*(encoder_len-hyp_len))
-                        # case 2. hyp_cache[ids[i]] is longer than encoder_lens
-                        if hyp_len > encoder_len:
-                            #print(f"{hyp_cache[ids[i]]}")
-                            #print(f"{hyp_len=} is longer than {encoder_len=}")
-                            hyp_cache[ids[i]] = tmp_hyp[:encoder_len]
+                nbest_beam_search_alignment = list()
+                nbest_pseudo_y = list()
+                for n in range(params.topk):
+                    for i in range(feature_lens.size()[0]):
+                        # feature lens to encoder lens
+                        encoder_len = math.ceil((feature_lens[i]-8)/4)
+                        if n >= len(hyp_cache[ids[i]]):
+                            n = len(hyp_cache[ids[i]]) - 1
+                        hyp_len = len(hyp_cache[ids[i]][n])
+                        if hyp_len != encoder_len:
+                            tmp_hyp = hyp_cache[ids[i]][n]
+                            # case 1. hyp_cache[ids[i]] is shorter than encoder_lens
+                            if hyp_len < encoder_len:
+                                #print(f"{hyp_cache[ids[i]]}")
+                                #print(f"{hyp_len=} is shorter than {encoder_len=}")
+                                hyp_cache[ids[i]][n] = tmp_hyp.extend([0]*(encoder_len-hyp_len))
+                            # case 2. hyp_cache[ids[i]] is longer than encoder_lens
+                            if hyp_len > encoder_len:
+                                #print(f"{hyp_cache[ids[i]]}")
+                                #print(f"{hyp_len=} is longer than {encoder_len=}")
+                                hyp_cache[ids[i]][n] = tmp_hyp[:encoder_len]
 
-                # loading hyp_tokens from cache
-                hyp_tokens = list()
-                for i in range(len(ids)):
-                    hyp_tokens.append(hyp_cache[ids[i]])
+                    # loading hyp_tokens from cache
+                    hyp_tokens = list()
+                    for i in range(len(ids)):
+                        hyp_tokens.append(hyp_cache[ids[i]][n])
 
-            # make pseudo labels
-            pseudo_labels = list()
-            for i in range(len(hyp_tokens)):
-                tmp_pseudo_label = [ t for t in hyp_tokens[i] if t != 0 ]
-                #for j in hyp_tokens[i]:
-                #    tmp_pseudo_label = [ t for t in j if t != 0 ]
-                pseudo_labels.append(tmp_pseudo_label)
+                    # make pseudo labels
+                    pseudo_labels = list()
+                    for i in range(len(hyp_tokens)):
+                        tmp_pseudo_label = [ t for t in hyp_tokens[i] if t != 0 ]
+                        #for j in hyp_tokens[i]:
+                        #    tmp_pseudo_label = [ t for t in j if t != 0 ]
+                        pseudo_labels.append(tmp_pseudo_label)
 
-            # don't need
-            # remove duplicated labels with maintaing order
-            # convert list(list()) to k2.RaggedTensor
-            pseudo_y = k2.RaggedTensor(pseudo_labels).to(device)
+                    # don't need
+                    # remove duplicated labels with maintaing order
+                    # convert list(list()) to k2.RaggedTensor
+                    pseudo_y = k2.RaggedTensor(pseudo_labels).to(device)
+                    nbest_pseudo_y.append(pseudo_y)
 
-            # I didn't copy the pseudo_y to y
-            y = pseudo_y.clone()
+                    # I didn't copy the pseudo_y to y
+                    y = pseudo_y.clone()
 
-            # first, check if the first token is blank
-            for i in range(len(hyp_tokens)):
-                if hyp_tokens[i][0] != 0:
-                    hyp_tokens[i][1:] = hyp_tokens[i][:-1] # shift to right
-                    hyp_tokens[i][0] = 0
-            # get max length of hyp_tokens
-            max_len = 0
-            for i in range(len(hyp_tokens)):
-                if max_len < len(hyp_tokens[i]):
-                    max_len = len(hyp_tokens[i])
-            alignment = torch.zeros((len(hyp_tokens), max_len), dtype=torch.int32)
+                    # first, check if the first token is blank
+                    for i in range(len(hyp_tokens)):
+                        if hyp_tokens[i][0] != 0:
+                            hyp_tokens[i][1:] = hyp_tokens[i][:-1] # shift to right
+                            hyp_tokens[i][0] = 0
+                    # get max length of hyp_tokens
+                    max_len = 0
+                    for i in range(len(hyp_tokens)):
+                        if max_len < len(hyp_tokens[i]):
+                            max_len = len(hyp_tokens[i])
+                    alignment = torch.zeros((len(hyp_tokens), max_len), dtype=torch.int32)
 
-            # get pseudo_y_sequence
-            pseudo_y_sequence = alignment.clone().to(device)
-            for i in range(len(hyp_tokens)):
-                pseudo_y_sequence[i, :len(hyp_tokens[i])] = torch.tensor(hyp_tokens[i], dtype=torch.int32)
+                    # get pseudo_y_sequence
+                    pseudo_y_sequence = alignment.clone().to(device)
+                    for i in range(len(hyp_tokens)):
+                        pseudo_y_sequence[i, :len(hyp_tokens[i])] = torch.tensor(hyp_tokens[i], dtype=torch.int32)
 
-            # remove duplicated labels in hyp_tokens
-            # and convert the sequence to monotonic increasing sequence
-            for i in range(len(hyp_tokens)):
-                mask = (torch.tensor(hyp_tokens[i], dtype=torch.bool) != 0)
-                alignment[i, :len(hyp_tokens[i])] = torch.cumsum(mask.int(), dim=-1, dtype=torch.int32)
+                    # remove duplicated labels in hyp_tokens
+                    # and convert the sequence to monotonic increasing sequence
+                    for i in range(len(hyp_tokens)):
+                        mask = (torch.tensor(hyp_tokens[i], dtype=torch.bool) != 0)
+                        alignment[i, :len(hyp_tokens[i])] = torch.cumsum(mask.int(), dim=-1, dtype=torch.int32)
 
-            beam_search_alignment = alignment.to(device)
+                    beam_search_alignment = alignment.to(device)
+                    nbest_beam_search_alignment.append(beam_search_alignment)
 
     # initialize teacher sampling y and logits
     sampling_y = None
     teacher_sampling_logits = None
 
     if use_kd:
-        with torch.no_grad():
-            teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
-                x=feature,
-                x_lens=feature_lens,
-                y=y,
-                use_grad=False,
-            )
+        if params.use_1best:
+            with torch.no_grad():
+                teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
+                    x=feature,
+                    x_lens=feature_lens,
+                    y=y,
+                    use_grad=False,
+                )
 
-            ret = teacher_model.get_logits_with_encoder_out(
-                encoder_out=teacher_encoder_out,
-                encoder_out_lens=teacher_encoder_out_lens,
-                y=y,
-                use_grad=False,
-            )
+                ret = teacher_model.get_logits_with_encoder_out(
+                    encoder_out=teacher_encoder_out,
+                    encoder_out_lens=teacher_encoder_out_lens,
+                    y=y,
+                    use_grad=False,
+                )
 
-        teacher_logits = ret
+            teacher_logits = ret
+        elif params.use_nbest:
+            nbest_teacher_logits = list()
+            for n in range(params.topk):
+                with torch.no_grad():
+                    teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
+                        x=feature,
+                        x_lens=feature_lens,
+                        y=nbest_pseudo_y[n],
+                        use_grad=False,
+                    )
+
+                    ret = teacher_model.get_logits_with_encoder_out(
+                        encoder_out=teacher_encoder_out,
+                        encoder_out_lens=teacher_encoder_out_lens,
+                        y=nbest_pseudo_y[n],
+                        use_grad=False,
+                    )
+
+                teacher_logits = ret
+                nbest_teacher_logits.append(teacher_logits)
+            #print(f"{nbest_beam_search_alignment=}")
+            #print(f"{nbest_pseudo_y=}")
+            #print(f"{nbest_teacher_logits=}")
+            #print(f"{len(nbest_beam_search_alignment)=}")
+            #print(f"{len(nbest_pseudo_y)=}")
+            #print(f"{len(nbest_teacher_logits)=}")
+            #import sys
+            #sys.exit(1)
 
         if use_sq_sampling:
             teacher_sampling_logits = list()
@@ -1052,42 +1189,27 @@ def compute_loss(
 
                 teacher_sampling_logits.append(sampling_ret)
 
-        """
-        with torch.no_grad():
-
-            #if use_beam_search:
-            #    teacher_y = pseudo_y
-            #else:
-            #    teacher_y = y
-
-            ret = teacher_model.get_logits(
-                x=feature,
-                x_lens=feature_lens,
-                y=y,
-                use_grad=False,
-            )
-        teacher_logits = ret
-        """
-
     with torch.set_grad_enabled(is_training):
         org_loss = torch.tensor(0.0, device=device)
         kd_loss = torch.tensor(0.0, device=device)
         sampling_loss = torch.tensor(0.0, device=device)
-
         ret = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
+            nbest_y=nbest_pseudo_y,
             use_kd=use_kd,
             teacher_logits=teacher_logits,
+            nbest_teacher_logits=nbest_teacher_logits,
             use_ctc=params.use_ctc,
             teacher_model=teacher_model,
             use_efficient=params.use_efficient,
             use_1best=params.use_1best,
+            use_nbest=params.use_nbest,
             use_pruned=params.use_pruned,
             pseudo_y_alignment=beam_search_alignment,
-            use_sequence=params.use_sequence,
-            pseudo_y_sequence=pseudo_y_sequence,
+            nbest_pseudo_y_alignment=nbest_beam_search_alignment,
+            topk=params.topk,
             use_sq_sampling=use_sq_sampling,
             sampling_y=sampling_y,
             teacher_sampling_logits=teacher_sampling_logits,
