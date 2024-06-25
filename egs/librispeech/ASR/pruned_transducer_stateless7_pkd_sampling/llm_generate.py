@@ -24,18 +24,20 @@ from datetime import datetime
 import re
 import os
 import pickle
+from jiwer import wer
 
 class LLMGenDict:
     def __init__(self, key, original_sentence, generated_sentence):
         self.key = key
         self.original_sentence = original_sentence
         self.generated_sentence = generated_sentence
+        self.wer = wer(self.original_sentence, self.generated_sentence)
 
     def update_generated_sentence(self, new_generated_sentence):
         self.generated_sentence = new_generated_sentence
 
     def __str__(self):
-        return f"Key: {self.key}\nOriginal Sentence: {self.original_sentence}\nGenerated Sentence: {self.generated_sentence}"
+        return f"Key: {self.key}\nOriginal Sentence: {self.original_sentence}\nGenerated Sentence: {self.generated_sentence}\nWER: {self.wer}"
 
 
 class LLMGenDB:
@@ -81,6 +83,9 @@ class LLMGenDB:
     def get_origin(self, key):
         return self.get_original_sentence(key)
 
+    def get_wer(self, key):
+        return self.entries[key].wer
+
     def delete_entry(self, key):
         if key in self.entries:
             del self.entries[key]
@@ -104,7 +109,7 @@ def create_client(port="1824") -> OpenAI:
 def make_message(asr_label: str):
     message = [
         {"role": "system", "content": "You are an ASR expert."},
-        {"role": "user", "content": f"Please generate ASR error pattern with WER 50% from this sentence, {asr_label}."},
+        {"role": "user", "content": f"Please generate ASR error pattern with WER 25% from this sentence, {asr_label}."},
         {"role": "user", "content": f"Please show me only the pattern without anything."},
         {"role": "system", "content": "The pattern is as follows: "}
     ]
@@ -178,8 +183,8 @@ def main():
     test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
     test_other_dl = librispeech.test_dataloaders(test_other_cuts)
 
-    test_sets = ["train-small"]
-    test_dls = [train_small_dl]
+    test_sets = ["train-clean-100"]
+    test_dls = [train_clean_100_dl]
 
     client = create_client(port=params.port)
     llm_gen_db = LLMGenDB()
@@ -214,13 +219,15 @@ def main():
             with open(llm_gen_db_file, "wb") as f:
                 pickle.dump(llm_gen_db, f)
 
-            # testing load the DB from pickle
-            #with open(llm_gen_db_file, "rb") as f:
-            #    llm_gen_db_from_pickle = pickle.load(f)
-            #for key in llm_gen_db_from_pickle.entries.keys():
-            #    print("origin: " + llm_gen_db_from_pickle.get_origin(key))
-            #    print("generated: " + llm_gen_db_from_pickle.get_value(key))
-            #break
+            use_debug = False
+            if use_debug:
+                # testing load the DB from pickle
+                with open(llm_gen_db_file, "rb") as f:
+                    llm_gen_db_from_pickle = pickle.load(f)
+                for key in llm_gen_db_from_pickle.entries.keys():
+                    print("origin: " + llm_gen_db_from_pickle.get_origin(key))
+                    print("generated: " + llm_gen_db_from_pickle.get_value(key))
+                    print("wer: " + str(llm_gen_db_from_pickle.get_wer(key)))
 
 if __name__ == "__main__":
     main()
