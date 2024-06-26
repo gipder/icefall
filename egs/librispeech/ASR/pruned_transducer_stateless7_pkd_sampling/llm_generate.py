@@ -25,6 +25,7 @@ import re
 import os
 import pickle
 from jiwer import wer
+import getpass
 
 class LLMGenDict:
     def __init__(self, key, original_sentence, generated_sentence):
@@ -97,12 +98,21 @@ class LLMGenDB:
             return "LLMGenDB is empty."
         return "\n".join([str(entry) for entry in self.entries.values()])
 
-def create_client(port="1824") -> OpenAI:
-    # init the client but point it to TGI
-    client = OpenAI(
-        base_url=f"http://localhost:{port}/v1",
-        api_key="-"
-    )
+def create_client(port="1824",
+                  model="meta-llama/Meta-Llama-3-70B-Instruct") -> OpenAI:
+
+    if model == "gpt-4o" or model == "gpt-4" or model == "gpt-3.5-turbo":
+        apikey = getpass.getpass("Please enter your OpenAI API key: ")
+        client = OpenAI(
+            api_key=apikey
+        )
+
+    else:
+        # init the client but point it to TGI
+        client = OpenAI(
+            base_url=f"http://localhost:{port}/v1",
+            api_key="-"
+        )
 
     return client
 
@@ -110,7 +120,7 @@ def make_message(asr_label: str):
     message = [
         {"role": "system", "content": "You are an ASR expert."},
         {"role": "user", "content": f"Please generate ASR error pattern with WER 25% from this sentence, {asr_label}."},
-        {"role": "user", "content": f"Please show me only the pattern without anything."},
+        {"role": "user", "content": f"Please show me only the generated sentence without anything."},
         {"role": "system", "content": "The pattern is as follows: "}
     ]
 
@@ -150,6 +160,13 @@ def get_parser():
         help="Port number for a TGI server"
     )
 
+    parser.add_argument(
+        "--use-debug",
+        type=str2bool,
+        default=False,
+        help="Whether to use debug mode or not."
+    )
+
     return parser
 
 @torch.no_grad()
@@ -183,10 +200,13 @@ def main():
     test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
     test_other_dl = librispeech.test_dataloaders(test_other_cuts)
 
-    test_sets = ["train-clean-100"]
-    test_dls = [train_clean_100_dl]
+    #test_sets = ["train-clean-100"]
+    #test_dls = [train_clean_100_dl]
+    test_sets = ["train-small"]
+    test_dls = [train_small_dl]
 
-    client = create_client(port=params.port)
+    client = create_client(port=params.port,
+                           model=params.llm_model)
     llm_gen_db = LLMGenDB()
     logging.info("LLM Generating Start")
     idx = 0
@@ -219,7 +239,7 @@ def main():
             with open(llm_gen_db_file, "wb") as f:
                 pickle.dump(llm_gen_db, f)
 
-            use_debug = False
+            use_debug = params.use_debug
             if use_debug:
                 # testing load the DB from pickle
                 with open(llm_gen_db_file, "rb") as f:
@@ -228,6 +248,8 @@ def main():
                     print("origin: " + llm_gen_db_from_pickle.get_origin(key))
                     print("generated: " + llm_gen_db_from_pickle.get_value(key))
                     print("wer: " + str(llm_gen_db_from_pickle.get_wer(key)))
+                import sys
+                sys.exit(0)
 
 if __name__ == "__main__":
     main()
