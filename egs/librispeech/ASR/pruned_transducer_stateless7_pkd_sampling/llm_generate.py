@@ -189,7 +189,7 @@ def get_content(client, params, texts, n):
     content = clear_sentence(chat_completion.choices[0].message.content)
     return content
 
-def create_client_and_get_content(apikey, params, uid, text, n):
+def create_client_and_get_content(apikey, params, uid, text):
     client = create_client(port=params.port,
                            model=params.llm_model,
                            apikey=apikey)
@@ -202,6 +202,21 @@ def create_client_and_get_content(apikey, params, uid, text, n):
     #make the character uppercase and remove the leading and trailing whitespaces
     content = clear_sentence(chat_completion.choices[0].message.content)
     return content, uid, text
+
+def process_one_sample(apikey, params, uid, text, llm_gen_db):
+    client = create_client(port=params.port,
+                           model=params.llm_model,
+                           apikey=apikey)
+    message = make_message(text)
+    chat_completion = client.chat.completions.create(
+        model=params.llm_model,
+        messages=message,
+        stream=False,
+    )
+    #make the character uppercase and remove the leading and trailing whitespaces
+    content = clear_sentence(chat_completion.choices[0].message.content)
+
+    llm_gen_db.add_entry(uid, text, content)
 
 @torch.no_grad()
 def main():
@@ -220,7 +235,10 @@ def main():
     setup_logger(f"{params.res_dir}/log-llm-generate")
 
     if params.llm_model == "gpt-4o" or params.llm_model == "gpt-4" or params.llm_model == "gpt-3.5-turbo":
-        apikey = getpass.getpass("Please enter your OpenAI API key: ")
+        if os.environ.get("OPENAI_API_KEY") is None:
+            apikey = getpass.getpass("Please enter your OpenAI API key: ")
+        else:
+            apikey = os.environ.get("OPENAI_API_KEY")
     else:
         if params.use_multiprocessing is True:
             logging.error("Multiprocessing is not supported with TGI. Please set use_multiprocessing to False.")
@@ -243,10 +261,10 @@ def main():
     test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
     test_other_dl = librispeech.test_dataloaders(test_other_cuts)
 
-    #test_sets = ["train-clean-100"]
-    #test_dls = [train_clean_100_dl]
-    test_sets = ["train-small"]
-    test_dls = [train_small_dl]
+    test_sets = ["train-clean-100"]
+    test_dls = [train_clean_100_dl]
+    #test_sets = ["train-small"]
+    #test_dls = [train_small_dl]
 
     if params.use_multiprocessing is False:
         client = create_client(port=params.port,
@@ -266,6 +284,7 @@ def main():
         # if the file already exists, then delete it
         if os.path.exists(llm_gen_db_file):
             os.remove(llm_gen_db_file)
+            logging.info(f"File {llm_gen_db_file} already exists. Deleting it.")
 
         with executor_context as executor:
             futures = []
@@ -278,14 +297,14 @@ def main():
                                                        apikey,
                                                        params,
                                                        cuts[n].id,
-                                                       texts[n],
-                                                       n))
-
+                                                       texts[n]))
                     concurrent.futures.wait(futures)
                     for future in futures:
                         content, cuts_id, text = future.result()
                         llm_gen_db.add_entry(cuts_id, text, content)
                         idx += 1
+                    futures.clear()
+
                 else:
                     for n in range(len(texts)):
                         content = get_content(client, params, texts, n)
@@ -293,12 +312,14 @@ def main():
                         idx += 1
 
                 if params.use_debug:
+                    logging.info(f"Debugging")
                     with open(llm_gen_db_file, "wb") as f:
                         pickle.dump(llm_gen_db, f)
                     # testing load the DB from pickle
                     with open(llm_gen_db_file, "rb") as f:
                         llm_gen_db_from_pickle = pickle.load(f)
                     for key in llm_gen_db_from_pickle.entries.keys():
+                        print("key: " + key)
                         print("origin: " + llm_gen_db_from_pickle.get_origin(key))
                         print("generated: " + llm_gen_db_from_pickle.get_value(key))
                         print("wer: " + str(llm_gen_db_from_pickle.get_wer(key)))
