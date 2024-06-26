@@ -26,6 +26,8 @@ import os
 import pickle
 from jiwer import wer
 import getpass
+import concurrent.futures
+from contextlib import nullcontext
 
 class LLMGenDict:
     def __init__(self, key, original_sentence, generated_sentence):
@@ -99,10 +101,10 @@ class LLMGenDB:
         return "\n".join([str(entry) for entry in self.entries.values()])
 
 def create_client(port="1824",
-                  model="meta-llama/Meta-Llama-3-70B-Instruct") -> OpenAI:
+                  model="meta-llama/Meta-Llama-3-70B-Instruct",
+                  apikey=None) -> OpenAI:
 
     if model == "gpt-4o" or model == "gpt-4" or model == "gpt-3.5-turbo":
-        apikey = getpass.getpass("Please enter your OpenAI API key: ")
         client = OpenAI(
             api_key=apikey
         )
@@ -167,7 +169,39 @@ def get_parser():
         help="Whether to use debug mode or not."
     )
 
+    parser.add_argument(
+        "--use-multiprocessing",
+        type=str2bool,
+        default=False,
+        help="Whether to use multiprocessing or not."
+    )
+
     return parser
+
+def get_content(client, params, texts, n):
+    message = make_message(texts[n])
+    chat_completion = client.chat.completions.create(
+        model=params.llm_model,
+        messages=message,
+        stream=False
+    )
+    #make the character uppercase and remove the leading and trailing whitespaces
+    content = clear_sentence(chat_completion.choices[0].message.content)
+    return content
+
+def create_client_and_get_content(apikey, params, uid, text, n):
+    client = create_client(port=params.port,
+                           model=params.llm_model,
+                           apikey=apikey)
+    message = make_message(text)
+    chat_completion = client.chat.completions.create(
+        model=params.llm_model,
+        messages=message,
+        stream=False,
+    )
+    #make the character uppercase and remove the leading and trailing whitespaces
+    content = clear_sentence(chat_completion.choices[0].message.content)
+    return content, uid, text
 
 @torch.no_grad()
 def main():
@@ -183,9 +217,15 @@ def main():
     params.res_dir = params.exp_dir / f"log-{decoding_method}"
 
     # already append the time information
-    #now = datetime.now()
-    #time_str = now.strftime("%Y-%m-%d-%H-%M-%S")
     setup_logger(f"{params.res_dir}/log-llm-generate")
+
+    if params.llm_model == "gpt-4o" or params.llm_model == "gpt-4" or params.llm_model == "gpt-3.5-turbo":
+        apikey = getpass.getpass("Please enter your OpenAI API key: ")
+    else:
+        apikey = None
+
+    # for debugging
+    debug_idx = 0
 
     args.return_cuts = True
     librispeech = LibriSpeechAsrDataModule(args)
@@ -205,51 +245,71 @@ def main():
     test_sets = ["train-small"]
     test_dls = [train_small_dl]
 
-    client = create_client(port=params.port,
-                           model=params.llm_model)
+    if params.use_multiprocessing is False:
+        client = create_client(port=params.port,
+                               model=params.llm_model,
+                               apikey=apikey)
+
     llm_gen_db = LLMGenDB()
     logging.info("LLM Generating Start")
     idx = 0
+
+    executor_context = concurrent.futures.ProcessPoolExecutor() if params.use_multiprocessing else nullcontext()
+
     for test_set, test_dl in zip(test_sets, test_dls):
         logging.info(f"LLM Generating {test_set}")
-        for batch_idx, batch in enumerate(test_dl):
-            texts = batch["supervisions"]["text"]
-            cuts = batch["supervisions"]["cut"]
-            message = make_message(texts[0])
-            for n in range(len(texts)):
-                message = make_message(texts[n])
-                chat_completion = client.chat.completions.create(
-                    model=params.llm_model,
-                    messages=message,
-                    stream=False
-                )
-                #make the character uppercase and remove the leading and trailing whitespaces
-                content = clear_sentence(chat_completion.choices[0].message.content)
-                llm_gen_db.add_entry(cuts[n].id, texts[n], content)
-                idx += 1
+        # testing save the DB in pickle
+        llm_gen_db_file = f"{params.res_dir}/llm_gen_db.{test_set}.{os.path.basename(params.llm_model)}.pkl"
+        # if the file already exists, then delete it
+        if os.path.exists(llm_gen_db_file):
+            os.remove(llm_gen_db_file)
 
-            if batch_idx % 100 == 0:
-                logging.info(f"Batch {batch_idx} is done. {idx} samples are done.")
-            # testing save the DB in pickle
-            llm_gen_db_file = f"{params.res_dir}/llm_gen_db.{os.path.basename(params.llm_model)}.pkl"
-            # if the file already exists, then delete it
-            if os.path.exists(llm_gen_db_file):
-                os.remove(llm_gen_db_file)
+        with executor_context as executor:
+            futures = []
+            for batch_idx, batch in enumerate(test_dl):
+                texts = batch["supervisions"]["text"]
+                cuts = batch["supervisions"]["cut"]
+                if params.use_multiprocessing:
+                    for n in range(len(texts)):
+                        futures.append(executor.submit(create_client_and_get_content,
+                                                       apikey,
+                                                       params,
+                                                       cuts[n].id,
+                                                       texts[n],
+                                                       n))
+
+                    concurrent.futures.wait(futures)
+                    for future in futures:
+                        content, cuts_id, text = future.result()
+                        llm_gen_db.add_entry(cuts_id, text, content)
+                        idx += 1
+                else:
+                    for n in range(len(texts)):
+                        content = get_content(client, params, texts, n)
+                        llm_gen_db.add_entry(cuts[n].id, texts[n], content)
+                        idx += 1
+
+                if params.use_debug:
+                    with open(llm_gen_db_file, "wb") as f:
+                        pickle.dump(llm_gen_db, f)
+                    # testing load the DB from pickle
+                    with open(llm_gen_db_file, "rb") as f:
+                        llm_gen_db_from_pickle = pickle.load(f)
+                    for key in llm_gen_db_from_pickle.entries.keys():
+                        print("origin: " + llm_gen_db_from_pickle.get_origin(key))
+                        print("generated: " + llm_gen_db_from_pickle.get_value(key))
+                        print("wer: " + str(llm_gen_db_from_pickle.get_wer(key)))
+                    if debug_idx == 2:
+                        import sys
+                        sys.exit(0)
+                    debug_idx += 1
+
+                if batch_idx % 100 == 0:
+                    logging.info(f"Batch {batch_idx} is done. {idx} samples are done.")
 
             with open(llm_gen_db_file, "wb") as f:
                 pickle.dump(llm_gen_db, f)
 
-            use_debug = params.use_debug
-            if use_debug:
-                # testing load the DB from pickle
-                with open(llm_gen_db_file, "rb") as f:
-                    llm_gen_db_from_pickle = pickle.load(f)
-                for key in llm_gen_db_from_pickle.entries.keys():
-                    print("origin: " + llm_gen_db_from_pickle.get_origin(key))
-                    print("generated: " + llm_gen_db_from_pickle.get_value(key))
-                    print("wer: " + str(llm_gen_db_from_pickle.get_wer(key)))
-                import sys
-                sys.exit(0)
 
 if __name__ == "__main__":
     main()
