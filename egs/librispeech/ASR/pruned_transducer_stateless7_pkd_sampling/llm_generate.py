@@ -222,6 +222,9 @@ def main():
     if params.llm_model == "gpt-4o" or params.llm_model == "gpt-4" or params.llm_model == "gpt-3.5-turbo":
         apikey = getpass.getpass("Please enter your OpenAI API key: ")
     else:
+        if params.use_multiprocessing is True:
+            logging.error("Multiprocessing is not supported with TGI. Please set use_multiprocessing to False.")
+            return
         apikey = None
 
     # for debugging
