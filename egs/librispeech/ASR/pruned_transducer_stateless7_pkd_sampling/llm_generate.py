@@ -195,6 +195,13 @@ def get_parser():
         help="How many process will be used when use-multiprocessing is True."
     )
 
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=1000,
+        help="How frequently we save the model to disk."
+    )
+
     return parser
 
 def get_content(client, params, texts, n):
@@ -222,37 +229,7 @@ def create_client_and_get_content(apikey, params, uid, text):
     content = clear_sentence(chat_completion.choices[0].message.content)
     return content, uid, text
 
-def process_one_sample(apikey, params, uid, text, llm_gen_db):
-    client = create_client(port=params.port,
-                           model=params.llm_model,
-                           apikey=apikey)
-    message = make_message(text)
-    chat_completion = client.chat.completions.create(
-        model=params.llm_model,
-        messages=message,
-        stream=False,
-    )
-    #make the character uppercase and remove the leading and trailing whitespaces
-    content = clear_sentence(chat_completion.choices[0].message.content)
-
-    llm_gen_db.add_entry(uid, text, content)
-
 def process_multi_samples(executor, num_processes, futures, apikey, params, cuts, texts, llm_gen_db):
-    #        if cuts[n].id in llm_gen_db_keys:
-    #            logging.info(f"Skipping {cuts[n].id}")
-    #            continue
-    #        futures.append(executor.submit(create_client_and_get_content,
-    #                                       apikey,
-    #                                       params,
-    #                                       cuts[n].id,
-    #                                       texts[n]))
-    #    concurrent.futures.wait(futures)
-    #    for future in futures:
-    #        content, cuts_id, text = future.result()
-    #        llm_gen_db.add_entry(cuts_id, text, content)
-    #        idx += 1
-    #    futures.clear()
-    #if futures is not clear, then clear it
     idx = 0
     if len(futures) > 0:
         futures.clear()
@@ -332,6 +309,7 @@ def main():
     llm_gen_db = LLMGenDB()
     logging.info("LLM Generating Start")
     idx = 0
+    save_interval = params.save_interval
 
     executor_context = concurrent.futures.ProcessPoolExecutor() if params.use_multiprocessing else nullcontext()
 
@@ -383,6 +361,7 @@ def main():
                         print("origin: " + llm_gen_db_from_pickle.get_origin(key))
                         print("generated: " + llm_gen_db_from_pickle.get_value(key))
                         print("wer: " + str(llm_gen_db_from_pickle.get_wer(key)))
+                    print("num samples: " + str(len(llm_gen_db_from_pickle.entries)))
                     if debug_idx == 2:
                         import sys
                         sys.exit(0)
@@ -391,9 +370,16 @@ def main():
                 if batch_idx % 100 == 0:
                     logging.info(f"Batch {batch_idx} is done. {idx} samples are done.")
 
-            with open(llm_gen_db_file, "wb") as f:
-                pickle.dump(llm_gen_db, f)
+                if idx > save_interval:
+                    logging.info(f"Saving the DB to {llm_gen_db_file}. {idx} samples are done.")
+                    with open(llm_gen_db_file, "wb") as f:
+                        pickle.dump(llm_gen_db, f)
+                    save_interval += params.save_interval
 
+            # final save
+            with open(llm_gen_db_file, "wb") as f:
+                logging.info(f"Saving the DB to {llm_gen_db_file}. {idx} samples are done.")
+                pickle.dump(llm_gen_db, f)
 
 if __name__ == "__main__":
     main()
