@@ -44,8 +44,9 @@ class LLMGenDict:
 
 
 class LLMGenDB:
-    def __init__(self):
+    def __init__(self, model=""):
         self.entries = {}  # LLMGenDict 객체들을 저장할 딕셔너리
+        self.model = model
 
     def keys(self):
         return self.entries.keys()
@@ -89,6 +90,9 @@ class LLMGenDB:
     def get_wer(self, key):
         return self.entries[key].wer
 
+    def get_model(self):
+        return self.model
+
     def delete_entry(self, key):
         if key in self.entries:
             del self.entries[key]
@@ -96,6 +100,7 @@ class LLMGenDB:
             print(f"Entry with key '{key}' not found.")
 
     def __str__(self):
+        print(f"Model: {self.model}")
         if not self.entries:
             return "LLMGenDB is empty."
         return "\n".join([str(entry) for entry in self.entries.values()])
@@ -104,7 +109,7 @@ def create_client(port="1824",
                   model="meta-llama/Meta-Llama-3-70B-Instruct",
                   apikey=None) -> OpenAI:
 
-    if model == "gpt-4o" or model == "gpt-4" or model == "gpt-3.5-turbo":
+    if model.startswith("gpt-"):
         client = OpenAI(
             api_key=apikey
         )
@@ -176,6 +181,20 @@ def get_parser():
         help="Whether to use multiprocessing or not."
     )
 
+    parser.add_argument(
+        "--delete-existing-db",
+        type=str2bool,
+        default=False,
+        help="Whether to delete the existing DB or not."
+    )
+
+    parser.add_argument(
+        "--num-processes",
+        type=int,
+        default=1,
+        help="How many process will be used when use-multiprocessing is True."
+    )
+
     return parser
 
 def get_content(client, params, texts, n):
@@ -218,6 +237,45 @@ def process_one_sample(apikey, params, uid, text, llm_gen_db):
 
     llm_gen_db.add_entry(uid, text, content)
 
+def process_multi_samples(executor, num_processes, futures, apikey, params, cuts, texts, llm_gen_db):
+    #        if cuts[n].id in llm_gen_db_keys:
+    #            logging.info(f"Skipping {cuts[n].id}")
+    #            continue
+    #        futures.append(executor.submit(create_client_and_get_content,
+    #                                       apikey,
+    #                                       params,
+    #                                       cuts[n].id,
+    #                                       texts[n]))
+    #    concurrent.futures.wait(futures)
+    #    for future in futures:
+    #        content, cuts_id, text = future.result()
+    #        llm_gen_db.add_entry(cuts_id, text, content)
+    #        idx += 1
+    #    futures.clear()
+    #if futures is not clear, then clear it
+    idx = 0
+    if len(futures) > 0:
+        futures.clear()
+    for n in range(0, len(cuts), num_processes):
+        for p in range(num_processes):
+            if n + p >= len(cuts):
+                break
+            if cuts[n+p].id in llm_gen_db.keys():
+                logging.info(f"Skipping {cuts[n+p].id}")
+                continue
+            futures.append(executor.submit(create_client_and_get_content,
+                                           apikey,
+                                           params,
+                                           cuts[n+p].id,
+                                           texts[n+p]))
+        concurrent.futures.wait(futures)
+        for future in futures:
+            content, cuts_id, text = future.result()
+            llm_gen_db.add_entry(cuts_id, text, content)
+            idx += 1
+        futures.clear()
+    return idx
+
 @torch.no_grad()
 def main():
     parser = get_parser()
@@ -234,7 +292,7 @@ def main():
     # already append the time information
     setup_logger(f"{params.res_dir}/log-llm-generate")
 
-    if params.llm_model == "gpt-4o" or params.llm_model == "gpt-4" or params.llm_model == "gpt-3.5-turbo":
+    if params.llm_model.startswith("gpt-"):
         if os.environ.get("OPENAI_API_KEY") is None:
             apikey = getpass.getpass("Please enter your OpenAI API key: ")
         else:
@@ -282,9 +340,17 @@ def main():
         # testing save the DB in pickle
         llm_gen_db_file = f"{params.res_dir}/llm_gen_db.{test_set}.{os.path.basename(params.llm_model)}.pkl"
         # if the file already exists, then delete it
-        if os.path.exists(llm_gen_db_file):
+        if params.delete_existing_db and os.path.exists(llm_gen_db_file):
             os.remove(llm_gen_db_file)
             logging.info(f"File {llm_gen_db_file} already exists. Deleting it.")
+        else:
+            if os.path.exists(llm_gen_db_file):
+                logging.info(f"File {llm_gen_db_file} already exists. Loading it.")
+                with open(llm_gen_db_file, "rb") as f:
+                    llm_gen_db = pickle.load(f)
+                num_samples = len(llm_gen_db.entries)
+                logging.info(f"Loaded {num_samples} samples.")
+                llm_gen_db_keys = llm_gen_db.keys()
 
         with executor_context as executor:
             futures = []
@@ -292,21 +358,15 @@ def main():
                 texts = batch["supervisions"]["text"]
                 cuts = batch["supervisions"]["cut"]
                 if params.use_multiprocessing:
-                    for n in range(len(texts)):
-                        futures.append(executor.submit(create_client_and_get_content,
-                                                       apikey,
-                                                       params,
-                                                       cuts[n].id,
-                                                       texts[n]))
-                    concurrent.futures.wait(futures)
-                    for future in futures:
-                        content, cuts_id, text = future.result()
-                        llm_gen_db.add_entry(cuts_id, text, content)
-                        idx += 1
-                    futures.clear()
-
+                    idx += process_multi_samples(executor,
+                                                 params.num_processes,
+                                                 futures, apikey, params,
+                                                 cuts, texts, llm_gen_db)
                 else:
                     for n in range(len(texts)):
+                        if cuts[n].id in llm_gen_db_keys:
+                            logging.info(f"Skipping {cuts[n].id}")
+                            continue
                         content = get_content(client, params, texts, n)
                         llm_gen_db.add_entry(cuts[n].id, texts[n], content)
                         idx += 1
