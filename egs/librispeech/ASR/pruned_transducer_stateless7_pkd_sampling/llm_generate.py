@@ -319,13 +319,13 @@ def main():
 
     llm_gen_db = LLMGenDB(model=params.llm_model, wer=params.wer)
     logging.info("LLM Generating Start")
-    idx = 0
     save_interval = params.save_interval
 
     executor_context = concurrent.futures.ProcessPoolExecutor() if params.use_multiprocessing else nullcontext()
 
     for test_set, test_dl in zip(test_sets, test_dls):
         logging.info(f"LLM Generating {test_set}")
+        idx = 0
         # testing save the DB in pickle
         llm_gen_db_file = f"{params.res_dir}/llm_gen_db.{test_set}.wer{params.wer}.{os.path.basename(params.llm_model)}.pkl"
         # if the file already exists, then delete it
@@ -340,6 +340,7 @@ def main():
                 num_samples = len(llm_gen_db.entries)
                 logging.info(f"Loaded {num_samples} samples.")
                 llm_gen_db_keys = llm_gen_db.keys()
+                idx += num_samples
 
         with executor_context as executor:
             futures = []
