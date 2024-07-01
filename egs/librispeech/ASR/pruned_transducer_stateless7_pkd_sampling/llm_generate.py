@@ -323,6 +323,7 @@ def main():
 
     executor_context = concurrent.futures.ProcessPoolExecutor() if params.use_multiprocessing else nullcontext()
 
+    llm_gen_db_keys = list()
     for test_set, test_dl in zip(test_sets, test_dls):
         logging.info(f"LLM Generating {test_set}")
         idx = 0
