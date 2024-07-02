@@ -1304,18 +1304,14 @@ def compute_loss(
                 sampling_y.append(k2.RaggedTensor(yy).to(device))
                 # the yy is the less probable label sequence
 
-                # original working code
-                if use_sq_simple_loss_range is True:
-                    pass
-                else:
-                    sampling_ret = teacher_model.get_logits_with_encoder_out(
-                        encoder_out=teacher_encoder_out,
-                        encoder_out_lens=teacher_encoder_out_lens,
-                        y=sampling_y[-1],
-                        use_grad=False,
-                    )
+                sampling_ret = teacher_model.get_logits_with_encoder_out(
+                    encoder_out=teacher_encoder_out,
+                    encoder_out_lens=teacher_encoder_out_lens,
+                    y=sampling_y[-1],
+                    use_grad=False,
+                )
 
-                    teacher_sampling_logits.append(sampling_ret)
+                teacher_sampling_logits.append(sampling_ret)
 
     with torch.set_grad_enabled(is_training):
         org_loss = torch.tensor(0.0, device=device)
