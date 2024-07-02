@@ -535,6 +535,14 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--use-topk-shuff",
+        type=str2bool,
+        default=False,
+        help="intead of using nbest at once, it uses only one sample at once,"
+        "and it shuffles the nbest results and use a different hypothesis every epoch",
+    )
+
+    parser.add_argument(
         "--use-sequence",
         type=str2bool,
         default=False,
@@ -576,6 +584,12 @@ def get_parser():
         help="The range when using use_pruned, default is 5",
     )
 
+    parser.add_argument(
+        "--use-sq-simple-loss-range",
+        type=str2bool,
+        default=False,
+        help="Whether to use sample loss in pruned RNN-T to get ranges of logits",
+    )
     add_model_arguments(parser)
 
     return parser
@@ -835,6 +849,7 @@ def compute_loss(
     is_training: bool,
     teacher_model: Optional[Union[nn.Module, DDP]] = None,
     hyp_cache: dict = None,
+    epoch: int = 0,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute transducer loss given the model and its inputs.
@@ -897,6 +912,7 @@ def compute_loss(
         use_teacher_simple_proj = False
         use_beam_search = False
         use_sq_sampling = False
+        use_sq_simple_loss_range = False
         sq_sampling_num = 0
     else:
         use_kd = params.use_kd
@@ -904,6 +920,7 @@ def compute_loss(
         use_beam_search = params.use_beam_search
         use_sq_sampling = params.use_sq_sampling
         sq_sampling_num = params.sq_sampling_num
+        use_sq_simple_loss_range = params.use_sq_simple_loss_range
 
     if use_beam_search:
         from beam_search import (
@@ -919,7 +936,7 @@ def compute_loss(
             ids.append(batch["supervisions"]['cut'][i].id)
 
         import math
-        if params.use_1best:
+        if params.use_1best or params.use_pruned:
             # the original working code
             with torch.no_grad():
                 all_in_cache = True
@@ -1024,7 +1041,7 @@ def compute_loss(
 
                 beam_search_alignment = alignment.to(device)
 
-        elif params.use_nbest:
+        elif params.use_nbest and not params.use_topk_shuff:
             with torch.no_grad():
                 all_in_cache = True
                 if hyp_cache is not None:
@@ -1115,17 +1132,105 @@ def compute_loss(
                     beam_search_alignment = alignment.to(device)
                     nbest_beam_search_alignment.append(beam_search_alignment)
 
+        elif params.use_nbest and params.use_topk_shuff:
+            # when using random shuff
+            with torch.no_grad():
+                all_in_cache = True
+                if hyp_cache is not None:
+                    for i in range(len(ids)):
+                        if hyp_cache.get(ids[i]) is None:
+                            all_in_cache = False
+                            break
+                if all_in_cache is False:
+                    print("Cache miss!")
+                    print(f"{ids=}")
+                    import os
+                    os.exit(1)
+
+                #print("Cache hit!")
+                #print(f"{hyp_cache[ids[i]]=}")
+                assert not (params.use_1best and params.use_nbest)
+                assert not (params.use_1best and params.use_pruned)
+
+                # check whether the length of hyp and the length of batch are the same
+                #print(f"{feature_lens.size()[0]=}")
+                #nbest_beam_search_alignment = list()
+                #nbest_pseudo_y = list()
+                # extract random number within the range of topk
+                #random_topk = random.randint(0, params.topk-1)
+                random_topk = epoch % params.topk
+                r = random_topk
+                for i in range(feature_lens.size()[0]):
+                    # feature lens to encoder lens
+                    encoder_len = math.ceil((feature_lens[i]-8)/4)
+                    if r >= len(hyp_cache[ids[i]]):
+                        r = len(hyp_cache[ids[i]]) - 1
+                    hyp_len = len(hyp_cache[ids[i]][r])
+                    if hyp_len != encoder_len:
+                        tmp_hyp = hyp_cache[ids[i]][r]
+                        # case 1. hyp_cache[ids[i]] is shorter than encoder_lens
+                        if hyp_len < encoder_len:
+                            hyp_cache[ids[i]][r] = tmp_hyp.extend([0]*(encoder_len-hyp_len))
+                        # case 2. hyp_cache[ids[i]] is longer than encoder_lens
+                        if hyp_len > encoder_len:
+                            hyp_cache[ids[i]][r] = tmp_hyp[:encoder_len]
+
+                # loading hyp_tokens from cache
+                hyp_tokens = list()
+                for i in range(len(ids)):
+                    hyp_tokens.append(hyp_cache[ids[i]][r])
+
+                # make pseudo labels
+                pseudo_labels = list()
+                for i in range(len(hyp_tokens)):
+                    tmp_pseudo_label = [ t for t in hyp_tokens[i] if t != 0 ]
+                    pseudo_labels.append(tmp_pseudo_label)
+
+                # don't need
+                # remove duplicated labels with maintaing order
+                # convert list(list()) to k2.RaggedTensor
+                pseudo_y = k2.RaggedTensor(pseudo_labels).to(device)
+                # nbest_pseudo_y.append(pseudo_y)
+
+                # I didn't copy the pseudo_y to y
+                y = pseudo_y.clone()
+
+                # first, check if the first token is blank
+                for i in range(len(hyp_tokens)):
+                    if hyp_tokens[i][0] != 0:
+                        hyp_tokens[i][1:] = hyp_tokens[i][:-1] # shift to right
+                        hyp_tokens[i][0] = 0
+                # get max length of hyp_tokens
+                max_len = 0
+                for i in range(len(hyp_tokens)):
+                    if max_len < len(hyp_tokens[i]):
+                        max_len = len(hyp_tokens[i])
+                alignment = torch.zeros((len(hyp_tokens), max_len), dtype=torch.int32)
+
+                # get pseudo_y_sequence
+                pseudo_y_sequence = alignment.clone().to(device)
+                for i in range(len(hyp_tokens)):
+                    pseudo_y_sequence[i, :len(hyp_tokens[i])] = torch.tensor(hyp_tokens[i], dtype=torch.int32)
+
+                # remove duplicated labels in hyp_tokens
+                # and convert the sequence to monotonic increasing sequence
+                for i in range(len(hyp_tokens)):
+                    mask = (torch.tensor(hyp_tokens[i], dtype=torch.bool) != 0)
+                    alignment[i, :len(hyp_tokens[i])] = torch.cumsum(mask.int(), dim=-1, dtype=torch.int32)
+
+                beam_search_alignment = alignment.to(device)
+                #nbest_beam_search_alignment.append(beam_search_alignment)
+
     # initialize teacher sampling y and logits
     sampling_y = None
     teacher_sampling_logits = None
 
     if use_kd:
-        if params.use_1best:
+        if params.use_1best or params.use_pruned:
             with torch.no_grad():
                 teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
                     x=feature,
                     x_lens=feature_lens,
-                    y=y,
                     use_grad=False,
                 )
 
@@ -1137,17 +1242,17 @@ def compute_loss(
                 )
 
             teacher_logits = ret
-        elif params.use_nbest:
+        elif params.use_nbest and not params.use_topk_shuff:
             nbest_teacher_logits = list()
+            with torch.no_grad():
+                # refactoring, because y is not necessary
+                teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
+                    x=feature,
+                    x_lens=feature_lens,
+                    use_grad=False,
+                )
             for n in range(params.topk):
                 with torch.no_grad():
-                    teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
-                        x=feature,
-                        x_lens=feature_lens,
-                        y=nbest_pseudo_y[n],
-                        use_grad=False,
-                    )
-
                     ret = teacher_model.get_logits_with_encoder_out(
                         encoder_out=teacher_encoder_out,
                         encoder_out_lens=teacher_encoder_out_lens,
@@ -1157,6 +1262,25 @@ def compute_loss(
 
                 teacher_logits = ret
                 nbest_teacher_logits.append(teacher_logits)
+        elif params.use_nbest and params.use_topk_shuff:
+            #nbest_teacher_logits = list()
+            with torch.no_grad():
+                teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
+                    x=feature,
+                    x_lens=feature_lens,
+                    y=pseudo_y,
+                    use_grad=False,
+                )
+
+                ret = teacher_model.get_logits_with_encoder_out(
+                    encoder_out=teacher_encoder_out,
+                    encoder_out_lens=teacher_encoder_out_lens,
+                    y=pseudo_y,
+                    use_grad=False,
+                )
+
+            teacher_logits = ret
+            #nbest_teacher_logits.append(teacher_logits)
             #print(f"{nbest_beam_search_alignment=}")
             #print(f"{nbest_pseudo_y=}")
             #print(f"{nbest_teacher_logits=}")
@@ -1180,14 +1304,18 @@ def compute_loss(
                 sampling_y.append(k2.RaggedTensor(yy).to(device))
                 # the yy is the less probable label sequence
 
-                sampling_ret = teacher_model.get_logits_with_encoder_out(
-                    encoder_out=teacher_encoder_out,
-                    encoder_out_lens=teacher_encoder_out_lens,
-                    y=sampling_y[-1],
-                    use_grad=False,
-                )
+                # original working code
+                if use_sq_simple_loss_range is True:
+                    pass
+                else:
+                    sampling_ret = teacher_model.get_logits_with_encoder_out(
+                        encoder_out=teacher_encoder_out,
+                        encoder_out_lens=teacher_encoder_out_lens,
+                        y=sampling_y[-1],
+                        use_grad=False,
+                    )
 
-                teacher_sampling_logits.append(sampling_ret)
+                    teacher_sampling_logits.append(sampling_ret)
 
     with torch.set_grad_enabled(is_training):
         org_loss = torch.tensor(0.0, device=device)
@@ -1210,11 +1338,13 @@ def compute_loss(
             pseudo_y_alignment=beam_search_alignment,
             nbest_pseudo_y_alignment=nbest_beam_search_alignment,
             topk=params.topk,
+            use_topk_shuff=params.use_topk_shuff,
             use_sq_sampling=use_sq_sampling,
             sampling_y=sampling_y,
             teacher_sampling_logits=teacher_sampling_logits,
             sq_sampling_num=sq_sampling_num,
             pruned_range=params.pruned_range,
+            use_sq_simple_loss_range=use_sq_simple_loss_range,
         )
 
     kd_loss_scale = params.kd_loss_scale
@@ -1298,6 +1428,7 @@ def train_one_epoch(
     rank: int = 0,
     teacher_model: Optional[nn.Module] = None,
     hyp_cache: dict = None,
+    epoch: int = 0,
 ) -> None:
     """Train the model for one epoch.
 
@@ -1354,6 +1485,7 @@ def train_one_epoch(
                     is_training=True,
                     teacher_model=teacher_model,
                     hyp_cache=hyp_cache,
+                    epoch=epoch,
                 )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
@@ -1723,6 +1855,7 @@ def run(rank, world_size, args):
             rank=rank,
             teacher_model=teacher_model,
             hyp_cache=hyp_cache,
+            epoch=epoch,
         )
 
         if params.print_diagnostics:
