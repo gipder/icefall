@@ -91,6 +91,10 @@ from icefall.utils import (
 )
 
 import math
+import os
+import sys
+import pickle
+from my_utils import make_nbest_alignment
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -397,17 +401,17 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--use-pkd",
+        "--use-kd",
         type=str2bool,
         default=False,
-        help="Whether to use knowledge distillation.",
+        help="Whether to use Knowledge Distillation (KD) training.",
     )
 
     parser.add_argument(
-        "--pkd-loss-scale",
+        "--kd-loss-scale",
         type=float,
         default=0.5,
-        help="The scale for pruned knowledge distillation loss.",
+        help="The scale for knowledge distillation loss.",
     )
 
     parser.add_argument(
@@ -488,34 +492,6 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--pkd-range",
-        type=int,
-        default=5,
-        help="The prune range for pkd loss when using teacher ctc alignment.",
-    )
-
-    parser.add_argument(
-        "--use-time-compression",
-        type=str2bool,
-        default=False,
-        help="Whether to use time compression",
-    )
-
-    parser.add_argument(
-        "--time-compression-threshold",
-        type=float,
-        default=0.95,
-        help="The threshold when using time compression",
-    )
-
-    parser.add_argument(
-        "--use-teacher-simple-proj",
-        type=str2bool,
-        default=False,
-        help="Whether to update simple projection layers of teacher model",
-    )
-
-    parser.add_argument(
         "--use-beam-search",
         type=str2bool,
         default=False,
@@ -544,6 +520,42 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--use-1best",
+        type=str2bool,
+        default=False,
+        help="Whether to use 1best when doing knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--use-nbest",
+        type=str2bool,
+        default=False,
+        help="Whether to use n-1best(4-best) when doing knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--topk",
+        type=int,
+        default=1,
+        help="How many nbest results we use when doing knowledge distillation",
+    )
+
+    parser.add_argument(
+        "--use-topk-shuff",
+        type=str2bool,
+        default=False,
+        help="intead of using nbest at once, it uses only one sample at once,"
+        "and it shuffles the nbest results and use a different hypothesis every epoch",
+    )
+
+    parser.add_argument(
+        "--use-pruned",
+        type=str2bool,
+        default=False,
+        help="Whether to use pruned KD",
+    )
+
+    parser.add_argument(
         "--use-sq-sampling",
         type=str2bool,
         default=False,
@@ -564,6 +576,19 @@ def get_parser():
         help="ratio between sampling loss and kd_loss, default is 1",
     )
 
+    parser.add_argument(
+        "--pruned-kd-range",
+        type=int,
+        default=5,
+        help="The range when using use_pruned, default is 5",
+    )
+
+    parser.add_argument(
+        "--use-sq-simple-loss-range",
+        type=str2bool,
+        default=False,
+        help="Whether to use sample loss in pruned RNN-T to get ranges of logits",
+    )
     add_model_arguments(parser)
 
     return parser
@@ -823,6 +848,7 @@ def compute_loss(
     is_training: bool,
     teacher_model: Optional[Union[nn.Module, DDP]] = None,
     hyp_cache: dict = None,
+    epoch: int = 0,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute transducer loss given the model and its inputs.
@@ -872,227 +898,58 @@ def compute_loss(
     if isinstance(teacher_model, DDP):
         teacher_model = teacher_model.module
 
-    teacher_ranges = None
     teacher_logits = None
-    teacher_compressed_ranges = None
-    teacher_compressed_logits = None
-    teacher_compressed_masks = None
+    nbest_teacher_logits = None
+    pseudo_y = None
+    nbest_pseudo_y = None
+    beam_search_alignment = None
+    nbest_beam_search_alignment = None
+    pseudo_y_sequence = None
 
     if teacher_model is None:
-        use_pkd = False
-        use_teacher_simple_proj = False
+        use_kd = False
         use_beam_search = False
         use_sq_sampling = False
+        use_sq_simple_loss_range = False
         sq_sampling_num = 0
     else:
-        use_pkd = params.use_pkd
-        use_teacher_simple_proj = params.use_teacher_simple_proj
+        use_kd = params.use_kd
         use_beam_search = params.use_beam_search
         use_sq_sampling = params.use_sq_sampling
+        use_sq_simple_loss_range = params.use_sq_simple_loss_range
         sq_sampling_num = params.sq_sampling_num
 
-    beam_search_alignment = None
     if use_beam_search:
         from beam_search import (
             modified_beam_search,
             modified_beam_search_for_kd,
             Hypothesis,
-            HypothesisList
+            HypothesisList,
         )
         from icefall.utils import add_sos
 
-        # getting beam search results and making pseudo labels
-        # beam search
-        # There is a problem with how to get the logits of the teacher model.
-        # option 1. from modified_beam_search
-        #
-        # option 2. from usual training process
-        #print(f"{batch=}")
-        ids = list()
-        #print(f"{batch['supervisions']['cut'][0].id=}")
-        for i in range(len(batch["supervisions"]['cut'])):
-            ids.append(batch["supervisions"]['cut'][i].id)
+        assert not (params.use_1best and params.use_nbest)
+        assert not (params.use_1best and params.use_pruned)
+        assert not (params.use_nbest and params.use_pruned)
 
-        import math
-        with torch.no_grad():
-            # check cache memory
-            all_in_cache = True
-            if hyp_cache is not None:
-                for i in range(len(ids)):
-                    if hyp_cache.get(ids[i]) is None:
-                        all_in_cache = False
-                        break
+        nbest_beam_search_alignment, nbest_pseudo_y = make_nbest_alignment(
+            batch=batch,
+            hyp_cache=hyp_cache,
+            params=params,
+            topk=params.topk,
+            device=device,
+        )
 
-            # if hyps exist in cache, use them or do beam search
-            if all_in_cache is False:
-                decoding_result = modified_beam_search_for_kd(
-                    model=teacher_model,
-                    x=feature,
-                    x_lens=feature_lens,
-                    beam=4,
-                )
-
-                # adding
-                # the equation is heuristically determined
-                hyp_alignment = torch.zeros(feature_lens.size()[0], math.ceil((feature_lens[0]-8)/4), dtype=torch.int)
-                for i in range(feature_lens.size()[0]):
-                    for j in range(len(decoding_result.hyps[i])):
-                        hyp_alignment[i, decoding_result.timestamps[i][j]] = decoding_result.hyps[i][j]
-
-                hyp_tokens = hyp_alignment.tolist()
-                # add the hyp_tokens to cache
-                for i in range(len(hyp_tokens)):
-                    hyp_cache[ids[i]] = hyp_tokens[i]
-
-            else:
-                #print("Cache hit!")
-                # check whether the length of hyp and the length of batch are the same
-                for i in range(feature_lens.size()[0]):
-                    # feature lens to encoder lens
-                    encoder_len = math.ceil((feature_lens[i]-8)/4)
-                    hyp_len = len(hyp_cache[ids[i]])
-                    if hyp_len != encoder_len:
-                        tmp_hyp = hyp_cache[ids[i]]
-                        # case 1. hyp_cache[ids[i]] is shorter than encoder_lens
-                        if hyp_len < encoder_len:
-                            #print(f"{hyp_cache[ids[i]]}")
-                            #print(f"{hyp_len=} is shorter than {encoder_len=}")
-                            hyp_cache[ids[i]] = tmp_hyp.extend([0]*(encoder_len-hyp_len))
-                        # case 2. hyp_cache[ids[i]] is longer than encoder_lens
-                        if hyp_len > encoder_len:
-                            #print(f"{hyp_cache[ids[i]]}")
-                            #print(f"{hyp_len=} is longer than {encoder_len=}")
-                            hyp_cache[ids[i]] = tmp_hyp[:encoder_len]
-
-                # loading hyp_tokens from cache
-                hyp_tokens = list()
-                for i in range(len(ids)):
-                    hyp_tokens.append(hyp_cache[ids[i]])
-
-            # make pseudo labels
-            pseudo_labels = list()
-            for i in range(len(hyp_tokens)):
-                tmp_pseudo_label = [ t for t in hyp_tokens[i] if t != 0 ]
-                #for j in hyp_tokens[i]:
-                #    tmp_pseudo_label = [ t for t in j if t != 0 ]
-                pseudo_labels.append(tmp_pseudo_label)
-
-            # don't need
-            # remove duplicated labels with maintaing order
-            # convert list(list()) to k2.RaggedTensor
-            pseudo_y = k2.RaggedTensor(pseudo_labels).to(device)
-            y = pseudo_y.clone()
-
-            # first, check if the first token is blank
-            for i in range(len(hyp_tokens)):
-                if hyp_tokens[i][0] != 0:
-                    hyp_tokens[i][1:] = hyp_tokens[i][:-1] # shift to right
-                    hyp_tokens[i][0] = 0
-            # get max length of hyp_tokens
-            max_len = 0
-            for i in range(len(hyp_tokens)):
-                if max_len < len(hyp_tokens[i]):
-                    max_len = len(hyp_tokens[i])
-            alignment = torch.zeros((len(hyp_tokens), max_len), dtype=torch.int32)
-            # remove duplicated labels in hyp_tokens
-            # and convert the sequence to monotonic increasing sequence
-            for i in range(len(hyp_tokens)):
-                mask = (torch.tensor(hyp_tokens[i], dtype=torch.bool) != 0)
-                alignment[i, :len(hyp_tokens[i])] = torch.cumsum(mask.int(), dim=-1, dtype=torch.int32)
-
-            beam_search_alignment = alignment.to(device)
-
-    # initialize teacher sampling y, ranges, and logits
+    sys.exit(0)
+    # initialize teacher sampling y
     sampling_y = None
-    teacher_sampling_ranges = None
-    teacher_sampling_logits = None
 
-    """
-    if use_pkd:
-        assert params.prune_range >= params.pkd_range
-        with torch.no_grad():
-            teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
-                x=feature,
-                x_lens=feature_lens,
-                y=y,
-                use_grad=False,
-            )
-
-            ret = teacher_model.get_ranges_and_logits_with_encoder_out(
-                encoder_out=teacher_encoder_out,
-                encoder_out_lens=teacher_encoder_out_lens,
-                y=y,
-                prune_range=params.pkd_range,
-                am_scale=params.am_scale,
-                lm_scale=params.lm_scale,
-                use_teacher_ctc_alignment=params.use_teacher_ctc_alignment,
-                use_efficient=params.use_efficient,
-                use_time_compression=params.use_time_compression,
-                compression_threshold=params.time_compression_threshold,
-                use_beam_search=use_beam_search,
-                use_beam_search_alignment=params.use_beam_search_alignment,
-                beam_search_alignment=beam_search_alignment,
-            )
-
-        teacher_ranges = ret[0]
-        teacher_logits = ret[1]
-
-        if use_sq_sampling:
-            teacher_sampling_ranges = list()
-            teacher_sampling_logits = list()
-            sampling_y = list()
-            for n in range(1, sq_sampling_num+1):
-                yy = list()
-                y_list = y.tolist()
-                # in the case of the number of samples is 1
-                # y_list[(i+1)%len(y_list)] means the next sample in a batch
-                for i in range(len(y_list)):
-                    yy.append(y_list[(i+n)%len(y_list)])
-
-                sampling_y.append(k2.RaggedTensor(yy).to(device))
-                # the yy is the less probable label sequence
-
-                sampling_ret = teacher_model.get_ranges_and_logits_with_encoder_out(
-                    encoder_out=teacher_encoder_out,
-                    encoder_out_lens=teacher_encoder_out_lens,
-                    y=sampling_y[-1],
-                    prune_range=params.pkd_range,
-                    am_scale=params.am_scale,
-                    lm_scale=params.lm_scale,
-                    use_teacher_ctc_alignment=params.use_teacher_ctc_alignment,
-                    use_efficient=params.use_efficient,
-                    use_time_compression=params.use_time_compression,
-                    compression_threshold=params.time_compression_threshold,
-                    use_beam_search=False,
-                    use_beam_search_alignment=False,
-                    beam_search_alignment=None,
-                    use_grad=False,
-                )
-
-                teacher_sampling_ranges.append(sampling_ret[0])
-                teacher_sampling_logits.append(sampling_ret[1])
-    """
-    """
-    if params.use_ctc:
-        use_ctc = True
-    else:
-        use_ctc = False
-    """
     with torch.set_grad_enabled(is_training):
         simple_loss = torch.tensor(0.0, device=device)
         pruned_loss = torch.tensor(0.0, device=device)
-        pkd_loss = torch.tensor(0.0, device=device)
+        kd_loss = torch.tensor(0.0, device=device)
         ctc_loss = torch.tensor(0.0, device=device)
-        teacher_simple_loss = torch.tensor(0.0, device=device)
         sampling_loss = torch.tensor(0.0, device=device)
-        """
-        # It doesn't need
-        if use_pkd:
-            ret = (simple_loss, pruned_loss, pkd_loss)
-        else:
-            ret = (simple_loss, pruned_loss)
-
-        """
         ret = model(
             x=feature,
             x_lens=feature_lens,
@@ -1100,25 +957,28 @@ def compute_loss(
             prune_range=params.prune_range,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
-            use_pkd=use_pkd,
-            pkd_range=params.pkd_range,
-            teacher_ranges=teacher_ranges,
-            teacher_logits=teacher_logits,
             use_ctc=params.use_ctc,
-            use_teacher_simple_proj=params.use_teacher_simple_proj,
-            teacher_model=teacher_model,
-            use_time_compression=params.use_time_compression,
-            teacher_compressed_ranges=teacher_compressed_ranges,
-            teacher_compressed_logits=teacher_compressed_logits,
-            teacher_compressed_masks=teacher_compressed_masks,
+            use_kd=use_kd,
             use_efficient=params.use_efficient,
-            use_alphas=False,
-            teacher_alphas=None,
+            use_1best=params.use_1best,
+            use_nbest=params.use_nbest,
+            use_pruned=params.use_pruned,
+
             use_sq_sampling=use_sq_sampling,
+            use_sq_simple_loss_range=use_sq_simple_loss_range,
+            teacher_model=teacher_model,
+            pruned_kd_range=params.pruned_kd_range,
             sampling_y=sampling_y,
+            nbest_sampling_y=
             teacher_sampling_ranges=teacher_sampling_ranges,
             teacher_sampling_logits=teacher_sampling_logits,
             sq_sampling_num=sq_sampling_num,
+            sampling_y=sampling_y,
+            nbest_y=nbest_pseudo_y,
+            pseudo_y_alignment=beam_search_alignment,
+            nbest_pseudo_y_alignment=nbest_beam_search_alignment,
+            topk=params.topk,
+            use_topk_shuff=params.use_topk_shuff,
         )
 
         s = params.simple_loss_scale
@@ -1135,17 +995,14 @@ def compute_loss(
             else 0.1 + 0.9 * (batch_idx_train / warm_step)
         )
 
-        pkd_loss_scale = params.pkd_loss_scale
-        ctc_loss_scale = params.pkd_loss_scale
-        sampling_loss_scale = params.pkd_loss_scale * params.sq_sampling_scale
-        teacher_simple_loss_scale = params.pkd_loss_scale
+        kd_loss_scale = params.kd_loss_scale
+        ctc_loss_scale = params.kd_loss_scale
+        sampling_loss_scale = params.kd_loss_scale * params.sq_sampling_scale
 
         simple_loss = ret["simple_loss"]
         pruned_loss = ret["pruned_loss"]
-        if use_pkd:
-            pkd_loss = ret["pkd_loss"]
-            if use_teacher_simple_proj:
-                teacher_simple_loss = ret["teacher_simple_loss"]
+        if use_kd:
+            kd_loss = ret["kd_loss"]
         if params.use_ctc:
             ctc_loss = ret["ctc_loss"]
         if use_sq_sampling:
@@ -1159,6 +1016,10 @@ def compute_loss(
             sampling_loss_scale * sampling_loss
 
     assert loss.requires_grad == is_training
+    if use_kd:
+        assert kd_loss.requires_grad == is_training
+        if use_sq_sampling:
+            assert sampling_loss.requires_grad == is_training
 
     info = MetricsTracker()
     with warnings.catch_warnings():
@@ -1169,10 +1030,8 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
-    if params.use_pkd:
-        info["pkd_loss"] = pkd_loss.detach().cpu().item()
-        if params.use_teacher_simple_proj:
-            info["teacher_simple_loss"] = teacher_simple_loss.detach().cpu().item()
+    if params.use_kd:
+        info["kd_loss"] = kd_loss.detach().cpu().item()
     if params.use_ctc:
         info["ctc_loss"] = ctc_loss.detach().cpu().item()
     if params.use_sq_sampling:
@@ -1230,6 +1089,7 @@ def train_one_epoch(
     rank: int = 0,
     teacher_model: Optional[nn.Module] = None,
     hyp_cache: dict = None,
+    epoch: int = 0,
 ) -> None:
     """Train the model for one epoch.
 
@@ -1286,6 +1146,7 @@ def train_one_epoch(
                     is_training=True,
                     teacher_model=teacher_model,
                     hyp_cache=hyp_cache,
+                    epoch=epoch,
                 )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
@@ -1460,7 +1321,7 @@ def run(rank, world_size, args):
 
     # load the model from checkpoint if available
     teacher_model = None
-    if params.use_pkd:
+    if params.use_kd:
         teacher_params = copy.deepcopy(params)
         teacher_params.num_encoder_layers = params.teacher_num_encoder_layers
         teacher_params.feedforward_dims = params.teacher_feedforward_dims
@@ -1473,14 +1334,6 @@ def run(rank, world_size, args):
         teacher_model.to(device)
         teacher_model.eval()
 
-        if params.use_teacher_simple_proj:
-            teacher_model.reset_simple_layer()
-            logging.info("Resetting simple layer in teacher model")
-            #TODO hard coded
-            model.set_teacher_simple_layer(384, #teacher_model.encoder.encoder_dims,
-                                           512, #teacher_model.decoder.dims,
-                                           500, #teacher_model.decoder.vocab_size,
-                                           device)
         logging.info("Teacher model loaded")
         num_param = sum([p.numel() for p in teacher_model.parameters()])
         logging.info(f"Number of teacher model parameters: {num_param}")
@@ -1504,8 +1357,6 @@ def run(rank, world_size, args):
     if world_size > 1:
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-        if params.use_pkd:
-            teacher_model = DDP(teacher_model, device_ids=[rank])
 
     parameters_names = []
     parameters_names.append(
@@ -1621,9 +1472,13 @@ def run(rank, world_size, args):
         hyp_cache = dict()
         logging.info("No dump hypotheses provided")
     else:
-        import pickle
-        hyp_cache = pickle.load(open(params.dump_hyp, "rb"))
-        logging.info(f"Loaded {len(hyp_cache)} hypotheses from {params.dump_hyp}")
+        # check if the file exits
+        if os.path.exists(params.dump_hyp):
+            hyp_cache = pickle.load(open(params.dump_hyp, "rb"))
+            logging.info(f"Loaded {len(hyp_cache)} hypotheses from {params.dump_hyp}")
+        else:
+            hyp_cache = dict()
+            logging.warning(f"{params.dump_hyp} doesn't exit")
 
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)
@@ -1650,6 +1505,7 @@ def run(rank, world_size, args):
             rank=rank,
             teacher_model=teacher_model,
             hyp_cache=hyp_cache,
+            epoch=epoch,
         )
 
         if params.print_diagnostics:
