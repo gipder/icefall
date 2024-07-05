@@ -963,15 +963,11 @@ def compute_loss(
             use_1best=params.use_1best,
             use_nbest=params.use_nbest,
             use_pruned=params.use_pruned,
-
             use_sq_sampling=use_sq_sampling,
             use_sq_simple_loss_range=use_sq_simple_loss_range,
             teacher_model=teacher_model,
             pruned_kd_range=params.pruned_kd_range,
-            sampling_y=sampling_y,
-            nbest_sampling_y=
-            teacher_sampling_ranges=teacher_sampling_ranges,
-            teacher_sampling_logits=teacher_sampling_logits,
+            nbest_sampling_y=sampling_y,
             sq_sampling_num=sq_sampling_num,
             sampling_y=sampling_y,
             nbest_y=nbest_pseudo_y,

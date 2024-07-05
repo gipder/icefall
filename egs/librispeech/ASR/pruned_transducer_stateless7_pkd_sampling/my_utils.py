@@ -18,9 +18,8 @@ def make_nbest_alignment(batch: dict,
                          hyp_cache: dict,
                          params: AttributeDict,
                          topk: int = 1,
-                         device: torch.device = torch.device("cpu")
-                         )
-    -> Union[list, torch.tensor], Union[list, k2.RaggedTensor]:
+                         device: torch.device = torch.device("cpu"),
+                         ) -> Tuple[Union[list, torch.tensor], Union[list, k2.RaggedTensor]]:
     """
     Make n-best alignments from the given batch and hypotheses dictionary.
     The n-best alignments contains N alignments for each utterance in the batch.
@@ -49,7 +48,7 @@ def make_nbest_alignment(batch: dict,
     ids = list()
     # get ids from batch
     for i in range(len(batch["supervisions"]["cut"])):
-        ids.append(batch["supervisions"]["cut"][i].id
+        ids.append(batch["supervisions"]["cut"][i].id)
 
     feature_lens = batch["supervisions"]["num_frames"]
 
@@ -73,7 +72,7 @@ def make_nbest_alignment(batch: dict,
             logging.error(f"{ids=}")
             assert False
 
-        for n in range(topk)
+        for n in range(topk):
             # loop for the number of elements in a batch
             for i in range(feature_lens.size()[0]):
                 # get encoder output lens
@@ -81,7 +80,7 @@ def make_nbest_alignment(batch: dict,
                 # when the range is larger than the number of N-best alignments
                 if n >= len(hyp_cache[ids[i]]):
                     n = len(hyp_cache[ids[i]]) - 1
-                hyp_len = len(hyp_cache[ids[i]][n]])
+                hyp_len = len(hyp_cache[ids[i]][n])
                 if hyp_len != encoder_len:
                     tmp_hyp = hyp_cache[ids[i]][n]
                     # case 1. hyp_cache[ids[i]] is shorter than encoder_lens
