@@ -902,7 +902,6 @@ def compute_loss(
     nbest_teacher_logits = None
     pseudo_y = None
     nbest_pseudo_y = None
-    beam_search_alignment = None
     nbest_beam_search_alignment = None
     pseudo_y_sequence = None
 
@@ -940,10 +939,6 @@ def compute_loss(
             device=device,
         )
 
-    sys.exit(0)
-    # initialize teacher sampling y
-    sampling_y = None
-
     with torch.set_grad_enabled(is_training):
         simple_loss = torch.tensor(0.0, device=device)
         pruned_loss = torch.tensor(0.0, device=device)
@@ -965,16 +960,13 @@ def compute_loss(
             use_pruned=params.use_pruned,
             use_sq_sampling=use_sq_sampling,
             use_sq_simple_loss_range=use_sq_simple_loss_range,
+            use_topk_shuff=params.use_topk_shuff,
             teacher_model=teacher_model,
             pruned_kd_range=params.pruned_kd_range,
-            nbest_sampling_y=sampling_y,
             sq_sampling_num=sq_sampling_num,
-            sampling_y=sampling_y,
-            nbest_y=nbest_pseudo_y,
-            pseudo_y_alignment=beam_search_alignment,
-            nbest_pseudo_y_alignment=nbest_beam_search_alignment,
             topk=params.topk,
-            use_topk_shuff=params.use_topk_shuff,
+            nbest_beam_search_alignment=nbest_beam_search_alignment,
+            nbest_sampling_y=nbest_pseudo_y,
         )
 
         s = params.simple_loss_scale
@@ -1006,9 +998,8 @@ def compute_loss(
 
         loss = simple_loss_scale * simple_loss + \
             pruned_loss_scale * pruned_loss + \
-            pkd_loss_scale * pkd_loss + \
+            kd_loss_scale * kd_loss + \
             ctc_loss_scale * ctc_loss + \
-            teacher_simple_loss_scale * teacher_simple_loss + \
             sampling_loss_scale * sampling_loss
 
     assert loss.requires_grad == is_training

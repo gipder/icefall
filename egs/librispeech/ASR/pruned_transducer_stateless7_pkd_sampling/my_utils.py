@@ -76,7 +76,7 @@ def make_nbest_alignment(batch: dict,
             # loop for the number of elements in a batch
             for i in range(feature_lens.size()[0]):
                 # get encoder output lens
-                encoder_len = match.ceil((feature_lens[i]-8)/4)
+                encoder_len = math.ceil((feature_lens[i]-8)/4)
                 # when the range is larger than the number of N-best alignments
                 if n >= len(hyp_cache[ids[i]]):
                     n = len(hyp_cache[ids[i]]) - 1
