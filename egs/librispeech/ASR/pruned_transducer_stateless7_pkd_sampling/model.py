@@ -466,6 +466,9 @@ class Transducer(nn.Module):
             kd_loss = self.kd_criterion(student, teacher)
 
         if use_sq_sampling:
+            assert use_1best is False, "1best kd is not supported with sequence sampling"
+            assert use_nbest is False, "nbest kd is not supported with sequence sampling"
+
             sampling_loss = torch.tensor(0.0).to(logits.device)
             teacher_sampling_ranges = list()
             teacher_sampling_logits = list()
