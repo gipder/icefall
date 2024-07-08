@@ -315,13 +315,25 @@ class Transducer(nn.Module):
             assert not (use_1best and use_pruned), "use_1best and use_pruned cannot be True at the same time"
             assert not (use_nbest and use_pruned), "use_nbest and use_pruned cannot be True at the same time"
             if use_1best:
-                student = F.log_softmax(logits, dim=-1)
+                alignment = nbest_beam_search_alignment[0].unsqueeze(-1).to(torch.int64)
+                teacher_logits = teacher_model.get_logits_with_encoder_out_and_ranges(
+                    encoder_out=teacher_encoder_out,
+                    encoder_out_lens=teacher_encoder_out_lens,
+                    y=nbest_sampling_y[0],
+                    ranges=alignment,
+                    prune_range=1,
+                    use_grad=False,
+                )
+                student_logits = self.get_logits_with_encoder_out_and_ranges(
+                    encoder_out=encoder_out,
+                    encoder_out_lens=x_lens,
+                    y=nbest_sampling_y[0],
+                    ranges=alignment,
+                    prune_range=1,
+                    use_grad=True,
+                )
+                student = F.log_softmax(student_logits, dim=-1)
                 teacher = F.softmax(teacher_logits, dim=-1)
-                alignment = nbest_beam_search_alignment[0]
-                idx = alignment.unsqueeze(-1).expand(-1, -1, student.shape[-1]).unsqueeze(2)
-                idx = idx.to(torch.int64)
-                student = torch.gather(student, 2, idx)
-                teacher = torch.gather(teacher, 2, idx)
                 max_len = student.size(1)
                 mask = torch.arange(max_len, device=student.device).expand(student.size(0), max_len) < x_lens.unsqueeze(1)
                 mask = mask.unsqueeze(-1).unsqueeze(-1)
@@ -333,42 +345,25 @@ class Transducer(nn.Module):
                     nbest_student = None
                     nbest_teacher = None
                     for n in range(0, topk):
-                        student_ret = self.get_ranges_and_logits_with_encoder_out(
-                            encoder_out=encoder_out,
-                            encoder_out_lens=encoder_out_lens,
-                            y=nbest_sampling_y[n],
-                            prune_range=pruned_kd_range,
-                            am_scale=am_scale,
-                            lm_scale=lm_scale,
-                            use_teacher_ctc_alignment=False,
-                            use_efficient=use_efficient,
-                            use_time_compression=False,
-                            compression_threshold=0.0,
-                            use_beam_search=False,
-                            use_beam_search_alignment=False,
-                            beam_search_alignment=None,
-                            use_grad=True,
-                        )
-
-                        tmp_ranges = student_ret[0]
-                        student_logits = student_ret[1]
-
+                        alignment = nbest_beam_search_alignment[n].unsqueeze(-1).to(torch.int64)
                         teacher_logits = teacher_model.get_logits_with_encoder_out_and_ranges(
                             encoder_out=teacher_encoder_out,
                             encoder_out_lens=teacher_encoder_out_lens,
                             y=nbest_sampling_y[n],
-                            ranges=tmp_ranges,
-                            prune_range=pruned_kd_range,
+                            ranges=alignment,
+                            prune_range=1,
                             use_grad=False,
                         )
-
+                        student_logits = self.get_logits_with_encoder_out_and_ranges(
+                            encoder_out=encoder_out,
+                            encoder_out_lens=x_lens,
+                            y=nbest_sampling_y[n],
+                            ranges=alignment,
+                            prune_range=1,
+                            use_grad=True,
+                        )
                         student = F.log_softmax(student_logits, dim=-1)
                         teacher = F.softmax(teacher_logits, dim=-1)
-                        alignment = nbest_beam_search_alignment[n]
-                        idx = alignment.unsqueeze(-1).expand(-1, -1, student.shape[-1]).unsqueeze(2)
-                        idx = idx.to(torch.int64)
-                        student = torch.gather(student, 2, idx)
-                        teacher = torch.gather(teacher, 2, idx)
                         max_len = student.size(1)
                         mask = torch.arange(max_len, device=student.device).expand(student.size(0), max_len) < x_lens.unsqueeze(1)
                         mask = mask.unsqueeze(-1).unsqueeze(-1)
@@ -379,31 +374,25 @@ class Transducer(nn.Module):
                     student = nbest_student
                     teacher = nbest_teacher
                 else:
-                    student_logits = self.get_logits_with_encoder_out_and_ranges(
-                        encoder_out=encoder_out,
-                        encoder_out_lens=x_lens,
-                        y=nbest_sampling_y[0],
-                        ranges=tmp_ranges,
-                        prune_range=pruned_kd_range,
-                        use_grad=True,
-                    )
-
+                    alignment = nbest_beam_search_alignment[0].unsqueeze(-1).to(torch.int64)
                     teacher_logits = teacher_model.get_logits_with_encoder_out_and_ranges(
                         encoder_out=teacher_encoder_out,
                         encoder_out_lens=teacher_encoder_out_lens,
                         y=nbest_sampling_y[0],
-                        ranges=tmp_ranges,
-                        prune_range=pruned_kd_range,
+                        ranges=alignment,
+                        prune_range=1,
                         use_grad=False,
                     )
-
+                    student_logits = self.get_logits_with_encoder_out_and_ranges(
+                        encoder_out=encoder_out,
+                        encoder_out_lens=x_lens,
+                        y=nbest_sampling_y[0],
+                        ranges=alignment,
+                        prune_range=1,
+                        use_grad=True,
+                    )
                     student = F.log_softmax(student_logits, dim=-1)
                     teacher = F.softmax(teacher_logits, dim=-1)
-                    alignment = nbest_beam_search_alignment[0]
-                    idx = alignment.unsqueeze(-1).expand(-1, -1, student.shape[-1]).unsqueeze(2)
-                    idx = idx.to(torch.int64)
-                    student = torch.gather(student, 2, idx)
-                    teacher = torch.gather(teacher, 2, idx)
                     max_len = student.size(1)
                     mask = torch.arange(max_len, device=student.device).expand(student.size(0), max_len) < x_lens.unsqueeze(1)
                     mask = mask.unsqueeze(-1).unsqueeze(-1)
@@ -462,7 +451,6 @@ class Transducer(nn.Module):
                 mask = mask.unsqueeze(-1).unsqueeze(-1)
                 student = student * mask.float()
                 teacher = teacher * mask.float()
-
             kd_loss = self.kd_criterion(student, teacher)
 
         if use_sq_sampling:

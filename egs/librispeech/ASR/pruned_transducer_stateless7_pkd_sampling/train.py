@@ -498,12 +498,14 @@ def get_parser():
         help="Whether to use beam search when doing knowledge distillation",
     )
 
+    """
     parser.add_argument(
         "--use-beam-search-alignment",
         type=str2bool,
         default=False,
         help="Whether to use beam search alignment when doing knowledge distillation",
     )
+    """
 
     parser.add_argument(
         "--teacher-n-best",

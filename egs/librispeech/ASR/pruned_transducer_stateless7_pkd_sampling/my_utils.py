@@ -57,7 +57,6 @@ def make_nbest_alignment(batch: dict,
     assert not (params.use_1best and params.use_nbest)
     if params.use_1best:
         topk = 1
-        logging.info("topk is set to 1")
 
     with torch.no_grad():
         nbest_beam_search_alignment = list()
