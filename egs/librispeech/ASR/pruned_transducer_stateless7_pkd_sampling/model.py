@@ -626,7 +626,7 @@ class Transducer(nn.Module):
         logits = self.joiner(am_pruned, lm_pruned, project_input=False)
 
         ctc_range.requires_grad_(False)
-        logits = logits.detach_()
+        logits = logits.detach()
 
         return ctc_range, logits
 
@@ -886,7 +886,7 @@ class Transducer(nn.Module):
 
         ranges.requires_grad_(False)
         if use_grad is False:
-            logits = logits.detach_()
+            logits = logits.detach()
 
         masks = None
 
@@ -1095,7 +1095,7 @@ class Transducer(nn.Module):
 
         ranges.requires_grad_(False)
         if use_grad is False:
-            logits = logits.detach_()
+            logits = logits.detach()
 
         ret = (ranges, logits)
 
@@ -1174,7 +1174,7 @@ class Transducer(nn.Module):
 
         ranges.requires_grad_(False)
         if use_grad is False:
-            logits = logits.detach_()
+            logits = logits.detach()
 
         ret = logits
 
@@ -1304,7 +1304,7 @@ class Transducer(nn.Module):
 
         ranges.requires_grad_(False)
         if use_grad is False:
-            logits = logits.detach_()
+            logits = logits.detach()
 
         masks = None
 
