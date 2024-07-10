@@ -941,6 +941,9 @@ def compute_loss(
             device=device,
         )
 
+        # using pseudo_y instead of original y
+        y = nbest_pseudo_y[0]
+
     with torch.set_grad_enabled(is_training):
         simple_loss = torch.tensor(0.0, device=device)
         pruned_loss = torch.tensor(0.0, device=device)
