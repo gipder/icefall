@@ -43,7 +43,6 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3"
 
 """
 
-
 import argparse
 import copy
 import logging
@@ -95,7 +94,7 @@ import os
 import sys
 import pickle
 from my_utils import make_nbest_alignment
-from llm_generate import LLMGenDict, LLMGenDB
+from llm_gen import LLMGenDB, LLMGenDict
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -867,6 +866,7 @@ def compute_loss(
     teacher_model: Optional[Union[nn.Module, DDP]] = None,
     hyp_cache: dict = None,
     epoch: int = 0,
+    llm_gen_db: Optional[LLMGenDB] = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute transducer loss given the model and its inputs.
@@ -929,12 +929,14 @@ def compute_loss(
         use_sq_sampling = False
         use_sq_simple_loss_range = False
         sq_sampling_num = 0
+        use_llm_gen = False
     else:
         use_kd = params.use_kd
         use_beam_search = params.use_beam_search
         use_sq_sampling = params.use_sq_sampling
         use_sq_simple_loss_range = params.use_sq_simple_loss_range
         sq_sampling_num = params.sq_sampling_num
+        use_llm_gen = params.use_llm_gen
 
     if use_beam_search:
         from beam_search import (
@@ -960,6 +962,10 @@ def compute_loss(
         # using pseudo_y instead of original y
         y = nbest_pseudo_y[0]
 
+    assert not (params.use_beam_search and params.use_llm_gen)
+    if use_llm_gen:
+       pass
+
     with torch.set_grad_enabled(is_training):
         simple_loss = torch.tensor(0.0, device=device)
         pruned_loss = torch.tensor(0.0, device=device)
@@ -981,6 +987,7 @@ def compute_loss(
             use_pruned=params.use_pruned,
             use_sq_sampling=use_sq_sampling,
             use_sq_simple_loss_range=use_sq_simple_loss_range,
+            use_llm_gen=params.use_llm_gen,
             use_topk_shuff=params.use_topk_shuff,
             teacher_model=teacher_model,
             pruned_kd_range=params.pruned_kd_range,
@@ -988,6 +995,7 @@ def compute_loss(
             topk=params.topk,
             nbest_beam_search_alignment=nbest_beam_search_alignment,
             nbest_sampling_y=nbest_pseudo_y,
+            llm_gen_db=llm_gen_db,
         )
 
         s = params.simple_loss_scale
@@ -1098,6 +1106,7 @@ def train_one_epoch(
     teacher_model: Optional[nn.Module] = None,
     hyp_cache: dict = None,
     epoch: int = 0,
+    llm_gen_db: Optional[LLMGenDB] = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -1155,6 +1164,7 @@ def train_one_epoch(
                     teacher_model=teacher_model,
                     hyp_cache=hyp_cache,
                     epoch=epoch,
+                    llm_gen_db=llm_gen_db,
                 )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
@@ -1358,11 +1368,9 @@ def run(rank, world_size, args):
                 llm_gen_db = pickle.load(f)
                 num_samples = len(llm_gen_db.entries)
                 llm_gen_db_keys = llm_gen_db.keys()
-                logging.info(f"Loaded {num_samples} samples.")
+                logging.info(f"Loaded {num_samples} samples from {params.path_to_llm_gen_db}.")
         else:
             logging.info(f"File {params.path_to_llm_gen_db} doesn't exist.")
-        import sys
-        sys.exit(0)
 
     assert params.save_every_n >= params.average_period
     model_avg: Optional[nn.Module] = None
@@ -1528,6 +1536,7 @@ def run(rank, world_size, args):
             teacher_model=teacher_model,
             hyp_cache=hyp_cache,
             epoch=epoch,
+            llm_gen_db=llm_gen_db,
         )
 
         if params.print_diagnostics:

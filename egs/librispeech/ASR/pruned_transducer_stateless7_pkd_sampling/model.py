@@ -27,6 +27,8 @@ from scaling import penalize_abs_values_gt
 from icefall.utils import add_sos
 from typing import Union
 
+from llm_gen import LLMGenDB, LLMGenDict
+
 class Transducer(nn.Module):
     """It implements https://arxiv.org/pdf/1211.3711.pdf
     "Sequence Transduction with Recurrent Neural Networks"
@@ -95,12 +97,14 @@ class Transducer(nn.Module):
         use_sq_sampling: bool = False,
         use_sq_simple_loss_range: bool = False,
         use_topk_shuff: bool = False,
+        use_llm_gen: bool = False,
         teacher_model: nn.Module = None,
         pruned_kd_range: int = 5,
         sq_sampling_num: int = 1,
         topk: int = 1,
         nbest_beam_search_alignment: Union[list, torch.tensor] = None,
         nbest_sampling_y: Union[list, k2.RaggedTensor] = None,
+        llm_gen_db: LLMGenDB = None,
     ) -> torch.tensor:
         """
         Args:
@@ -142,6 +146,8 @@ class Transducer(nn.Module):
           use_topk_shuffle:
             If True, instead of considering all N-best alignments,
             consider only one alignment at each epoch.
+          use_llm_gen:
+            If True, use LLM-generated labels for knowledge distillation.
           teacher_model:
             The pretrained teacher model for knowledge distillation
           pruned_kd_range:
@@ -425,6 +431,8 @@ class Transducer(nn.Module):
                 teacher = teacher * mask.float()
             elif use_efficient:
                 assert False, "Not implemented yet"
+                pass
+            elif use_llm_gen:
                 pass
             else:
                 student_logits = self.get_logits_with_encoder_out_and_ranges(

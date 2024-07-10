@@ -28,7 +28,9 @@ from jiwer import wer
 import getpass
 import concurrent.futures
 from contextlib import nullcontext
+from llm_gen import LLMGenDict, LLMGenDB
 
+"""
 class LLMGenDict:
     def __init__(self, key, original_sentence, generated_sentence):
         self.key = key
@@ -106,6 +108,7 @@ class LLMGenDB:
         if not self.entries:
             return "LLMGenDB is empty."
         return "\n".join([str(entry) for entry in self.entries.values()])
+"""
 
 def create_client(port="1824",
                   model="meta-llama/Meta-Llama-3-70B-Instruct",
