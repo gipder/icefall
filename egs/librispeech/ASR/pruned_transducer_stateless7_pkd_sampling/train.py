@@ -95,6 +95,7 @@ import os
 import sys
 import pickle
 from my_utils import make_nbest_alignment
+from llm_generate import LLMGenDict, LLMGenDB
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -591,6 +592,21 @@ def get_parser():
         default=False,
         help="Whether to use sample loss in pruned RNN-T to get ranges of logits",
     )
+
+    parser.add_argument(
+        "--use-llm-gen",
+        type=str2bool,
+        default=False,
+        help="Whether to use labels from LLM-generated labels",
+    )
+
+    parser.add_argument(
+        "--path-to-llm-gen-db",
+        type=str,
+        default=None,
+        help="Location of the LLM-generated labels DB",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -1333,6 +1349,20 @@ def run(rank, world_size, args):
     if params.use_ctc:
         model.set_ctc_loss(reduction="sum", zero_infinity=True, blank=params.blank_id)
         logging.info("Using CTC loss")
+
+    llm_gen_db = None
+    if params.use_llm_gen:
+        if os.path.exists(params.path_to_llm_gen_db):
+            logging.info(f"File {params.path_to_llm_gen_db} already exists. Loading it.")
+            with open(params.path_to_llm_gen_db, "rb") as f:
+                llm_gen_db = pickle.load(f)
+                num_samples = len(llm_gen_db.entries)
+                llm_gen_db_keys = llm_gen_db.keys()
+                logging.info(f"Loaded {num_samples} samples.")
+        else:
+            logging.info(f"File {params.path_to_llm_gen_db} doesn't exist.")
+        import sys
+        sys.exit(0)
 
     assert params.save_every_n >= params.average_period
     model_avg: Optional[nn.Module] = None
