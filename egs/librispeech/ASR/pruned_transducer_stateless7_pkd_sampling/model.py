@@ -29,6 +29,7 @@ from typing import Union
 
 from llm_gen import LLMGenDB, LLMGenDict
 from my_utils import create_pseudo_alignment, create_increasing_sublists_torch
+import random
 
 class Transducer(nn.Module):
     """It implements https://arxiv.org/pdf/1211.3711.pdf
@@ -540,10 +541,36 @@ class Transducer(nn.Module):
                                                        dtype=torch.int64,
                                                        device=teacher_encoder_out.device)
                     sampled_y_lens = [len(i) for i in sampling_y[n-1].tolist()]
+
+                    # filter out when U is shorter than pruned_kd_range
+                    short_indics = list()
+                    noprob_indics = list()
+                    for ii, _ in enumerate(sampled_y_lens):
+                        if sampled_y_lens[ii] < pruned_kd_range:
+                            short_indics.append(ii)
+                        else:
+                            noprob_indics.append(ii)
+
+                    for ii in short_indics:
+                        # random pick from noprob_indics
+                        random_index = random.choice(noprob_indics)
+                        sampled_y_lens[ii] = sampled_y_lens[random_index]
+                        yy[ii] = yy[random_index]
+                    # update sampling_y
+                    sampling_y[n-1] = k2.RaggedTensor(yy).to(x.device)
+
                     for ii in range(len(sampled_y_lens)):
                         sampled_y_alignments[ii, :teacher_encoder_out_lens[ii]] = create_pseudo_alignment(
                                                                                         teacher_encoder_out_lens[ii],
                                                                                         sampled_y_lens[ii])
+                        max_value = torch.max(sampled_y_alignments[ii])
+                        non_zero_index = torch.nonzero(sampled_y_alignments[ii])
+                        last_non_zero_index = non_zero_index[-1].item()
+                        start_index = last_non_zero_index + 1
+                        sampled_y_alignments[ii, start_index:] = max_value
+                    #print(f"{sampled_y_alignments=}")
+                    #print(f"{sampled_y_lens=}")
+                    #print(f"{sampling_y[n-1]=}")
                     sampled_ranges = create_increasing_sublists_torch(sampled_y_alignments, pruned_kd_range)
                     teacher_logits = teacher_model.get_logits_with_encoder_out_and_ranges(
                         encoder_out=teacher_encoder_out,
@@ -556,6 +583,9 @@ class Transducer(nn.Module):
                     teacher_sampling_ranges.append(sampled_ranges)
                     teacher_sampling_logits.append(teacher_logits)
 
+                #print("GARBAGE " * 10)
+                #print(f"{ranges=}")
+                #print(f"{teacher_sampling_ranges[n-1]=}")
                 student_sampling_logits = self.get_logits_with_encoder_out_and_ranges(
                     encoder_out=encoder_out,
                     encoder_out_lens=x_lens,
@@ -563,7 +593,7 @@ class Transducer(nn.Module):
                     ranges=teacher_sampling_ranges[n-1],
                     use_grad=True,
                 )
-
+                #print("TRASH " * 10)
                 student_sampling = F.log_softmax(student_sampling_logits, dim=-1)
                 teacher_sampling = F.softmax(teacher_sampling_logits[n-1], dim=-1)
 
@@ -574,7 +604,7 @@ class Transducer(nn.Module):
 
                 student_sampling = student_sampling * mask.float()
                 teacher_sampling = teacher_sampling * mask.float()
-
+                #print("DUMMY " * 10)
                 sampling_loss += self.kd_criterion(student_sampling, teacher_sampling)
             # getting average for the sampling loss
             sampling_loss /= sq_sampling_num
