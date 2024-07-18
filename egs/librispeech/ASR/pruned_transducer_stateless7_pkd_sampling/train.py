@@ -498,6 +498,13 @@ def get_parser():
         help="Whether to use beam search when doing knowledge distillation",
     )
 
+    parser.add_argument(
+        "--use-even-alignment",
+        type=str2bool,
+        default=False,
+        help="Whether to use even alignments when samplming less likely paths",
+    )
+
     """
     parser.add_argument(
         "--use-beam-search-alignment",
@@ -1001,8 +1008,9 @@ def compute_loss(
             use_pruned=params.use_pruned,
             use_sq_sampling=use_sq_sampling,
             use_sq_simple_loss_range=use_sq_simple_loss_range,
-            use_llm_gen=params.use_llm_gen,
             use_topk_shuff=params.use_topk_shuff,
+            use_llm_gen=params.use_llm_gen,
+            use_even_alignment=params.use_even_alignment,
             teacher_model=teacher_model,
             pruned_kd_range=params.pruned_kd_range,
             sq_sampling_num=sq_sampling_num,

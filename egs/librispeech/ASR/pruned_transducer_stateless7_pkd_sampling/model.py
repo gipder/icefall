@@ -100,6 +100,7 @@ class Transducer(nn.Module):
         use_sq_simple_loss_range: bool = True,
         use_topk_shuff: bool = False,
         use_llm_gen: bool = False,
+        use_even_alignment: bool = False,
         teacher_model: nn.Module = None,
         pruned_kd_range: int = 5,
         sq_sampling_num: int = 1,
@@ -562,7 +563,8 @@ class Transducer(nn.Module):
                     for ii in range(len(sampled_y_lens)):
                         sampled_y_alignments[ii, :teacher_encoder_out_lens[ii]] = create_pseudo_alignment(
                                                                                         teacher_encoder_out_lens[ii],
-                                                                                        sampled_y_lens[ii])
+                                                                                        sampled_y_lens[ii],
+                                                                                        is_even_alignment=use_even_alignment,)
                         max_value = torch.max(sampled_y_alignments[ii])
                         non_zero_index = torch.nonzero(sampled_y_alignments[ii])
                         last_non_zero_index = non_zero_index[-1].item()

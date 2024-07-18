@@ -195,7 +195,7 @@ def make_llm_gen_label(batch: dict,
 
     return llm_gen_pseudo_y
 
-def create_pseudo_alignment(x_len, y_len):
+def create_pseudo_alignment(x_len, y_len, is_even_alignment=False):
     """
     Create pseudo alignment from the given x_len and y_len.
     The pseudo alignment is a tensor of Torch.
@@ -204,12 +204,22 @@ def create_pseudo_alignment(x_len, y_len):
     if x_len < padded_y_len:
         padded_y_len = x_len.item()
     y = torch.arange(padded_y_len, dtype=int)
-    base_repeats = np.ones(padded_y_len, dtype=int)
-    remaining_len = x_len - padded_y_len
-    additional_repeats = np.random.multinomial(remaining_len, np.ones(padded_y_len)/padded_y_len)
-    repeats = base_repeats + additional_repeats
 
-    ret = torch.cat([torch.full((count,), num) for num, count in zip(y, repeats)])
+    if is_even_alignment is False:
+        base_repeats = np.ones(padded_y_len, dtype=int)
+        remaining_len = x_len - padded_y_len
+        additional_repeats = np.random.multinomial(remaining_len, np.ones(padded_y_len)/padded_y_len)
+        repeats = base_repeats + additional_repeats
+
+        ret = torch.cat([torch.full((count,), num) for num, count in zip(y, repeats)])
+    else:
+        base_repeats = torch.div(x_len, padded_y_len, rounding_mode='trunc')
+        remaining_len = x_len % padded_y_len
+
+        repeats = torch.full((padded_y_len,), base_repeats, dtype=int)
+        repeats[:remaining_len] += 1
+
+        ret = torch.cat([torch.full((count,), num) for num, count in zip(y, repeats)])
 
     return ret
 
@@ -240,3 +250,11 @@ def create_increasing_sublists_torch(original_tensor, length=5):
     result_tensor = torch.min(result_tensor, max_val.unsqueeze(-1))
 
     return result_tensor
+
+def comma_separated_list(value):
+    # 쉼표로 문자열을 분할하고 공백을 제거한 리스트를 반환
+    return [item.strip() for item in value.split(',')]
+
+def comma_separated_list_in_float(value):
+    # 쉼표로 문자열을 분할하고 공백을 제거한 리스트를 반환
+    return [float(item.strip()) for item in value.split(',')]
