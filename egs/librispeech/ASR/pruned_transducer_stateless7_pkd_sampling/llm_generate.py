@@ -75,7 +75,7 @@ def semantic_message(asr_label: str, wer: float = 15.0) -> List[Dict[str, str]]:
 
 def acoustic_message(asr_label: str, hyp_gen_db: HYPGenDB, keys_in_wer_range: list(), few_shot: int=1) -> List[Dict[str, str]]:
     message = list()
-    message.append({"role": "system", "content": f"You are a ASR expert."})
+    message.append({"role": "system", "content": f"You are an ASR expert."})
     message.append({"role": "system", "content": "Generate ASR Error Patterns from examples of users."})
     random_choices = random.choices(keys_in_wer_range, k=few_shot)
     for key in random.choices(keys_in_wer_range, k=few_shot):
@@ -193,7 +193,7 @@ def get_parser():
     parser.add_argument(
         "--wer-range",
         type=comma_separated_list_in_float,
-        default="0,15",
+        default="0.0,1.0",
         help="Range of WER to generate acoustic prompts."
     )
 
@@ -209,7 +209,7 @@ def get_parser():
 def get_content(client, params, texts, n, hyp_gen_db, keys_in_wer_range):
     message = make_message(texts[n], params,
                            hyp_gen_db=hyp_gen_db,
-                           keys_in_wer_range=keys_in)
+                           keys_in_wer_range=keys_in_wer_range)
     chat_completion = client.chat.completions.create(
         model=params.llm_model,
         messages=message,
@@ -375,7 +375,8 @@ def main():
                         if cuts[n].id in llm_gen_db_keys:
                             logging.info(f"Skipping {cuts[n].id}")
                             continue
-                        content = get_content(client, params, texts, n)
+                        content = get_content(client, params, texts, n,
+                                              hyp_gen_db, keys_in_wer_range)
                         llm_gen_db.add_entry(cuts[n].id, texts[n], content)
                         idx += 1
 
