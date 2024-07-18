@@ -75,14 +75,28 @@ def semantic_message(asr_label: str, wer: float = 15.0) -> List[Dict[str, str]]:
 
 def acoustic_message(asr_label: str, hyp_gen_db: HYPGenDB, keys_in_wer_range: list(), few_shot: int=1) -> List[Dict[str, str]]:
     message = list()
-    message.append({"role": "system", "content": f"You are an ASR expert."})
-    message.append({"role": "system", "content": "Generate ASR Error Patterns from examples of users."})
+    message.append({"role": "user", "content": "You are an ASR expert."})
+    message.append({"role": "user", "content": "Generate sentences referring to examples of users."})
+    message.append({"role": "user", "content": "Please show me only ASR OUT results without anything."})
     random_choices = random.choices(keys_in_wer_range, k=few_shot)
     for key in random.choices(keys_in_wer_range, k=few_shot):
-        message.append({"role": "user", "content": f"INPUT: {hyp_gen_db.get_origin(key)}"})
-        message.append({"role": "system", "content": f"OUTPUT: {hyp_gen_db.get_value(key)[0]}"})
-    message.append({"role": "user", "content": f"INPUT: {asr_label}"})
-    message.append({"role": "system", "content": f"OUTPUT: "})
+        message.append({"role": "user", "content": f"ASR REFERENCE: {hyp_gen_db.get_origin(key)}"})
+        message.append({"role": "system", "content": f"ASR OUTPUT: {hyp_gen_db.get_value(key)[0]}"})
+    message.append({"role": "user", "content": f"ASR REFERENCE: {asr_label}"})
+    message.append({"role": "system", "content": f"ASR OUTPUT: "})
+
+    return message
+
+def acoustic_message_test(asr_label: str, hyp_gen_db: HYPGenDB, keys_in_wer_range: list(), few_shot: int=1) -> List[Dict[str, str]]:
+    message = [
+        {"role": "user", "content": f"You are a ASR expert. I ask you to generated a ASR error sentence based on examples I'm going to give you."},
+        {"role": "system", "content": "Sure, I can help with that. Please provide the examples of sentences with ASR errors, in which WER should be between 0.1 and 0.2, and I will generate the ASR error sentence based on the examples."},
+        {"role": "user", "content": f"ref: SHE RUSHED TO SONYA HUGGED HER AND BEGAN TO CRY"},
+        {"role": "system", "content": f"hyp: SHE RUSHED AS SONYA HUGGED HER AND BEGAN TO CRY"},
+        {"role": "user", "content": f"ref: BUT THE SECRET OF DOSTOEVSKYS APPEAL IS SOMETHING MORE THAN THE MULTITUDE AND THRILL OF HIS INCIDENTS AND THRILL OF HIS INCIDENTS AND CHARACTERS"},
+        {"role": "system", "content": f"hyp: BUT THE SACRED OF DUSTY EXCUS APPEAL IS SOMETHING MORE THAN THE MOST ACHUTE THRILL OF HIS INCIDENTS AND CHARACTERS"},
+        {"role": "user", "content": f"Please show me only the hypothesis without anything. The ref is {asr_label}"},
+    ]
 
     return message
 
