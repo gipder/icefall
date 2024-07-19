@@ -75,16 +75,17 @@ def semantic_message(asr_label: str, wer: float = 15.0) -> List[Dict[str, str]]:
 
 def acoustic_message(asr_label: str, hyp_gen_db: HYPGenDB, keys_in_wer_range: list(), few_shot: int=1) -> List[Dict[str, str]]:
     message = list()
-    message.append({"role": "system", "content": "You are an ASR expert. Please generate an ASR error sentence based on the examples a user give you. Please show me only the generated sentence without anything."})
-    user_message = "Examples are as follows:"
+    message.append({"role": "system", "content": "You are an ASR expert."})
+    user_message = "I ask you to generate an ASR error sentence based on examples I give you. "
+    user_message += "Could you please show me only the sentence you generate. "
+    user_message += "If you think the problem is too hard, you can just generate a similar one to the ASR_REFFERENCE."
+
 
     for idx, key in enumerate(random.choices(keys_in_wer_range, k=few_shot)):
-        user_message += f"The {idx+1}st example is "
-        user_message += f"{hyp_gen_db.get_origin(key)}//"
-        user_message += f"{hyp_gen_db.get_value(key)[0]} "
+        user_message += f"||Example {idx+1}: ASR_REFFERENCE:{hyp_gen_db.get_origin(key)}|GENERATED_SENTENCE:{hyp_gen_db.get_value(key)[0]}"
 
     idx += 1
-    user_message += f"The {idx+1}st example is {asr_label}//"
+    user_message += f"||Example {idx+1}: ASR_REFFERENCE:{asr_label}|GENERATED_SENTENCE:"
     message.append({"role": "user", "content": user_message})
 
     return message
@@ -92,7 +93,7 @@ def acoustic_message(asr_label: str, hyp_gen_db: HYPGenDB, keys_in_wer_range: li
 def acoustic_message_test(asr_label: str, hyp_gen_db: HYPGenDB, keys_in_wer_range: list(), few_shot: int=1) -> List[Dict[str, str]]:
     message = [
         {"role": "system", "content": f"You are a ASR expert."},
-        {"role": "user", "content": f"I ask you to generate an ASR error sentence based on examples I give you. 1. SHE RUSHED TO SONYA HUGGED HER AND BEGAN TO CRY // SHE RUSHED AS SONYA HUGGED HER AND BEGAN TO CRY 2. BUT THE SECRET OF DOSTOEVSKYS APPEAL IS SOMETHING MORE THAN THE MULTITUDE AND THRILL OF HIS INCIDENTS AND THRILL OF HIS INCIDENTS AND CHARACTERS // BUT THE SACRED OF DUSTY EXCUS APPEAL IS SOMETHING MORE THAN THE MOST ACHUTE THRILL OF HIS INCIDENTS AND CHARACTERS 3. {asr_label} // "},
+        {"role": "user", "content": f"I ask you to generate an ASR error sentence based on examples I give you. Could you please show me only the sentence you generate. ||Example 1: ASR_REFFERENCE:SHE RUSHED TO SONYA HUGGED HER AND BEGAN TO CRY|GENERATED_SENTENCE:SHE RUSHED AS SONYA HUGGED HER AND BEGAN TO CRY||Example 2: ASR_REFFERENCE:BUT THE SECRET OF DOSTOEVSKYS APPEAL IS SOMETHING MORE THAN THE MULTITUDE AND THRILL OF HIS INCIDENTS AND THRILL OF HIS INCIDENTS AND CHARACTERS|GENERATED_SENTENCE:BUT THE SACRED OF DUSTY EXCUS APPEAL IS SOMETHING MORE THAN THE MOST ACHUTE THRILL OF HIS INCIDENTS AND CHARACTERS||Example 3: ASR_REFFERENCE:{asr_label}|GENERATED_SENTENCE:"},
     ]
 
     return message
@@ -226,13 +227,6 @@ def get_content(client, params, texts, n, hyp_gen_db, keys_in_wer_range):
         messages=message,
         stream=False
     )
-    """
-    chat_completion = client.completions.create(
-        model=params.llm_model,
-        messages=message,
-        stream=False
-    )
-    """
     #make the character uppercase and remove the leading and trailing whitespaces
     content = clear_sentence(chat_completion.choices[0].message.content)
     return content
@@ -250,6 +244,7 @@ def create_client_and_get_content(apikey, params, uid, text, hyp_gen_db, keys_in
         messages=message,
         stream=False,
     )
+
     #make the character uppercase and remove the leading and trailing whitespaces
     content = clear_sentence(chat_completion.choices[0].message.content)
     return content, uid, text
@@ -281,6 +276,30 @@ def process_multi_samples(executor, num_processes, futures, apikey, params, cuts
             idx += 1
         futures.clear()
     return idx
+
+def make_db_name(params, test_set):
+    llm_gen_db_file = f"{params.res_dir}/"
+    llm_gen_db_file += f"llm_gen_db.{test_set}."
+    for attr in "mode", "target_wer", "wer_range", "few_shot":
+        if attr == "mode":
+            llm_gen_db_file += f"mode_{params[attr]}."
+
+        if params.mode == "acoustic":
+            if attr == "wer_range":
+                # from [10, 20] to 10-20
+                wer_range = '-'.join([str(params[attr][0]), str(params[attr][1])])
+                llm_gen_db_file += f"wer{wer_range}."
+
+            if attr == "few_shot":
+                llm_gen_db_file += f"few_shot_{params[attr]}."
+
+        if params.mode == "semantic":
+            if attr == "target_wer":
+                llm_gen_db_file += f"wer{params[attr]}."
+
+    llm_gen_db_file += f"{os.path.basename(params.llm_model)}.pkl"
+
+    return llm_gen_db_file
 
 @torch.no_grad()
 def main():
@@ -362,7 +381,8 @@ def main():
         logging.info(f"LLM Generating {test_set}")
         idx = 0
         # testing save the DB in pickle
-        llm_gen_db_file = f"{params.res_dir}/llm_gen_db.{test_set}.wer{params.target_wer}.mode_{params.mode}.{os.path.basename(params.llm_model)}.pkl"
+        llm_gen_db_file = make_db_name(params, test_set)
+
         # if the file already exists, then delete it
         if params.delete_existing_db and os.path.exists(llm_gen_db_file):
             os.remove(llm_gen_db_file)
