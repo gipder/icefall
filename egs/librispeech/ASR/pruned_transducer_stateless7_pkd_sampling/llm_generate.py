@@ -32,7 +32,7 @@ import concurrent.futures
 from contextlib import nullcontext
 from llm_gen import LLMGenDict, LLMGenDB
 from hyp_gen import HYPGenDict, HYPGenDB
-from my_utils  import comma_separated_list_in_float
+from my_utils  import comma_separated_list, comma_separated_list_in_float
 
 def create_client(port="1824",
                   model="meta-llama/Meta-Llama-3-70B-Instruct",
@@ -44,7 +44,6 @@ def create_client(port="1824",
         )
 
     else:
-        # init the client but point it to TGI
         client = OpenAI(
             base_url=f"http://localhost:{port}/v1",
             api_key="-"
@@ -134,8 +133,8 @@ def get_parser():
 
     parser.add_argument(
         "--port",
-        type=str,
-        default="1824",
+        type=comma_separated_list,
+        default=["1824"],
         help="Port number for a TGI server"
     )
 
@@ -231,8 +230,8 @@ def get_content(client, params, texts, n, hyp_gen_db, keys_in_wer_range):
     content = clear_sentence(chat_completion.choices[0].message.content)
     return content
 
-def create_client_and_get_content(apikey, params, uid, text, hyp_gen_db, keys_in_wer_range):
-    client = create_client(port=params.port,
+def create_client_and_get_content(apikey, params, uid, text, hyp_gen_db, keys_in_wer_range, process_num=0):
+    client = create_client(port=params.port[process_num],
                            model=params.llm_model,
                            apikey=apikey,)
     message = make_message(text, params,
@@ -267,7 +266,8 @@ def process_multi_samples(executor, num_processes, futures, apikey, params, cuts
                                            cuts[n+p].id,
                                            texts[n+p],
                                            hyp_gen_db,
-                                           keys_in_wer_range
+                                           keys_in_wer_range,
+                                           p
                                            ))
         concurrent.futures.wait(futures)
         for future in futures:
@@ -323,10 +323,8 @@ def main():
         else:
             apikey = os.environ.get("OPENAI_API_KEY")
     else:
-        if params.use_multiprocessing is True:
-            logging.error("Multiprocessing is not supported with TGI. Please set use_multiprocessing to False.")
-            return
         apikey = None
+
 
     logging.info(params)
 
@@ -366,7 +364,7 @@ def main():
     #test_dls = [train_small_dl]
 
     if params.use_multiprocessing is False:
-        client = create_client(port=params.port,
+        client = create_client(port=params.port[0],
                                model=params.llm_model,
                                apikey=apikey)
 
