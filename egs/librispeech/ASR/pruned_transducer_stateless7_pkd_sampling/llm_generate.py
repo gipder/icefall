@@ -75,27 +75,24 @@ def semantic_message(asr_label: str, wer: float = 15.0) -> List[Dict[str, str]]:
 
 def acoustic_message(asr_label: str, hyp_gen_db: HYPGenDB, keys_in_wer_range: list(), few_shot: int=1) -> List[Dict[str, str]]:
     message = list()
-    message.append({"role": "user", "content": "You are an ASR expert."})
-    message.append({"role": "user", "content": "Generate sentences referring to examples of users."})
-    message.append({"role": "user", "content": "Please show me only ASR OUT results without anything."})
-    random_choices = random.choices(keys_in_wer_range, k=few_shot)
-    for key in random.choices(keys_in_wer_range, k=few_shot):
-        message.append({"role": "user", "content": f"ASR REFERENCE: {hyp_gen_db.get_origin(key)}"})
-        message.append({"role": "system", "content": f"ASR OUTPUT: {hyp_gen_db.get_value(key)[0]}"})
-    message.append({"role": "user", "content": f"ASR REFERENCE: {asr_label}"})
-    message.append({"role": "system", "content": f"ASR OUTPUT: "})
+    message.append({"role": "system", "content": "You are an ASR expert. Please generate an ASR error sentence based on the examples a user give you. "})
+    user_message = ""
 
+    for idx, key in enumerate(random.choices(keys_in_wer_range, k=few_shot)):
+        user_message += f"{idx}: {hyp_gen_db.get_origin(key)} // "
+        user_message += f"{hyp_gen_db.get_value(key)[0]} "
+
+    idx += 1
+    user_message += f"{idx}: {asr_label} // "
+    message.append({"role": "user", "content": user_message})
+
+    print(f"{message=}")
     return message
 
 def acoustic_message_test(asr_label: str, hyp_gen_db: HYPGenDB, keys_in_wer_range: list(), few_shot: int=1) -> List[Dict[str, str]]:
     message = [
-        {"role": "user", "content": f"You are a ASR expert. I ask you to generated a ASR error sentence based on examples I'm going to give you."},
-        {"role": "system", "content": "Sure, I can help with that. Please provide the examples of sentences with ASR errors, in which WER should be between 0.1 and 0.2, and I will generate the ASR error sentence based on the examples."},
-        {"role": "user", "content": f"ref: SHE RUSHED TO SONYA HUGGED HER AND BEGAN TO CRY"},
-        {"role": "system", "content": f"hyp: SHE RUSHED AS SONYA HUGGED HER AND BEGAN TO CRY"},
-        {"role": "user", "content": f"ref: BUT THE SECRET OF DOSTOEVSKYS APPEAL IS SOMETHING MORE THAN THE MULTITUDE AND THRILL OF HIS INCIDENTS AND THRILL OF HIS INCIDENTS AND CHARACTERS"},
-        {"role": "system", "content": f"hyp: BUT THE SACRED OF DUSTY EXCUS APPEAL IS SOMETHING MORE THAN THE MOST ACHUTE THRILL OF HIS INCIDENTS AND CHARACTERS"},
-        {"role": "user", "content": f"Please show me only the hypothesis without anything. The ref is {asr_label}"},
+        {"role": "system", "content": f"You are a ASR expert."},
+        {"role": "user", "content": f"I ask you to generate an ASR error sentence based on examples I give you. 1. SHE RUSHED TO SONYA HUGGED HER AND BEGAN TO CRY // SHE RUSHED AS SONYA HUGGED HER AND BEGAN TO CRY 2. BUT THE SECRET OF DOSTOEVSKYS APPEAL IS SOMETHING MORE THAN THE MULTITUDE AND THRILL OF HIS INCIDENTS AND THRILL OF HIS INCIDENTS AND CHARACTERS // BUT THE SACRED OF DUSTY EXCUS APPEAL IS SOMETHING MORE THAN THE MOST ACHUTE THRILL OF HIS INCIDENTS AND CHARACTERS 3. {asr_label} // "},
     ]
 
     return message
@@ -110,7 +107,7 @@ def clear_sentence(sentence: str):
 def get_keys_in_range(hyp_gen_db, start: float = 0, end: float = 100):
     keys = list()
     for key in hyp_gen_db.keys():
-        if hyp_gen_db.get_wer(key) >= start and hyp_gen_db.get_wer(key) < end:
+        if hyp_gen_db.get_wer(key) >= float(start/100) and hyp_gen_db.get_wer(key) < float(end/100):
             keys.append(key)
     return keys
 
@@ -207,8 +204,8 @@ def get_parser():
     parser.add_argument(
         "--wer-range",
         type=comma_separated_list_in_float,
-        default="0.0,1.0",
-        help="Range of WER to generate acoustic prompts."
+        default="0.0,50.0",
+        help="Range of WER % to generate acoustic prompts."
     )
 
     parser.add_argument(
@@ -224,7 +221,14 @@ def get_content(client, params, texts, n, hyp_gen_db, keys_in_wer_range):
     message = make_message(texts[n], params,
                            hyp_gen_db=hyp_gen_db,
                            keys_in_wer_range=keys_in_wer_range)
+    """
     chat_completion = client.chat.completions.create(
+        model=params.llm_model,
+        messages=message,
+        stream=False
+    )
+    """
+    chat_completion = client.completions.create(
         model=params.llm_model,
         messages=message,
         stream=False
