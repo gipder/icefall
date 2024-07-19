@@ -75,18 +75,18 @@ def semantic_message(asr_label: str, wer: float = 15.0) -> List[Dict[str, str]]:
 
 def acoustic_message(asr_label: str, hyp_gen_db: HYPGenDB, keys_in_wer_range: list(), few_shot: int=1) -> List[Dict[str, str]]:
     message = list()
-    message.append({"role": "system", "content": "You are an ASR expert. Please generate an ASR error sentence based on the examples a user give you. "})
-    user_message = ""
+    message.append({"role": "system", "content": "You are an ASR expert. Please generate an ASR error sentence based on the examples a user give you. Please show me only the generated sentence without anything."})
+    user_message = "Examples are as follows:"
 
     for idx, key in enumerate(random.choices(keys_in_wer_range, k=few_shot)):
-        user_message += f"{idx}: {hyp_gen_db.get_origin(key)} // "
+        user_message += f"The {idx+1}st example is "
+        user_message += f"{hyp_gen_db.get_origin(key)}//"
         user_message += f"{hyp_gen_db.get_value(key)[0]} "
 
     idx += 1
-    user_message += f"{idx}: {asr_label} // "
+    user_message += f"The {idx+1}st example is {asr_label}//"
     message.append({"role": "user", "content": user_message})
 
-    print(f"{message=}")
     return message
 
 def acoustic_message_test(asr_label: str, hyp_gen_db: HYPGenDB, keys_in_wer_range: list(), few_shot: int=1) -> List[Dict[str, str]]:
@@ -221,7 +221,6 @@ def get_content(client, params, texts, n, hyp_gen_db, keys_in_wer_range):
     message = make_message(texts[n], params,
                            hyp_gen_db=hyp_gen_db,
                            keys_in_wer_range=keys_in_wer_range)
-    """
     chat_completion = client.chat.completions.create(
         model=params.llm_model,
         messages=message,
@@ -233,6 +232,7 @@ def get_content(client, params, texts, n, hyp_gen_db, keys_in_wer_range):
         messages=message,
         stream=False
     )
+    """
     #make the character uppercase and remove the leading and trailing whitespaces
     content = clear_sentence(chat_completion.choices[0].message.content)
     return content
