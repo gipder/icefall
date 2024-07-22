@@ -105,6 +105,7 @@ class Transducer(nn.Module):
         pruned_kd_range: int = 5,
         sq_sampling_num: int = 1,
         topk: int = 1,
+        epoch: int = 0,
         nbest_beam_search_alignment: Union[list, torch.tensor] = None,
         nbest_sampling_y: Union[list, k2.RaggedTensor] = None,
     ) -> torch.tensor:
@@ -145,7 +146,7 @@ class Transducer(nn.Module):
             If True, use sequence sampling
           use_sq_simple_loss_range:
             If True, use simple loss to get the range for alignments
-          use_topk_shuffle:
+          use_topk_shuff:
             If True, instead of considering all N-best alignments,
             consider only one alignment at each epoch.
           use_llm_gen:
@@ -158,6 +159,8 @@ class Transducer(nn.Module):
             The number of samples for sequence sampling
           topk:
             The number of topk alignments to consider. It is the same as N of N-best
+          epoch:
+            The current epoch
           nbest_beam_search_alignment:
             The N-best alignments from beam search
           nbest_sampling_y:
@@ -291,13 +294,6 @@ class Transducer(nn.Module):
 
         # get logit with pruned_kd_range
         if use_kd:
-            tmp_ranges = k2.get_rnnt_prune_ranges(
-                px_grad=px_grad,
-                py_grad=py_grad,
-                boundary=boundary,
-                s_range=pruned_kd_range,
-            )
-
             # get teacher encoder out
             teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
                 x=x,
@@ -306,21 +302,10 @@ class Transducer(nn.Module):
             )
 
             assert pruned_kd_range > 1, f"{pruned_kd_range=} should be larger than 1"
-            # get teacher logits with student range
-            """
-            teacher_logits = teacher_model.get_logits_with_encoder_out_and_ranges(
-                encoder_out=teacher_encoder_out,
-                encoder_out_lens=teacher_encoder_out_lens,
-                y=y,
-                ranges=tmp_ranges,
-                prune_range=pruned_kd_range,
-                use_grad=False,
-            )
-            """
-
             assert not (use_1best and use_nbest), "use_1best and use_nbest cannot be True at the same time"
             assert not (use_1best and use_pruned), "use_1best and use_pruned cannot be True at the same time"
             assert not (use_nbest and use_pruned), "use_nbest and use_pruned cannot be True at the same time"
+
             if use_1best:
                 alignment = nbest_beam_search_alignment[0].unsqueeze(-1).to(torch.int64)
                 teacher_logits = teacher_model.get_logits_with_encoder_out_and_ranges(
@@ -381,11 +366,15 @@ class Transducer(nn.Module):
                     student = nbest_student
                     teacher = nbest_teacher
                 else:
-                    alignment = nbest_beam_search_alignment[0].unsqueeze(-1).to(torch.int64)
+                    # select which idx to use
+                    nbest = len(nbest_beam_search_alignment)
+                    choice_idx = int(epoch % nbest)
+
+                    alignment = nbest_beam_search_alignment[choice_idx].unsqueeze(-1).to(torch.int64)
                     teacher_logits = teacher_model.get_logits_with_encoder_out_and_ranges(
                         encoder_out=teacher_encoder_out,
                         encoder_out_lens=teacher_encoder_out_lens,
-                        y=nbest_sampling_y[0],
+                        y=nbest_sampling_y[choice_idx],
                         ranges=alignment,
                         prune_range=1,
                         use_grad=False,
@@ -393,7 +382,7 @@ class Transducer(nn.Module):
                     student_logits = self.get_logits_with_encoder_out_and_ranges(
                         encoder_out=encoder_out,
                         encoder_out_lens=x_lens,
-                        y=nbest_sampling_y[0],
+                        y=nbest_sampling_y[choice_idx],
                         ranges=alignment,
                         prune_range=1,
                         use_grad=True,
@@ -406,6 +395,13 @@ class Transducer(nn.Module):
                     student = student * mask.float()
                     teacher = teacher * mask.float()
             elif use_pruned:
+                tmp_ranges = k2.get_rnnt_prune_ranges(
+                    px_grad=px_grad,
+                    py_grad=py_grad,
+                    boundary=boundary,
+                    s_range=pruned_kd_range,
+                )
+
                 student_logits = self.get_logits_with_encoder_out_and_ranges(
                     encoder_out=encoder_out,
                     encoder_out_lens=x_lens,
@@ -433,40 +429,43 @@ class Transducer(nn.Module):
             elif use_efficient:
                 assert False, "Not implemented yet"
                 pass
-            elif use_llm_gen:
-                tmp_ranges, teacher_logits = teacher_model.get_ranges_and_logits_with_encoder_out(
-                    encoder_out=teacher_encoder_out,
-                    encoder_out_lens=teacher_encoder_out_lens,
-                    y=nbest_sampling_y[0],
-                    prune_range=pruned_kd_range,
-                    am_scale=am_scale,
-                    lm_scale=lm_scale,
-                    use_teacher_ctc_alignment=False,
-                    use_efficient=use_efficient,
-                    use_time_compression=False,
-                    compression_threshold=0.0,
-                    use_beam_search=False,
-                    use_beam_search_alignment=False,
-                    beam_search_alignment=None,
-                    use_grad=False,
-                )
+                """
+                <-- drag on the left to use use_llm_gen
+                elif use_llm_gen:
+                    tmp_ranges, teacher_logits = teacher_model.get_ranges_and_logits_with_encoder_out(
+                        encoder_out=teacher_encoder_out,
+                        encoder_out_lens=teacher_encoder_out_lens,
+                        y=nbest_sampling_y[0],
+                        prune_range=pruned_kd_range,
+                        am_scale=am_scale,
+                        lm_scale=lm_scale,
+                        use_teacher_ctc_alignment=False,
+                        use_efficient=use_efficient,
+                        use_time_compression=False,
+                        compression_threshold=0.0,
+                        use_beam_search=False,
+                        use_beam_search_alignment=False,
+                        beam_search_alignment=None,
+                        use_grad=False,
+                    )
 
-                student_logits = self.get_logits_with_encoder_out_and_ranges(
-                    encoder_out=encoder_out,
-                    encoder_out_lens=x_lens,
-                    y=nbest_sampling_y[0],
-                    ranges=tmp_ranges,
-                    prune_range=pruned_kd_range,
-                    use_grad=True,
-                )
+                    student_logits = self.get_logits_with_encoder_out_and_ranges(
+                        encoder_out=encoder_out,
+                        encoder_out_lens=x_lens,
+                        y=nbest_sampling_y[0],
+                        ranges=tmp_ranges,
+                        prune_range=pruned_kd_range,
+                        use_grad=True,
+                    )
 
-                student = F.log_softmax(student_logits, dim=-1)
-                teacher = F.softmax(teacher_logits, dim=-1)
-                max_len = student.size(1)
-                mask = torch.arange(max_len, device=student.device).expand(student.size(0), max_len) < x_lens.unsqueeze(1)
-                mask = mask.unsqueeze(-1).unsqueeze(-1)
-                student = student * mask.float()
-                teacher = teacher * mask.float()
+                    student = F.log_softmax(student_logits, dim=-1)
+                    teacher = F.softmax(teacher_logits, dim=-1)
+                    max_len = student.size(1)
+                    mask = torch.arange(max_len, device=student.device).expand(student.size(0), max_len) < x_lens.unsqueeze(1)
+                    mask = mask.unsqueeze(-1).unsqueeze(-1)
+                    student = student * mask.float()
+                    teacher = teacher * mask.float()
+                """
             else:
                 student_logits = self.get_logits_with_encoder_out_and_ranges(
                     encoder_out=encoder_out,

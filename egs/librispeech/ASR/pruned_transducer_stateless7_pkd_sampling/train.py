@@ -953,6 +953,7 @@ def compute_loss(
         sq_sampling_num = params.sq_sampling_num
         use_llm_gen = params.use_llm_gen
 
+    assert not (params.use_beam_search and params.use_llm_gen)
     if use_beam_search:
         from beam_search import (
             modified_beam_search,
@@ -977,8 +978,8 @@ def compute_loss(
         # using pseudo_y instead of original y
         y = nbest_pseudo_y[0]
 
-    assert not (params.use_beam_search and params.use_llm_gen)
-    if use_llm_gen:
+    elif use_llm_gen:
+        nbest_beam_search_alignment = None
         nbest_pseudo_y = make_llm_gen_label(
             batch=batch,
             llm_gen_db=llm_gen_db,
@@ -1015,6 +1016,7 @@ def compute_loss(
             pruned_kd_range=params.pruned_kd_range,
             sq_sampling_num=sq_sampling_num,
             topk=params.topk,
+            epoch=epoch,
             nbest_beam_search_alignment=nbest_beam_search_alignment,
             nbest_sampling_y=nbest_pseudo_y,
         )
