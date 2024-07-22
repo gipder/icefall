@@ -93,6 +93,7 @@ import math
 import os
 import sys
 import pickle
+from multiprocessing import Lock
 from my_utils import make_nbest_alignment, make_llm_gen_label
 from llm_gen import LLMGenDB, LLMGenDict
 
@@ -1383,17 +1384,6 @@ def run(rank, world_size, args):
         model.set_ctc_loss(reduction="sum", zero_infinity=True, blank=params.blank_id)
         logging.info("Using CTC loss")
 
-    llm_gen_db = None
-    if params.use_llm_gen:
-        if os.path.exists(params.path_to_llm_gen_db):
-            logging.info(f"File {params.path_to_llm_gen_db} already exists. Loading it.")
-            with open(params.path_to_llm_gen_db, "rb") as f:
-                llm_gen_db = pickle.load(f)
-                num_samples = len(llm_gen_db.entries)
-                llm_gen_db_keys = llm_gen_db.keys()
-                logging.info(f"Loaded {num_samples} samples from {params.path_to_llm_gen_db}.")
-        else:
-            logging.info(f"File {params.path_to_llm_gen_db} doesn't exist.")
 
     assert params.save_every_n >= params.average_period
     model_avg: Optional[nn.Module] = None
@@ -1532,6 +1522,19 @@ def run(rank, world_size, args):
         else:
             hyp_cache = dict()
             logging.warning(f"{params.dump_hyp} doesn't exit")
+
+    llm_gen_db = None
+    if params.use_llm_gen:
+        if os.path.exists(params.path_to_llm_gen_db):
+            logging.info(f"File {params.path_to_llm_gen_db} already exists. Loading it.")
+            # blocking from other process
+            with open(params.path_to_llm_gen_db, "rb") as f:
+                llm_gen_db = pickle.load(f)
+                num_samples = len(llm_gen_db.entries)
+                llm_gen_db_keys = llm_gen_db.keys()
+                logging.info(f"Loaded {num_samples} samples from {params.path_to_llm_gen_db}.")
+        else:
+            logging.info(f"File {params.path_to_llm_gen_db} doesn't exist.")
 
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)
