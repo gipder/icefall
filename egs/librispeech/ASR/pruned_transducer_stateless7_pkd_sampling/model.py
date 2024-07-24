@@ -395,30 +395,37 @@ class Transducer(nn.Module):
                     student = student * mask.float()
                     teacher = teacher * mask.float()
             elif use_pruned:
-                tmp_ranges = k2.get_rnnt_prune_ranges(
-                    px_grad=px_grad,
-                    py_grad=py_grad,
-                    boundary=boundary,
-                    s_range=pruned_kd_range,
+                if use_llm_gen:
+                    target_label=nbest_sampling_y[0]
+                else:
+                    target_label=y
+
+                tmp_ranges, teacher_logits = teacher_model.get_ranges_and_logits_with_encoder_out(
+                    encoder_out=teacher_encoder_out,
+                    encoder_out_lens=teacher_encoder_out_lens,
+                    y=target_label,
+                    prune_range=pruned_kd_range,
+                    am_scale=am_scale,
+                    lm_scale=lm_scale,
+                    use_teacher_ctc_alignment=False,
+                    use_efficient=False,
+                    use_time_compression=False,
+                    compression_threshold=0.0,
+                    use_beam_search=False,
+                    use_beam_search_alignment=False,
+                    beam_search_alignment=None,
+                    use_grad=False,
                 )
 
                 student_logits = self.get_logits_with_encoder_out_and_ranges(
                     encoder_out=encoder_out,
                     encoder_out_lens=x_lens,
-                    y=y,
+                    y=target_label,
                     ranges=tmp_ranges,
                     prune_range=pruned_kd_range,
                     use_grad=True,
                 )
 
-                teacher_logits = teacher_model.get_logits_with_encoder_out_and_ranges(
-                    encoder_out=teacher_encoder_out,
-                    encoder_out_lens=teacher_encoder_out_lens,
-                    y=y,
-                    ranges=tmp_ranges,
-                    prune_range=pruned_kd_range,
-                    use_grad=False,
-                )
                 student = F.log_softmax(student_logits, dim=-1)
                 teacher = F.softmax(teacher_logits, dim=-1)
                 max_len = student.size(1)
