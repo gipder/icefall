@@ -474,6 +474,8 @@ class Transducer(nn.Module):
                     teacher = teacher * mask.float()
                 """
             else:
+                # for reference
+                # this logic re-uses the ranges from student model
                 student_logits = self.get_logits_with_encoder_out_and_ranges(
                     encoder_out=encoder_out,
                     encoder_out_lens=x_lens,
