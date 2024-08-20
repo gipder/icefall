@@ -80,7 +80,7 @@ class Transducer(nn.Module):
         self.teacher_simple_lm_proj = None
         self.ctc_layer = nn.Linear(encoder_dim, vocab_size)
         self.ctc_criterion = None
-        self.alphas_criterion = nn.MSELoss(reduction='none')
+        self.mse_criterion = nn.MSELoss(reduction='mean')
 
     def forward(
         self,
@@ -108,6 +108,7 @@ class Transducer(nn.Module):
         epoch: int = 0,
         nbest_beam_search_alignment: Union[list, torch.tensor] = None,
         nbest_sampling_y: Union[list, k2.RaggedTensor] = None,
+        use_token_correlation: bool = False,
     ) -> torch.tensor:
         """
         Args:
@@ -578,9 +579,7 @@ class Transducer(nn.Module):
                         last_non_zero_index = non_zero_index[-1].item()
                         start_index = last_non_zero_index + 1
                         sampled_y_alignments[ii, start_index:] = max_value
-                    #print(f"{sampled_y_alignments=}")
-                    #print(f"{sampled_y_lens=}")
-                    #print(f"{sampling_y[n-1]=}")
+
                     sampled_ranges = create_increasing_sublists_torch(sampled_y_alignments, pruned_kd_range)
                     teacher_logits = teacher_model.get_logits_with_encoder_out_and_ranges(
                         encoder_out=teacher_encoder_out,
@@ -593,9 +592,6 @@ class Transducer(nn.Module):
                     teacher_sampling_ranges.append(sampled_ranges)
                     teacher_sampling_logits.append(teacher_logits)
 
-                #print("GARBAGE " * 10)
-                #print(f"{ranges=}")
-                #print(f"{teacher_sampling_ranges[n-1]=}")
                 student_sampling_logits = self.get_logits_with_encoder_out_and_ranges(
                     encoder_out=encoder_out,
                     encoder_out_lens=x_lens,
@@ -603,7 +599,6 @@ class Transducer(nn.Module):
                     ranges=teacher_sampling_ranges[n-1],
                     use_grad=True,
                 )
-                #print("TRASH " * 10)
                 student_sampling = F.log_softmax(student_sampling_logits, dim=-1)
                 teacher_sampling = F.softmax(teacher_sampling_logits[n-1], dim=-1)
 
@@ -614,10 +609,13 @@ class Transducer(nn.Module):
 
                 student_sampling = student_sampling * mask.float()
                 teacher_sampling = teacher_sampling * mask.float()
-                #print("DUMMY " * 10)
-                sampling_loss += self.kd_criterion(student_sampling, teacher_sampling)
             # getting average for the sampling loss
             sampling_loss /= sq_sampling_num
+
+        if use_token_correlation:
+            teacher_delta = teacher[:, 1:] - teacher[:, :-1]
+            student_delta = student[:, 1:] - student[:, :-1]
+            token_correlation_loss = self.mse_criterion(student_delta, teacher_delta)
 
         if use_ctc:
             ctc_out = self.ctc_layer(encoder_out)
@@ -641,6 +639,11 @@ class Transducer(nn.Module):
             ret["sampling_loss"] = sampling_loss
         else:
             ret["sampling_loss"] = torch.tensor(0.0)
+
+        if use_token_correlation:
+            ret["token_correlation_loss"] = token_correlation_loss
+        else:
+            ret["token_correlation_loss"] = torch.tensor(0.0)
 
         return ret
 

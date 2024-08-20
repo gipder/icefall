@@ -622,6 +622,20 @@ def get_parser():
         help="Location of the LLM-generated labels DB",
     )
 
+    parser.add_argument(
+        "--use-token-correlation",
+        type=str2bool,
+        default=False,
+        help="Whether to use the loss related to the token correlation",
+    )
+
+    parser.add_argument(
+        "--token-corr-loss-scale",
+        type=float,
+        default=1.0,
+        help="scale for the token correlation loss",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -946,6 +960,7 @@ def compute_loss(
         use_sq_simple_loss_range = False
         sq_sampling_num = 0
         use_llm_gen = False
+        use_token_correlation = False
     else:
         use_kd = params.use_kd
         use_beam_search = params.use_beam_search
@@ -953,6 +968,7 @@ def compute_loss(
         use_sq_simple_loss_range = params.use_sq_simple_loss_range
         sq_sampling_num = params.sq_sampling_num
         use_llm_gen = params.use_llm_gen
+        use_token_correlation = params.use_token_correlation
 
     assert not (params.use_beam_search and params.use_llm_gen)
     if use_beam_search:
@@ -995,6 +1011,7 @@ def compute_loss(
         kd_loss = torch.tensor(0.0, device=device)
         ctc_loss = torch.tensor(0.0, device=device)
         sampling_loss = torch.tensor(0.0, device=device)
+        token_correlation_loss = torch.tensor(0.0, device=device)
         ret = model(
             x=feature,
             x_lens=feature_lens,
@@ -1020,6 +1037,7 @@ def compute_loss(
             epoch=epoch,
             nbest_beam_search_alignment=nbest_beam_search_alignment,
             nbest_sampling_y=nbest_pseudo_y,
+            use_token_correlation=use_token_correlation,
         )
 
         s = params.simple_loss_scale
@@ -1039,6 +1057,7 @@ def compute_loss(
         kd_loss_scale = params.kd_loss_scale
         ctc_loss_scale = params.kd_loss_scale
         sampling_loss_scale = params.kd_loss_scale * params.sq_sampling_scale
+        token_corr_loss_scale = params.token_corr_loss_scale
 
         simple_loss = ret["simple_loss"]
         pruned_loss = ret["pruned_loss"]
@@ -1048,18 +1067,23 @@ def compute_loss(
             ctc_loss = ret["ctc_loss"]
         if use_sq_sampling:
             sampling_loss = ret["sampling_loss"]
+        if use_token_correlation:
+            token_correlation_loss = ret["token_correlation_loss"]
 
         loss = simple_loss_scale * simple_loss + \
             pruned_loss_scale * pruned_loss + \
             kd_loss_scale * kd_loss + \
             ctc_loss_scale * ctc_loss + \
-            sampling_loss_scale * sampling_loss
+            sampling_loss_scale * sampling_loss + \
+            token_corr_loss_scale * token_correlation_loss
 
     assert loss.requires_grad == is_training
     if use_kd:
         assert kd_loss.requires_grad == is_training
         if use_sq_sampling:
             assert sampling_loss.requires_grad == is_training
+        if use_token_correlation:
+            assert token_correlation_loss.requires_grad == is_training
 
     info = MetricsTracker()
     with warnings.catch_warnings():
@@ -1076,6 +1100,8 @@ def compute_loss(
         info["ctc_loss"] = ctc_loss.detach().cpu().item()
     if params.use_sq_sampling:
         info["sampling_loss"] = sampling_loss.detach().cpu().item()
+    if params.use_token_correlation:
+        info["token_correlation_loss"] = token_correlation_loss.detach().cpu().item()
 
     return loss, info
 
