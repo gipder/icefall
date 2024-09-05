@@ -276,7 +276,7 @@ class Transducer(nn.Module):
             # In this version, teacher's ranges are from student's ranges
             # However, the teacher's sampling ranges follows the different logic
             # They are not from student's ranges
-            assert prune_range >= pkd_range
+            #assert prune_range >= pkd_range
             with torch.no_grad():
                 teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
                     x=x,
@@ -599,7 +599,7 @@ class Transducer(nn.Module):
         logits = self.joiner(am_pruned, lm_pruned, project_input=False)
 
         ctc_range.requires_grad_(False)
-        logits = logits.detach_()
+        logits = logits.detach()
 
         return ctc_range, logits
 
@@ -859,7 +859,7 @@ class Transducer(nn.Module):
 
         ranges.requires_grad_(False)
         if use_grad is False:
-            logits = logits.detach_()
+            logits = logits.detach()
 
         masks = None
 
@@ -1068,7 +1068,7 @@ class Transducer(nn.Module):
 
         ranges.requires_grad_(False)
         if use_grad is False:
-            logits = logits.detach_()
+            logits = logits.detach()
 
         masks = None
 
@@ -1149,7 +1149,7 @@ class Transducer(nn.Module):
 
         ranges.requires_grad_(False)
         if use_grad is False:
-            logits = logits.detach_()
+            logits = logits.detach()
 
         masks = None
 
@@ -1283,7 +1283,7 @@ class Transducer(nn.Module):
 
         ranges.requires_grad_(False)
         if use_grad is False:
-            logits = logits.detach_()
+            logits = logits.detach()
 
         masks = None
 

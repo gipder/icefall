@@ -328,6 +328,9 @@ class Transducer(nn.Module):
             # getting average for the sampling loss
             sampling_loss /= sq_sampling_num
 
+        if use_corr:
+            pass
+
         """
         if use_sq_sampling:
             sampling_loss = torch.tensor(0.0).to(logits.device)
