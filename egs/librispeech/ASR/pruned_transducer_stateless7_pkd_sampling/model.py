@@ -609,6 +609,7 @@ class Transducer(nn.Module):
 
                 student_sampling = student_sampling * mask.float()
                 teacher_sampling = teacher_sampling * mask.float()
+                sampling_loss += self.kd_criterion(student_sampling, teacher_sampling)
             # getting average for the sampling loss
             sampling_loss /= sq_sampling_num
 

@@ -42,7 +42,7 @@ from lhotse.utils import fix_random_seed
 from torch.utils.data import DataLoader
 
 from icefall.utils import str2bool
-
+from my_utils import comma_separated_list
 
 class _SeedWorkers:
     def __init__(self, seed: int):
@@ -205,6 +205,13 @@ class LibriSpeechAsrDataModule:
             type=str,
             default="PrecomputedFeatures",
             help="AudioSamples or PrecomputedFeatures",
+        )
+
+        group.add_argument(
+            "--condition",
+            type=comma_separated_list,
+            default=[],
+            help="The augmented condition of test set",
         )
 
     def train_dataloaders(
@@ -561,4 +568,11 @@ class LibriSpeechAsrDataModule:
         logging.info("About to get test-other cuts")
         return load_manifest_lazy(
             self.args.manifest_dir / "librispeech_cuts_test-other.jsonl.gz"
+        )
+
+    @lru_cache()
+    def dev_clean_cuts_with_condition(self, condition) -> CutSet:
+        logging.info(f"About to get dev-clean cuts with {condition}")
+        return load_manifest_lazy(
+            self.args.manifest_dir / f"librispeech_cuts_dev-clean_{condition}.jsonl.gz"
         )
