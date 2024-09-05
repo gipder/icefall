@@ -506,22 +506,6 @@ class Transducer(nn.Module):
             # getting average for the sampling loss
             sampling_loss /= sq_sampling_num
 
-        """
-        if use_sq_sampling:
-            sampling_loss = torch.tensor(0.0).to(logits.device)
-            for i in range(sq_sampling_num):
-                sampling_logits = self.get_logits_with_encoder_out(
-                    encoder_out=encoder_out,
-                    encoder_out_lens=x_lens,
-                    y=sampling_y[i],
-                    use_grad=True,
-                )
-
-                student_sampling_logits = sampling_logits
-
-                student_sampling = F.log_softmax(student_sampling_logits, dim=-1)
-                teacher_sampling = F.softmax(teacher_sampling_logits[i], dim=-1)
-        """
         ret = dict()
         ret["org_loss"] = loss
         if use_kd:

@@ -64,8 +64,8 @@ def make_message(asr_label: str, params,
 
 def semantic_message(asr_label: str, wer: float = 15.0) -> List[Dict[str, str]]:
     message = [
-        {"role": "system", "content": f"You are a ASR expert."},
-        {"role": "user", "content": f"Please generate ASR error pattern with WER {wer} from this sentence, {asr_label}."},
+        {"role": "system", "content": f"You are an ASR expert."},
+        {"role": "user", "content": f"Please generate an ASR error pattern with WER {wer} from this sentence, {asr_label}."},
         {"role": "user", "content": f"Please show me only the generated sentence without anything."},
         {"role": "system", "content": f"The pattern is as follows: "}
     ]
@@ -76,7 +76,7 @@ def acoustic_message(asr_label: str, hyp_gen_db: HYPGenDB, keys_in_wer_range: li
     message = list()
     message.append({"role": "system", "content": "You are an ASR expert."})
     user_message = "I ask you to generate an ASR error sentence based on examples I give you. "
-    user_message += "Could you please show me only the sentence you generate. "
+    user_message += "Could you please show me only the sentence you generate? "
     user_message += "If you think the problem is too hard, you can just generate a similar one to the ASR_REFFERENCE."
 
 

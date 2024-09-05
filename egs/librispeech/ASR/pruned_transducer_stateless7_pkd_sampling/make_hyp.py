@@ -1149,6 +1149,10 @@ def main():
             dev_other_cuts = librispeech.dev_other_cuts()
             dev_other_dl = librispeech.test_dataloaders(dev_other_cuts)
             test_dl.append(dev_other_dl)
+        elif cut == "train-all-shuf":
+            train_all_shuf_cuts = librispeech.train_all_shuf_cuts()
+            train_all_shuf_dl = librispeech.test_dataloaders(train_all_shuf_cuts)
+            test_dl.append(train_all_shuf_dl)
         else:
             raise ValueError(f"Unsupported test set: {cut}")
     #train_small_cuts = librispeech.train_small_cuts()
