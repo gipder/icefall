@@ -386,108 +386,152 @@ class Transducer(nn.Module):
                                         )
                     student_sampling = ret["student"]
                     teacher_sampling = ret["teacher"]
-
+                elif use_1best:
+                    logits_dict = dict()
+                    logits_dict["student"] = sampling_logits
+                    logits_dict["teacher"] = teacher_sampling_logits[i]
+                    student = F.log_softmax(logits_dict["student"], dim=-1)
+                    teacher = F.softmax(logits_dict["teacher"], dim=-1)
+                    sampled_y_alignments = torch.zeros(org_encoder_out.size(0),
+                                                       org_encoder_out.size(1),
+                                                       dtype=torch.int64,
+                                                       device=org_encoder_out.device)
+                    sampled_y_lens = [len(i) for i in sampling_y[i].tolist()]
+                    for ii in range(len(sampled_y_lens)):
+                        sampled_y_alignments[ii, :x_lens[ii]] = create_pseudo_alignment(x_lens[ii],
+                                                                                      sampled_y_lens[ii])
+                    idx = sampled_y_alignments.unsqueeze(-1).expand(-1, -1, sampling_logits.shape[-1]).unsqueeze(2)
+                    idx = idx.to(torch.int64)
+                    teacher = torch.gather(teacher, 2, idx)
+                    student = torch.gather(student, 2, idx)
+                    max_len = sampling_logits.size(1)
+                    mask = torch.arange(max_len, device=sampling_logits.device).expand(sampling_logits.size(0), max_len) < x_lens.unsqueeze(1)
+                    mask = mask.unsqueeze(-1).unsqueeze(-1)
+                    student_sampling = student * mask.float()
+                    teacher_sampling = teacher * mask.float()
                 elif use_pruned:
-                    if use_sq_simple_loss_range is False:
-                        # original working code
-                        logits = sampling_logits
-                        student_sampling = F.log_softmax(sampling_logits, dim=-1)
-                        teacher_sampling = F.softmax(teacher_sampling_logits[i], dim=-1)
-
-                        # to make sampled pseudo alignment
-                        sampled_y_alignments = torch.zeros_like(pseudo_y_alignment,
-                                                                dtype=pseudo_y_alignment.dtype)
-                        sampled_y_lens = [len(i) for i in sampling_y[i].tolist()]
-                        for ii in range(len(sampled_y_lens)):
-                            sampled_y_alignments[ii, :x_lens[ii]] = create_pseudo_alignment(x_lens[ii],
-                                                                                          sampled_y_lens[ii])
-
-                        #print(f"{pseudo_y_alignment.shape=}")
-                        #print(f"{pseudo_y_alignment[0]=}")
-                        #print(f"{sampled_y_alignments.shape=}")
-                        #print(f"{sampled_y_alignments[0]=}")
-                        #print(f"{sampled_y_alignments[-1]=}")
-                        #print(f"{sampling_logits.shape}")
-                        #print(f"{sampling_y[i]=}")
-                        #print(f"{[len(i) for i in sampling_y[i].tolist()]=}")
-                        #print(f"{y_lens=}")
-                        #print(f"{sampling_y[i][0]=}")
-                        #student = F.log_softmax(logits, dim=-1)
-                        #teacher = F.softmax(teacher_logits, dim=-1)
-                        max_len = torch.max(y_lens)
-                        if pruned_range > max_len:
-                            pruned_range = max_len
-                        idx = create_increasing_sublists_torch(sampled_y_alignments, pruned_range)
-                        batch_idx = torch.arange(logits.size(0)).view(-1, 1, 1)
-                        batch_idx = batch_idx.expand(-1, idx.size(-2), idx.size(-1))
-                        teacher = teacher_sampling[batch_idx, torch.arange(logits.size(1)).view(1, -1, 1), idx]
-                        student = student_sampling[batch_idx, torch.arange(logits.size(1)).view(1, -1, 1), idx]
-                        max_len = logits.size(1)
-                        mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
-                        mask = mask.unsqueeze(-1).unsqueeze(-1)
-                        student = student * mask.float()
-                        teacher = teacher * mask.float()
-                    elif use_sq_simple_loss_range is True:
-                        logits = sampling_logits
-                        student_sampling = F.log_softmax(sampling_logits, dim=-1)
-
-                        # getting teacher encoder output
-                        with torch.no_grad():
+                    logits_dict = dict()
+                    logits_dict["student"] = sampling_logits
+                    logits_dict["teacher"] = teacher_sampling_logits[i]
+                    student = F.log_softmax(logits_dict["student"], dim=-1)
+                    teacher = F.softmax(logits_dict["teacher"], dim=-1)
+                    sampled_y_alignments = torch.zeros(org_encoder_out.size(0),
+                                                       org_encoder_out.size(1),
+                                                       dtype=torch.int64,
+                                                       device=org_encoder_out.device)
+                    sampled_y_lens = [len(i) for i in sampling_y[i].tolist()]
+                    for ii in range(len(sampled_y_lens)):
+                        sampled_y_alignments[ii, :x_lens[ii]] = create_pseudo_alignment(x_lens[ii],
+                                                                                      sampled_y_lens[ii])
+                    idx = sampled_y_alignments.unsqueeze(-1).expand(-1, -1, sampling_logits.shape[-1]).unsqueeze(2)
+                    idx = idx.to(torch.int64)
+                    teacher = torch.gather(teacher, 2, idx)
+                    student = torch.gather(student, 2, idx)
+                    max_len = sampling_logits.size(1)
+                    mask = torch.arange(max_len, device=sampling_logits.device).expand(sampling_logits.size(0), max_len) < x_lens.unsqueeze(1)
+                    mask = mask.unsqueeze(-1).unsqueeze(-1)
+                    student_sampling = student * mask.float()
+                    teacher_sampling = teacher * mask.float()
+                    """
+                    elif use_pruned:
+                        if use_sq_simple_loss_range is False:
+                            # original working code
+                            student_sampling = F.log_softmax(sampling_logits, dim=-1)
                             teacher_sampling = F.softmax(teacher_sampling_logits[i], dim=-1)
-                            teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
-                                x=x,
-                                x_lens=org_x_lens,
-                                use_grad=False,
-                            )
-                            sos_sampling_y_padded = add_sos(sampling_y[i], sos_id=blank_id)
-                            sos_sampling_y_padded = sos_sampling_y_padded.pad(mode="constant", padding_value=blank_id)
-                            teacher_decoder_out = teacher_model.decoder(sos_sampling_y_padded)
 
-                            sampling_y_padded = sampling_y[i].pad(mode="constant", padding_value=0)
-                            teacher_am = teacher_model.simple_am_proj(teacher_encoder_out)
-                            teacher_lm = teacher_model.simple_lm_proj(teacher_decoder_out)
-                            sampling_row_splits = sampling_y[i].shape.row_splits(1)
-                            sampling_y_lens = sampling_row_splits[1:] - sampling_row_splits[:-1]
-                            sampling_boundary = torch.zeros((teacher_encoder_out.size(0), 4), dtype=torch.int64, device=teacher_encoder_out.device)
-                            sampling_boundary[:, 2] = sampling_y_lens
-                            sampling_boundary[:, 3] = teacher_encoder_out_lens
+                            # to make sampled pseudo alignment
+                            sampled_y_alignments = torch.zeros_like(pseudo_y_alignment,
+                                                                    dtype=pseudo_y_alignment.dtype)
+                            sampled_y_lens = [len(i) for i in sampling_y[i].tolist()]
+                            for ii in range(len(sampled_y_lens)):
+                                sampled_y_alignments[ii, :x_lens[ii]] = create_pseudo_alignment(x_lens[ii],
+                                                                                              sampled_y_lens[ii])
 
-                            with torch.cuda.amp.autocast(enabled=False):
-                                # getting ranges
-                                _, (teacher_px_grad, teacher_py_grad) = k2.rnnt_loss_smoothed(
-                                    lm=teacher_lm.float(),
-                                    am=teacher_am.float(),
-                                    symbols=sampling_y_padded.to(torch.int64),
-                                    termination_symbol=blank_id,
-                                    lm_only_scale=0.25,
-                                    am_only_scale=0.0,
-                                    boundary=sampling_boundary,
-                                    reduction="sum",
-                                    return_grad=True,
+                            #print(f"{pseudo_y_alignment.shape=}")
+                            #print(f"{pseudo_y_alignment[0]=}")
+                            #print(f"{sampled_y_alignments.shape=}")
+                            #print(f"{sampled_y_alignments[0]=}")
+                            #print(f"{sampled_y_alignments[-1]=}")
+                            #print(f"{sampling_logits.shape}")
+                            #print(f"{sampling_y[i]=}")
+                            #print(f"{[len(i) for i in sampling_y[i].tolist()]=}")
+                            #print(f"{y_lens=}")
+                            #print(f"{sampling_y[i][0]=}")
+                            #student = F.log_softmax(logits, dim=-1)
+                            #teacher = F.softmax(teacher_logits, dim=-1)
+                            max_len = torch.max(y_lens)
+                            if pruned_range > max_len:
+                                pruned_range = max_len
+                            idx = create_increasing_sublists_torch(sampled_y_alignments, pruned_range)
+                            batch_idx = torch.arange(sampling_logits.size(0)).view(-1, 1, 1)
+                            batch_idx = batch_idx.expand(-1, idx.size(-2), idx.size(-1))
+                            teacher = teacher_sampling[batch_idx, torch.arange(sampling_logits.size(1)).view(1, -1, 1), idx]
+                            student = student_sampling[batch_idx, torch.arange(sampling_logits.size(1)).view(1, -1, 1), idx]
+                            max_len = sampling_logits.size(1)
+                            mask = torch.arange(max_len, device=sampling_logits.device).expand(sampling_logits.size(0), max_len) < x_lens.unsqueeze(1)
+                            mask = mask.unsqueeze(-1).unsqueeze(-1)
+                            student = student * mask.float()
+                            teacher = teacher * mask.float()
+                        elif use_sq_simple_loss_range is True:
+                            student_sampling = F.log_softmax(sampling_logits, dim=-1)
+
+                            # getting teacher encoder output
+                            with torch.no_grad():
+                                teacher_sampling = F.softmax(teacher_sampling_logits[i], dim=-1)
+                                teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
+                                    x=x,
+                                    x_lens=org_x_lens,
+                                    use_grad=False,
                                 )
+                                sos_sampling_y_padded = add_sos(sampling_y[i], sos_id=blank_id)
+                                sos_sampling_y_padded = sos_sampling_y_padded.pad(mode="constant", padding_value=blank_id)
+                                teacher_decoder_out = teacher_model.decoder(sos_sampling_y_padded)
 
-                            teacher_sampling_ranges = k2.get_rnnt_prune_ranges(
-                                px_grad=teacher_px_grad,
-                                py_grad=teacher_py_grad,
-                                boundary=sampling_boundary,
-                                s_range=pruned_range,
-                            )
-                        idx = teacher_sampling_ranges
-                        batch_idx = torch.arange(teacher_sampling_logits[i].size(0)).view(-1, 1, 1)
-                        batch_idx = batch_idx.expand(-1, idx.size(-2), idx.size(-1))
-                        teacher = teacher_sampling[batch_idx, torch.arange(teacher_sampling.size(1)).view(1, -1, 1), idx]
-                        student = student_sampling[batch_idx, torch.arange(student_sampling.size(1)).view(1, -1, 1), idx]
+                                sampling_y_padded = sampling_y[i].pad(mode="constant", padding_value=0)
+                                teacher_am = teacher_model.simple_am_proj(teacher_encoder_out)
+                                teacher_lm = teacher_model.simple_lm_proj(teacher_decoder_out)
+                                sampling_row_splits = sampling_y[i].shape.row_splits(1)
+                                sampling_y_lens = sampling_row_splits[1:] - sampling_row_splits[:-1]
+                                sampling_boundary = torch.zeros((teacher_encoder_out.size(0), 4), dtype=torch.int64, device=teacher_encoder_out.device)
+                                sampling_boundary[:, 2] = sampling_y_lens
+                                sampling_boundary[:, 3] = teacher_encoder_out_lens
 
-                        # T-axis direction masking
-                        max_len = logits.size(1)
-                        mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
-                        mask = mask.unsqueeze(-1).unsqueeze(-1)
-                        student = student * mask.float()
-                        teacher = teacher * mask.float()
+                                with torch.cuda.amp.autocast(enabled=False):
+                                    # getting ranges
+                                    _, (teacher_px_grad, teacher_py_grad) = k2.rnnt_loss_smoothed(
+                                        lm=teacher_lm.float(),
+                                        am=teacher_am.float(),
+                                        symbols=sampling_y_padded.to(torch.int64),
+                                        termination_symbol=blank_id,
+                                        lm_only_scale=0.25,
+                                        am_only_scale=0.0,
+                                        boundary=sampling_boundary,
+                                        reduction="sum",
+                                        return_grad=True,
+                                    )
 
-                        student_sampling = student_sampling * mask.float()
-                        teacher_sampling = teacher_sampling * mask.float()
+                                teacher_sampling_ranges = k2.get_rnnt_prune_ranges(
+                                    px_grad=teacher_px_grad,
+                                    py_grad=teacher_py_grad,
+                                    boundary=sampling_boundary,
+                                    s_range=pruned_range,
+                                )
+                            idx = teacher_sampling_ranges
+                            batch_idx = torch.arange(teacher_sampling_logits[i].size(0)).view(-1, 1, 1)
+                            batch_idx = batch_idx.expand(-1, idx.size(-2), idx.size(-1))
+                            teacher = teacher_sampling[batch_idx, torch.arange(teacher_sampling.size(1)).view(1, -1, 1), idx]
+                            student = student_sampling[batch_idx, torch.arange(student_sampling.size(1)).view(1, -1, 1), idx]
 
+                            # T-axis direction masking
+                            max_len = sampling_logits.size(1)
+                            mask = torch.arange(max_len, device=sampling_logits.device).expand(sampling_logits.size(0), max_len) < x_lens.unsqueeze(1)
+                            mask = mask.unsqueeze(-1).unsqueeze(-1)
+                            student = student * mask.float()
+                            teacher = teacher * mask.float()
+
+                            student_sampling = student_sampling * mask.float()
+                            teacher_sampling = teacher_sampling * mask.float()
+                    """
                 else: #original code
                     student_sampling_logits = sampling_logits
 
@@ -872,7 +916,7 @@ def create_increasing_sublists_torch(original_tensor, length=5):
     starts = torch.clamp(starts, min_val, max_val - length + 1)
 
     # 각 시작점에 대해 서브리스트 생성 (증가하는 범위)
-    Result_tensor = torch.arange(0, length, device=original_tensor.device)
+    result_tensor = torch.arange(0, length, device=original_tensor.device)
     result_tensor = result_tensor.expand(batch_size, num_elements, -1) + starts.unsqueeze(-1)
 
     # 최대값에 따라 클램핑 없이 증가 범위 유지

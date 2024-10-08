@@ -298,6 +298,14 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--prune-range",
+        type=int,
+        default=5,
+        help="The prune range for rnnt loss, it means how many symbols(context)"
+        "we are using to compute the loss",
+    )
+
+    parser.add_argument(
         "--lm-scale",
         type=float,
         default=0.25,
@@ -1289,6 +1297,23 @@ def compute_loss(
             #print(f"{len(nbest_teacher_logits)=}")
             #import sys
             #sys.exit(1)
+        else:
+            # original kd
+            with torch.no_grad():
+                teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
+                    x=feature,
+                    x_lens=feature_lens,
+                    use_grad=False,
+                )
+
+                ret = teacher_model.get_logits_with_encoder_out(
+                    encoder_out=teacher_encoder_out,
+                    encoder_out_lens=teacher_encoder_out_lens,
+                    y=y,
+                    use_grad=False,
+                )
+
+            teacher_logits = ret
 
         if use_sq_sampling:
             teacher_sampling_logits = list()

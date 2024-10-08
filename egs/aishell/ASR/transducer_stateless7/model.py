@@ -27,6 +27,7 @@ from scaling import penalize_abs_values_gt
 
 from icefall.utils import add_sos
 from typing import Union
+from my_utils import create_pseudo_alignment, create_increasing_sublists_torch
 
 class Transducer(nn.Module):
     """It implements https://arxiv.org/pdf/1211.3711.pdf
@@ -308,8 +309,29 @@ class Transducer(nn.Module):
                                         x_lens=x_lens,
                                         y=sampling_y[i],
                                         )
-                    student_sampling = ret["student"]
-                    teacher_sampling = ret["teacher"]
+                    student_sampling = F.log_softmax(ret["student"], dim=-1)
+                    teacher_sampling = F.softmax(ret["teacher"], dim=-1)
+                elif use_1best:
+                    logits_dict = dict()
+                    logits_dict["student"] = sampling_logits
+                    logits_dict["teacher"] = teacher_sampling_logits[i]
+                    student = F.log_softmax(logits_dict["student"], dim=-1)
+                    teacher = F.softmax(logits_dict["teacher"], dim=-1)
+                    sampled_y_alignments = torch.zeros(org_encoder_out.size(0),
+                                                       org_encoder_out.size(1),
+                                                       dtype=torch.int64,
+                                                       device=org_encoder_out.device)
+                    idx = sampled_y_alignment.unsqueeze(-1).expand(-1, -1, sampling_logits.shape[-1]).unsqueeze(2)
+                    idx = idx.to(torch.int64)
+                    teacher = torch.gather(teacher, 2, idx)
+                    student = torch.gather(student, 2, idx)
+                    max_len = sampling_logits.size(1)
+                    mask = torch.arange(max_len, device=sampling_logits.device).expand(sampling_logits.size(0), max_len) < x_lens.unsqueeze(1)
+                    mask = mask.unsqueeze(-1).unsqueeze(-1)
+                    student_sampling = student * mask.float()
+                    teacher_sampling = teacher * mask.float()
+                    # getting random alignments
+                    # initiallize a tensor to keep the alignments
                 else: #original code
                     student_sampling_logits = sampling_logits
 

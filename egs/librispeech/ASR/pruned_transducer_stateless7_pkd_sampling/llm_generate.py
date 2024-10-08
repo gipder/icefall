@@ -1,3 +1,5 @@
+import sys
+import os
 from openai import OpenAI
 import argparse
 import logging
@@ -22,90 +24,15 @@ from icefall.utils import (
 
 from datetime import datetime
 import re
-import os
 import pickle
-from jiwer import wer
+import jiwer
 import getpass
+import random
 import concurrent.futures
 from contextlib import nullcontext
-
-class LLMGenDict:
-    def __init__(self, key, original_sentence, generated_sentence):
-        self.key = key
-        self.original_sentence = original_sentence
-        self.generated_sentence = generated_sentence
-        self.wer = wer(self.original_sentence, self.generated_sentence)
-
-    def update_generated_sentence(self, new_generated_sentence):
-        self.generated_sentence = new_generated_sentence
-
-    def __str__(self):
-        return f"Key: {self.key}\nOriginal Sentence: {self.original_sentence}\nGenerated Sentence: {self.generated_sentence}\nWER: {self.wer}"
-
-
-class LLMGenDB:
-    def __init__(self, model="", target_wer=15.0):
-        self.entries = {}  # LLMGenDict 객체들을 저장할 딕셔너리
-        self.model = model
-        self.target_wer = target_wer
-
-    def keys(self):
-        return self.entries.keys()
-
-    def values(self):
-        return self.entries.values()
-
-    def add_entry(self, key, original_sentence, generated_sentence):
-        if key not in self.entries:
-            self.entries[key] = LLMGenDict(key, original_sentence, generated_sentence)
-        else:
-            print(f"Entry with key '{key}' already exists.")
-
-    def get_entry(self, key):
-        if key in self.entries:
-            return self.entries[key]
-        else:
-            print(f"Entry with key '{key}' not found.")
-            return None
-
-    def get_original_sentence(self, key):
-        if key in self.entries:
-            return self.entries[key].original_sentence
-        else:
-            print(f"Entry with key '{key}' not found.")
-            return None
-
-    def get_generated_sentence(self, key):
-        if key in self.entries:
-            return self.entries[key].generated_sentence
-        else:
-            print(f"Entry with key '{key}' not found.")
-            return None
-
-    def get_value(self, key):
-        return self.get_generated_sentence(key)
-
-    def get_origin(self, key):
-        return self.get_original_sentence(key)
-
-    def get_wer(self, key):
-        return self.entries[key].wer
-
-    def get_model(self):
-        return self.model
-
-    def delete_entry(self, key):
-        if key in self.entries:
-            del self.entries[key]
-        else:
-            print(f"Entry with key '{key}' not found.")
-
-    def __str__(self):
-        print(f"Model: {self.model}")
-        print(f"WER: {self.wer}")
-        if not self.entries:
-            return "LLMGenDB is empty."
-        return "\n".join([str(entry) for entry in self.entries.values()])
+from llm_gen import LLMGenDict, LLMGenDB
+from hyp_gen import HYPGenDict, HYPGenDB
+from my_utils  import comma_separated_list, comma_separated_list_in_float
 
 def create_client(port="1824",
                   model="meta-llama/Meta-Llama-3-70B-Instruct",
@@ -117,7 +44,6 @@ def create_client(port="1824",
         )
 
     else:
-        # init the client but point it to TGI
         client = OpenAI(
             base_url=f"http://localhost:{port}/v1",
             api_key="-"
@@ -125,12 +51,48 @@ def create_client(port="1824",
 
     return client
 
-def make_message(asr_label: str, wer: float = 15.0) -> List[Dict[str, str]]:
+def make_message(asr_label: str, params,
+                 hyp_gen_db: HYPGenDB = None, keys_in_wer_range: list() = None ) -> List[Dict[str, str]]:
+    if params.mode == "semantic":
+        return semantic_message(asr_label, params.target_wer)
+    elif params.mode == "acoustic":
+        return acoustic_message(asr_label, hyp_gen_db, keys_in_wer_range, params.few_shot)
+
+    assert False, f"Unknown mode: {params.mode}"
+
+    return
+
+def semantic_message(asr_label: str, wer: float = 15.0) -> List[Dict[str, str]]:
     message = [
-        {"role": "system", "content": "You are an ASR expert."},
-        {"role": "user", "content": f"Please generate ASR error pattern with WER 15% from this sentence, {asr_label}."},
+        {"role": "system", "content": f"You are a ASR expert."},
+        {"role": "user", "content": f"Please generate ASR error pattern with WER {wer} from this sentence, {asr_label}."},
         {"role": "user", "content": f"Please show me only the generated sentence without anything."},
-        {"role": "system", "content": "The pattern is as follows: "}
+        {"role": "system", "content": f"The pattern is as follows: "}
+    ]
+
+    return message
+
+def acoustic_message(asr_label: str, hyp_gen_db: HYPGenDB, keys_in_wer_range: list(), few_shot: int=1) -> List[Dict[str, str]]:
+    message = list()
+    message.append({"role": "system", "content": "You are an ASR expert."})
+    user_message = "I ask you to generate an ASR error sentence based on examples I give you. "
+    user_message += "Could you please show me only the sentence you generate. "
+    user_message += "If you think the problem is too hard, you can just generate a similar one to the ASR_REFFERENCE."
+
+
+    for idx, key in enumerate(random.choices(keys_in_wer_range, k=few_shot)):
+        user_message += f"||Example {idx+1}: ASR_REFFERENCE:{hyp_gen_db.get_origin(key)}|GENERATED_SENTENCE:{hyp_gen_db.get_value(key)[0]}"
+
+    idx += 1
+    user_message += f"||Example {idx+1}: ASR_REFFERENCE:{asr_label}|GENERATED_SENTENCE:"
+    message.append({"role": "user", "content": user_message})
+
+    return message
+
+def acoustic_message_test(asr_label: str, hyp_gen_db: HYPGenDB, keys_in_wer_range: list(), few_shot: int=1) -> List[Dict[str, str]]:
+    message = [
+        {"role": "system", "content": f"You are a ASR expert."},
+        {"role": "user", "content": f"I ask you to generate an ASR error sentence based on examples I give you. Could you please show me only the sentence you generate. ||Example 1: ASR_REFFERENCE:SHE RUSHED TO SONYA HUGGED HER AND BEGAN TO CRY|GENERATED_SENTENCE:SHE RUSHED AS SONYA HUGGED HER AND BEGAN TO CRY||Example 2: ASR_REFFERENCE:BUT THE SECRET OF DOSTOEVSKYS APPEAL IS SOMETHING MORE THAN THE MULTITUDE AND THRILL OF HIS INCIDENTS AND THRILL OF HIS INCIDENTS AND CHARACTERS|GENERATED_SENTENCE:BUT THE SACRED OF DUSTY EXCUS APPEAL IS SOMETHING MORE THAN THE MOST ACHUTE THRILL OF HIS INCIDENTS AND CHARACTERS||Example 3: ASR_REFFERENCE:{asr_label}|GENERATED_SENTENCE:"},
     ]
 
     return message
@@ -141,6 +103,13 @@ def clear_sentence(sentence: str):
     sentence = re.sub(r'[\r\n]', '', sentence)
     sentence = re.sub(r'\s+', ' ', sentence)
     return sentence
+
+def get_keys_in_range(hyp_gen_db, start: float = 0, end: float = 100):
+    keys = list()
+    for key in hyp_gen_db.keys():
+        if hyp_gen_db.get_wer(key) >= float(start/100) and hyp_gen_db.get_wer(key) < float(end/100):
+            keys.append(key)
+    return keys
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -164,8 +133,8 @@ def get_parser():
 
     parser.add_argument(
         "--port",
-        type=str,
-        default="1824",
+        type=comma_separated_list,
+        default=["1824"],
         help="Port number for a TGI server"
     )
 
@@ -211,10 +180,47 @@ def get_parser():
         help="The target WER from sentences generated by LLM."
     )
 
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="semantic",
+        help="The mode about prompts to LLM, 'semantic' or 'acoustic'."
+    )
+
+    parser.add_argument(
+        "--use-hyp-gen",
+        type=str2bool,
+        default=False,
+        help="Whether to use hyp-gen or not."
+    )
+
+    parser.add_argument(
+        "--hyp-gen-db",
+        type=str,
+        default="",
+        help="The file path to the hyp-gen DB."
+    )
+
+    parser.add_argument(
+        "--wer-range",
+        type=comma_separated_list_in_float,
+        default="0.0,50.0",
+        help="Range of WER % to generate acoustic prompts."
+    )
+
+    parser.add_argument(
+        "--few-shot",
+        type=int,
+        default=1,
+        help="How many examples prompts use to generate sentences."
+    )
+
     return parser
 
-def get_content(client, params, texts, n):
-    message = make_message(texts[n], wer=params.target_wer)
+def get_content(client, params, texts, n, hyp_gen_db, keys_in_wer_range):
+    message = make_message(texts[n], params,
+                           hyp_gen_db=hyp_gen_db,
+                           keys_in_wer_range=keys_in_wer_range)
     chat_completion = client.chat.completions.create(
         model=params.llm_model,
         messages=message,
@@ -224,21 +230,26 @@ def get_content(client, params, texts, n):
     content = clear_sentence(chat_completion.choices[0].message.content)
     return content
 
-def create_client_and_get_content(apikey, params, uid, text):
-    client = create_client(port=params.port,
+def create_client_and_get_content(apikey, params, uid, text, hyp_gen_db, keys_in_wer_range, process_num=0):
+    client = create_client(port=params.port[process_num],
                            model=params.llm_model,
-                           apikey=apikey)
-    message = make_message(text, wer=params.target_wer)
+                           apikey=apikey,)
+    message = make_message(text, params,
+                           hyp_gen_db=hyp_gen_db,
+                           keys_in_wer_range=keys_in_wer_range)
+
     chat_completion = client.chat.completions.create(
         model=params.llm_model,
         messages=message,
         stream=False,
     )
+
     #make the character uppercase and remove the leading and trailing whitespaces
     content = clear_sentence(chat_completion.choices[0].message.content)
     return content, uid, text
 
-def process_multi_samples(executor, num_processes, futures, apikey, params, cuts, texts, llm_gen_db):
+def process_multi_samples(executor, num_processes, futures, apikey, params, cuts, texts, llm_gen_db,
+                          hyp_gen_db, keys_in_wer_range):
     idx = 0
     if len(futures) > 0:
         futures.clear()
@@ -253,7 +264,11 @@ def process_multi_samples(executor, num_processes, futures, apikey, params, cuts
                                            apikey,
                                            params,
                                            cuts[n+p].id,
-                                           texts[n+p]))
+                                           texts[n+p],
+                                           hyp_gen_db,
+                                           keys_in_wer_range,
+                                           p
+                                           ))
         concurrent.futures.wait(futures)
         for future in futures:
             content, cuts_id, text = future.result()
@@ -261,6 +276,30 @@ def process_multi_samples(executor, num_processes, futures, apikey, params, cuts
             idx += 1
         futures.clear()
     return idx
+
+def make_db_name(params, test_set):
+    llm_gen_db_file = f"{params.res_dir}/"
+    llm_gen_db_file += f"llm_gen_db.{test_set}."
+    for attr in "mode", "target_wer", "wer_range", "few_shot":
+        if attr == "mode":
+            llm_gen_db_file += f"mode_{params[attr]}."
+
+        if params.mode == "acoustic":
+            if attr == "wer_range":
+                # from [10, 20] to 10-20
+                wer_range = '-'.join([str(params[attr][0]), str(params[attr][1])])
+                llm_gen_db_file += f"wer{wer_range}."
+
+            if attr == "few_shot":
+                llm_gen_db_file += f"few_shot_{params[attr]}."
+
+        if params.mode == "semantic":
+            if attr == "target_wer":
+                llm_gen_db_file += f"wer{params[attr]}."
+
+    llm_gen_db_file += f"{os.path.basename(params.llm_model)}.pkl"
+
+    return llm_gen_db_file
 
 @torch.no_grad()
 def main():
@@ -284,12 +323,24 @@ def main():
         else:
             apikey = os.environ.get("OPENAI_API_KEY")
     else:
-        if params.use_multiprocessing is True:
-            logging.error("Multiprocessing is not supported with TGI. Please set use_multiprocessing to False.")
-            return
         apikey = None
 
+
     logging.info(params)
+
+    # loading hyp_gen_db
+    # check first where the file exists
+    hyp_gen_db = None
+    if params.use_hyp_gen:
+        assert os.path.exists(params.hyp_gen_db), f"{params.hyp_gen_db} does not exist."
+        f = open(params.hyp_gen_db, "rb")
+        hyp_gen_db = pickle.load(f)
+        keys_in_wer_range = get_keys_in_range(hyp_gen_db, params.wer_range[0], params.wer_range[1])
+        if len(keys_in_wer_range) == 0:
+            logging.error(f"No keys in the WER range {params.wer_range}.")
+            return
+        else:
+            logging.info(f"Keys in the WER range {params.wer_range}: {len(keys_in_wer_range)}")
 
     # for debugging
     debug_idx = 0
@@ -313,7 +364,7 @@ def main():
     #test_dls = [train_small_dl]
 
     if params.use_multiprocessing is False:
-        client = create_client(port=params.port,
+        client = create_client(port=params.port[0],
                                model=params.llm_model,
                                apikey=apikey)
 
@@ -328,7 +379,8 @@ def main():
         logging.info(f"LLM Generating {test_set}")
         idx = 0
         # testing save the DB in pickle
-        llm_gen_db_file = f"{params.res_dir}/llm_gen_db.{test_set}.wer{params.target_wer}.{os.path.basename(params.llm_model)}.pkl"
+        llm_gen_db_file = make_db_name(params, test_set)
+
         # if the file already exists, then delete it
         if params.delete_existing_db and os.path.exists(llm_gen_db_file):
             os.remove(llm_gen_db_file)
@@ -352,13 +404,15 @@ def main():
                     idx += process_multi_samples(executor,
                                                  params.num_processes,
                                                  futures, apikey, params,
-                                                 cuts, texts, llm_gen_db)
+                                                 cuts, texts, llm_gen_db,
+                                                 hyp_gen_db, keys_in_wer_range)
                 else:
                     for n in range(len(texts)):
                         if cuts[n].id in llm_gen_db_keys:
                             logging.info(f"Skipping {cuts[n].id}")
                             continue
-                        content = get_content(client, params, texts, n)
+                        content = get_content(client, params, texts, n,
+                                              hyp_gen_db, keys_in_wer_range)
                         llm_gen_db.add_entry(cuts[n].id, texts[n], content)
                         idx += 1
 
@@ -375,7 +429,7 @@ def main():
                         print("generated: " + llm_gen_db_from_pickle.get_value(key))
                         print("wer: " + str(llm_gen_db_from_pickle.get_wer(key)))
                     print("num samples: " + str(len(llm_gen_db_from_pickle.entries)))
-                    if debug_idx == 2:
+                    if debug_idx == 1:
                         import sys
                         sys.exit(0)
                     debug_idx += 1

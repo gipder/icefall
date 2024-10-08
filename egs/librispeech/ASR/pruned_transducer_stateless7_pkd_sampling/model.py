@@ -27,6 +27,10 @@ from scaling import penalize_abs_values_gt
 from icefall.utils import add_sos
 from typing import Union
 
+from llm_gen import LLMGenDB, LLMGenDict
+from my_utils import create_pseudo_alignment, create_increasing_sublists_torch
+import random
+
 class Transducer(nn.Module):
     """It implements https://arxiv.org/pdf/1211.3711.pdf
     "Sequence Transduction with Recurrent Neural Networks"
@@ -71,12 +75,12 @@ class Transducer(nn.Module):
             vocab_size,
         )
         self.simple_lm_proj = nn.Linear(decoder_dim, vocab_size)
-        self.pkd_criterion = nn.KLDivLoss(reduction='batchmean')
+        self.kd_criterion = nn.KLDivLoss(reduction='batchmean')
         self.teacher_simple_am_proj = None
         self.teacher_simple_lm_proj = None
         self.ctc_layer = nn.Linear(encoder_dim, vocab_size)
         self.ctc_criterion = None
-        self.alphas_criterion = nn.MSELoss(reduction='none')
+        self.mse_criterion = nn.MSELoss(reduction='mean')
 
     def forward(
         self,
@@ -86,25 +90,25 @@ class Transducer(nn.Module):
         prune_range: int = 5,
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
-        use_pkd: bool = False,
-        pkd_range: int = 5,
-        teacher_ranges: torch.tensor = None,
-        teacher_logits: torch.tensor = None,
         use_ctc: bool = False,
-        use_teacher_simple_proj: bool = False,
-        teacher_model: nn.Module = None,
-        use_time_compression: bool = False,
-        teacher_compressed_ranges: torch.tensor = None,
-        teacher_compressed_logits: torch.tensor = None,
-        teacher_compressed_masks: torch.tensor = None,
+        use_kd: bool = False,
         use_efficient: bool = False,
-        use_alphas: bool = False,
-        teacher_alphas: torch.tensor = None,
+        use_1best: bool = False,
+        use_nbest: bool = False,
+        use_pruned: bool = False,
         use_sq_sampling: bool = False,
-        sampling_y: Union[list, k2.RaggedTensor] = None,
-        teacher_sampling_ranges: Union[list, torch.tensor] = None,
-        teacher_sampling_logits: Union[list, torch.tensor] = None,
+        use_sq_simple_loss_range: bool = True,
+        use_topk_shuff: bool = False,
+        use_llm_gen: bool = False,
+        use_even_alignment: bool = False,
+        teacher_model: nn.Module = None,
+        pruned_kd_range: int = 5,
         sq_sampling_num: int = 1,
+        topk: int = 1,
+        epoch: int = 0,
+        nbest_beam_search_alignment: Union[list, torch.tensor] = None,
+        nbest_sampling_y: Union[list, k2.RaggedTensor] = None,
+        use_token_correlation: bool = False,
     ) -> torch.tensor:
         """
         Args:
@@ -125,6 +129,44 @@ class Transducer(nn.Module):
           lm_scale:
             The scale to smooth the loss with lm (output of predictor network)
             part
+          use_ctc:
+            If True, use CTC loss
+          use_kd:
+            If True, use knowledge distillation
+          use_efficient:
+            If True, compress the logits for RNN-T from K-dims to 3-dims
+            The 3-dims consists of Prob of y, Prob. of blank, and Prob. of others
+            The Prob. of others can be calculated as 1 - Prob. of y - Prob. of blank
+          use_1best:
+            If True, use 1-best alignment from teacher model
+          use_nbest:
+            If True, use N-best alignment from teacher model
+          use_pruned:
+            If True, use pruned range from teacher model
+          use_sq_sampling:
+            If True, use sequence sampling
+          use_sq_simple_loss_range:
+            If True, use simple loss to get the range for alignments
+          use_topk_shuff:
+            If True, instead of considering all N-best alignments,
+            consider only one alignment at each epoch.
+          use_llm_gen:
+            If True, use LLM-generated labels for knowledge distillation.
+          teacher_model:
+            The pretrained teacher model for knowledge distillation
+          pruned_kd_range:
+            The prune range for knowledge distillation. It is different from "prune_range"
+          sq_sampling_num:
+            The number of samples for sequence sampling
+          topk:
+            The number of topk alignments to consider. It is the same as N of N-best
+          epoch:
+            The current epoch
+          nbest_beam_search_alignment:
+            The N-best alignments from beam search
+          nbest_sampling_y:
+            The N-best label sequences for sequence sampling
+
         Returns:
           Return the transducer loss.
 
@@ -132,7 +174,11 @@ class Transducer(nn.Module):
            Regarding am_scale & lm_scale, it will make the loss-function one of
            the form:
               lm_scale * lm_probs + am_scale * am_probs +
-              (1-lm_scale-am_scale) * combined_probs
+              (1-lm_scale-am_scale) * combined_probs +
+              ctc_scale * ctc_probs +
+              kd_scale * kd_probs +
+              kd_scale * sampling_scale * sampling_probs
+
         """
         assert x.ndim == 3, x.shape
         assert x_lens.ndim == 1, x_lens.shape
@@ -140,8 +186,6 @@ class Transducer(nn.Module):
 
         assert x.size(0) == x_lens.size(0) == y.dim0
 
-        if use_teacher_simple_proj:
-            teacher_x_lens = x_lens
         # getting student encoder output and length
         #print(f"{x=}")
         org_x_lens = x_lens
@@ -172,32 +216,6 @@ class Transducer(nn.Module):
         boundary[:, 2] = y_lens
         boundary[:, 3] = x_lens
 
-        # teacher simple loss
-        teacher_simple_loss = None
-        if use_pkd and use_teacher_simple_proj:
-            #print(f"{teacher_model=}")
-            #print(f"{use_pkd=}")
-            assert teacher_model is not None
-            with torch.no_grad():
-                teacher_encoder_out, teacher_x_lens = teacher_model.encoder(x, teacher_x_lens)
-                teacher_decoder_out = teacher_model.decoder(sos_y_padded)
-
-            assert self.teacher_simple_am_proj is not None
-            assert self.teacher_simple_lm_proj is not None
-            teacher_am = self.teacher_simple_am_proj(teacher_encoder_out)
-            teacher_lm = self.teacher_simple_lm_proj(teacher_decoder_out)
-            with torch.cuda.amp.autocast(enabled=False):
-                teacher_simple_loss, (teacher_px_grad, teacher_py_grad) = k2.rnnt_loss_smoothed(
-                    lm=teacher_lm.float(),
-                    am=teacher_am.float(),
-                    symbols=y_padded,
-                    termination_symbol=blank_id,
-                    lm_only_scale=lm_scale,
-                    am_only_scale=am_scale,
-                    boundary=boundary,
-                    reduction="sum",
-                    return_grad=True,
-                )
         lm = self.simple_lm_proj(decoder_out)
         am = self.simple_am_proj(encoder_out)
 
@@ -250,71 +268,266 @@ class Transducer(nn.Module):
         # prior to do_rnnt_pruning (this is an optimization for speed).
         logits = self.joiner(am_pruned, lm_pruned, project_input=False)
 
-        # get logit with pkd_range
-        if use_pkd:
-            student_ranges = k2.get_rnnt_prune_ranges(
-                px_grad=px_grad,
-                py_grad=py_grad,
+        with torch.cuda.amp.autocast(enabled=False):
+            pruned_loss = k2.rnnt_loss_pruned(
+                logits=logits.float(),
+                symbols=y_padded,
+                ranges=ranges,
+                termination_symbol=blank_id,
                 boundary=boundary,
-                s_range=pkd_range,
+                reduction="none",
             )
 
-            # am_pruned : [B, T, prune_range, encoder_dim]
-            # lm_pruned : [B, T, prune_range, decoder_dim]
-            student_am_pruned, student_lm_pruned = k2.do_rnnt_pruning(
-                am=self.joiner.encoder_proj(encoder_out),
-                lm=self.joiner.decoder_proj(decoder_out),
-                ranges=student_ranges,
+        if torch.isnan(pruned_loss).any() or torch.isinf(pruned_loss).any():
+            idx = torch.where(torch.isnan(pruned_loss) | torch.isinf(pruned_loss))
+            print(f"{pruned_loss=}")
+            print("pruned_loss is nan or inf, then terminate training")
+            print(f"{idx=}")
+            #print(f"{logits=}")
+            print(f"{x_lens=}")
+            print(f"{y_lens=}")
+            print(f"{ranges[idx]=}")
+            print(f"{y_padded[idx]=}")
+            print(f"{y_padded[0]=}")
+            import sys
+            sys.exit(0)
+        pruned_loss = pruned_loss.sum()
+
+        # get logit with pruned_kd_range
+        if use_kd:
+            # get teacher encoder out
+            teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
+                x=x,
+                x_lens=org_x_lens,
+                use_grad=False,
             )
-            # logits : [B, T, prune_range, vocab_size]
 
-            # project_input=False since we applied the decoder's input projections
-            # prior to do_rnnt_pruning (this is an optimization for speed).
-            student_logits = self.joiner(student_am_pruned, student_lm_pruned, project_input=False)
+            assert pruned_kd_range > 1, f"{pruned_kd_range=} should be larger than 1"
+            assert not (use_1best and use_nbest), "use_1best and use_nbest cannot be True at the same time"
+            assert not (use_1best and use_pruned), "use_1best and use_pruned cannot be True at the same time"
+            assert not (use_nbest and use_pruned), "use_nbest and use_pruned cannot be True at the same time"
 
-            # In this version, teacher's ranges are from student's ranges
-            # However, the teacher's sampling ranges follows the different logic
-            # They are not from student's ranges
-            assert prune_range >= pkd_range
-            with torch.no_grad():
-                teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
-                    x=x,
-                    x_lens=org_x_lens,
-                    y=y,
+            if use_1best:
+                alignment = nbest_beam_search_alignment[0].unsqueeze(-1).to(torch.int64)
+                teacher_logits = teacher_model.get_logits_with_encoder_out_and_ranges(
+                    encoder_out=teacher_encoder_out,
+                    encoder_out_lens=teacher_encoder_out_lens,
+                    y=nbest_sampling_y[0],
+                    ranges=alignment,
+                    prune_range=1,
+                    use_grad=False,
+                )
+                student_logits = self.get_logits_with_encoder_out_and_ranges(
+                    encoder_out=encoder_out,
+                    encoder_out_lens=x_lens,
+                    y=nbest_sampling_y[0],
+                    ranges=alignment,
+                    prune_range=1,
+                    use_grad=True,
+                )
+                student = F.log_softmax(student_logits, dim=-1)
+                teacher = F.softmax(teacher_logits, dim=-1)
+                max_len = student.size(1)
+                mask = torch.arange(max_len, device=student.device).expand(student.size(0), max_len) < x_lens.unsqueeze(1)
+                mask = mask.unsqueeze(-1).unsqueeze(-1)
+                student = student * mask.float()
+                teacher = teacher * mask.float()
+
+            elif use_nbest:
+                if not use_topk_shuff:
+                    nbest_student = None
+                    nbest_teacher = None
+                    for n in range(0, topk):
+                        alignment = nbest_beam_search_alignment[n].unsqueeze(-1).to(torch.int64)
+                        teacher_logits = teacher_model.get_logits_with_encoder_out_and_ranges(
+                            encoder_out=teacher_encoder_out,
+                            encoder_out_lens=teacher_encoder_out_lens,
+                            y=nbest_sampling_y[n],
+                            ranges=alignment,
+                            prune_range=1,
+                            use_grad=False,
+                        )
+                        student_logits = self.get_logits_with_encoder_out_and_ranges(
+                            encoder_out=encoder_out,
+                            encoder_out_lens=x_lens,
+                            y=nbest_sampling_y[n],
+                            ranges=alignment,
+                            prune_range=1,
+                            use_grad=True,
+                        )
+                        student = F.log_softmax(student_logits, dim=-1)
+                        teacher = F.softmax(teacher_logits, dim=-1)
+                        max_len = student.size(1)
+                        mask = torch.arange(max_len, device=student.device).expand(student.size(0), max_len) < x_lens.unsqueeze(1)
+                        mask = mask.unsqueeze(-1).unsqueeze(-1)
+                        student = student * mask.float()
+                        teacher = teacher * mask.float()
+                        nbest_student = torch.cat([nbest_student, student], dim=2) if nbest_student is not None else student
+                        nbest_teacher = torch.cat([nbest_teacher, teacher], dim=2) if nbest_teacher is not None else teacher
+                    student = nbest_student
+                    teacher = nbest_teacher
+                else:
+                    # select which idx to use
+                    nbest = len(nbest_beam_search_alignment)
+                    choice_idx = int(epoch % nbest)
+
+                    alignment = nbest_beam_search_alignment[choice_idx].unsqueeze(-1).to(torch.int64)
+                    teacher_logits = teacher_model.get_logits_with_encoder_out_and_ranges(
+                        encoder_out=teacher_encoder_out,
+                        encoder_out_lens=teacher_encoder_out_lens,
+                        y=nbest_sampling_y[choice_idx],
+                        ranges=alignment,
+                        prune_range=1,
+                        use_grad=False,
+                    )
+                    student_logits = self.get_logits_with_encoder_out_and_ranges(
+                        encoder_out=encoder_out,
+                        encoder_out_lens=x_lens,
+                        y=nbest_sampling_y[choice_idx],
+                        ranges=alignment,
+                        prune_range=1,
+                        use_grad=True,
+                    )
+                    student = F.log_softmax(student_logits, dim=-1)
+                    teacher = F.softmax(teacher_logits, dim=-1)
+                    max_len = student.size(1)
+                    mask = torch.arange(max_len, device=student.device).expand(student.size(0), max_len) < x_lens.unsqueeze(1)
+                    mask = mask.unsqueeze(-1).unsqueeze(-1)
+                    student = student * mask.float()
+                    teacher = teacher * mask.float()
+            elif use_pruned:
+                if use_llm_gen:
+                    target_label=nbest_sampling_y[0]
+                else:
+                    target_label=y
+
+                tmp_ranges, teacher_logits = teacher_model.get_ranges_and_logits_with_encoder_out(
+                    encoder_out=teacher_encoder_out,
+                    encoder_out_lens=teacher_encoder_out_lens,
+                    y=target_label,
+                    prune_range=pruned_kd_range,
+                    am_scale=am_scale,
+                    lm_scale=lm_scale,
+                    use_teacher_ctc_alignment=False,
+                    use_efficient=False,
+                    use_time_compression=False,
+                    compression_threshold=0.0,
+                    use_beam_search=False,
+                    use_beam_search_alignment=False,
+                    beam_search_alignment=None,
                     use_grad=False,
                 )
 
-                ret = teacher_model.get_logits_with_encoder_out_and_ranges(
+                student_logits = self.get_logits_with_encoder_out_and_ranges(
+                    encoder_out=encoder_out,
+                    encoder_out_lens=x_lens,
+                    y=target_label,
+                    ranges=tmp_ranges,
+                    prune_range=pruned_kd_range,
+                    use_grad=True,
+                )
+
+                student = F.log_softmax(student_logits, dim=-1)
+                teacher = F.softmax(teacher_logits, dim=-1)
+                max_len = student.size(1)
+                mask = torch.arange(max_len, device=student.device).expand(student.size(0), max_len) < x_lens.unsqueeze(1)
+                mask = mask.unsqueeze(-1).unsqueeze(-1)
+                student = student * mask.float()
+                teacher = teacher * mask.float()
+            elif use_efficient:
+                assert False, "Not implemented yet"
+                pass
+                """
+                <-- drag on the left to use use_llm_gen
+                elif use_llm_gen:
+                    tmp_ranges, teacher_logits = teacher_model.get_ranges_and_logits_with_encoder_out(
+                        encoder_out=teacher_encoder_out,
+                        encoder_out_lens=teacher_encoder_out_lens,
+                        y=nbest_sampling_y[0],
+                        prune_range=pruned_kd_range,
+                        am_scale=am_scale,
+                        lm_scale=lm_scale,
+                        use_teacher_ctc_alignment=False,
+                        use_efficient=use_efficient,
+                        use_time_compression=False,
+                        compression_threshold=0.0,
+                        use_beam_search=False,
+                        use_beam_search_alignment=False,
+                        beam_search_alignment=None,
+                        use_grad=False,
+                    )
+
+                    student_logits = self.get_logits_with_encoder_out_and_ranges(
+                        encoder_out=encoder_out,
+                        encoder_out_lens=x_lens,
+                        y=nbest_sampling_y[0],
+                        ranges=tmp_ranges,
+                        prune_range=pruned_kd_range,
+                        use_grad=True,
+                    )
+
+                    student = F.log_softmax(student_logits, dim=-1)
+                    teacher = F.softmax(teacher_logits, dim=-1)
+                    max_len = student.size(1)
+                    mask = torch.arange(max_len, device=student.device).expand(student.size(0), max_len) < x_lens.unsqueeze(1)
+                    mask = mask.unsqueeze(-1).unsqueeze(-1)
+                    student = student * mask.float()
+                    teacher = teacher * mask.float()
+                """
+            else:
+                # for reference
+                # this logic re-uses the ranges from student model
+                student_logits = self.get_logits_with_encoder_out_and_ranges(
+                    encoder_out=encoder_out,
+                    encoder_out_lens=x_lens,
+                    y=y,
+                    ranges=ranges,
+                    prune_range=prune_range,
+                    use_grad=True,
+                )
+
+                teacher_logits = teacher_model.get_logits_with_encoder_out_and_ranges(
                     encoder_out=teacher_encoder_out,
                     encoder_out_lens=teacher_encoder_out_lens,
                     y=y,
-                    ranges=student_ranges,
-                    prune_range=pkd_range,
+                    ranges=ranges,
+                    prune_range=prune_range,
+                    use_grad=False,
                 )
+                student = F.log_softmax(student_logits, dim=-1)
+                teacher = F.softmax(teacher_logits, dim=-1)
+                max_len = student.size(1)
+                mask = torch.arange(max_len, device=student.device).expand(student.size(0), max_len) < x_lens.unsqueeze(1)
+                mask = mask.unsqueeze(-1).unsqueeze(-1)
+                student = student * mask.float()
+                teacher = teacher * mask.float()
+            kd_loss = self.kd_criterion(student, teacher)
 
-                teacher_ranges = student_ranges
-                teacher_logits = ret
+        if use_sq_sampling:
+            assert use_1best is False, "1best kd is not supported with sequence sampling"
+            assert use_nbest is False, "nbest kd is not supported with sequence sampling"
 
-            if use_sq_sampling:
-                teacher_sampling_ranges = list()
-                teacher_sampling_logits = list()
-                sampling_y = list()
-                for n in range(1, sq_sampling_num+1):
-                    yy = list()
-                    y_list = y.tolist()
-                    # in the case of the number of samples is 1
-                    # y_list[(i+1)%len(y_list)] means the next sample in a batch
-                    for i in range(len(y_list)):
-                        yy.append(y_list[(i+n)%len(y_list)])
+            sampling_loss = torch.tensor(0.0).to(logits.device)
+            teacher_sampling_ranges = list()
+            teacher_sampling_logits = list()
+            sampling_y = list()
+            for n in range(1, sq_sampling_num+1):
+                yy = list()
+                y_list = y.tolist()
+                # in the case of the number of samples is 1
+                # y_list[(i+1)%len(y_list)] means the next sample in a batch
+                for i in range(len(y_list)):
+                    yy.append(y_list[(i+n)%len(y_list)])
 
-                    sampling_y.append(k2.RaggedTensor(yy).to(x.device))
-                    # the yy is the less probable label sequence
+                sampling_y.append(k2.RaggedTensor(yy).to(x.device))
+                # the yy is the less probable label sequence
 
+                if use_sq_simple_loss_range is True:
                     sampling_ret = teacher_model.get_ranges_and_logits_with_encoder_out(
                         encoder_out=teacher_encoder_out,
                         encoder_out_lens=teacher_encoder_out_lens,
-                        y=sampling_y[-1],
-                        prune_range=pkd_range,
+                        y=sampling_y[n-1],
+                        prune_range=pruned_kd_range,
                         am_scale=am_scale,
                         lm_scale=lm_scale,
                         use_teacher_ctc_alignment=False,
@@ -330,115 +543,64 @@ class Transducer(nn.Module):
                     teacher_sampling_ranges.append(sampling_ret[0])
                     teacher_sampling_logits.append(sampling_ret[1])
 
-        if use_alphas:
-            with torch.cuda.amp.autocast(enabled=False):
-                pruned_loss, alphas = k2.rnnt_loss_pruned_rt_alphas(
-                    logits=logits.float(),
-                    symbols=y_padded,
-                    ranges=ranges,
-                    termination_symbol=blank_id,
-                    boundary=boundary,
-                    reduction="sum",
-                )
-        else: #original
-            with torch.cuda.amp.autocast(enabled=False):
-                pruned_loss = k2.rnnt_loss_pruned(
-                    logits=logits.float(),
-                    symbols=y_padded,
-                    ranges=ranges,
-                    termination_symbol=blank_id,
-                    boundary=boundary,
-                    reduction="none",
-                )
+                elif use_sq_simple_loss_range is False:
+                    # getting random alignments
+                    # initiallize a tensor to keep the alignments
+                    sampled_y_alignments = torch.zeros(teacher_encoder_out.size(0),
+                                                       teacher_encoder_out.size(1),
+                                                       dtype=torch.int64,
+                                                       device=teacher_encoder_out.device)
+                    sampled_y_lens = [len(i) for i in sampling_y[n-1].tolist()]
 
-            if torch.isnan(pruned_loss).any() or torch.isinf(pruned_loss).any():
-                idx = torch.where(torch.isnan(pruned_loss) | torch.isinf(pruned_loss))
-                print(f"{pruned_loss=}")
-                print("pruned_loss is nan or inf, then terminate training")
-                print(f"{idx=}")
-                #print(f"{logits=}")
-                print(f"{x_lens=}")
-                print(f"{y_lens=}")
-                print(f"{ranges[idx]=}")
-                print(f"{y_padded[idx]=}")
-                print(f"{y_padded[0]=}")
-                import sys
-                sys.exit(0)
-            pruned_loss = pruned_loss.sum()
-        #print(f"{pruned_loss=}")
-        #if not torch.isfinite(pruned_loss):
-        #    print("pruned_loss is inf or nan, then terminate training")
-        #    import sys
-        #    sys.exit(0)
+                    # filter out when U is shorter than pruned_kd_range
+                    short_indics = list()
+                    noprob_indics = list()
+                    for ii, _ in enumerate(sampled_y_lens):
+                        if sampled_y_lens[ii] < pruned_kd_range:
+                            short_indics.append(ii)
+                        else:
+                            noprob_indics.append(ii)
 
-        if use_pkd:
-            assert student_logits.shape == teacher_logits.shape
+                    for ii in short_indics:
+                        # random pick from noprob_indics
+                        random_index = random.choice(noprob_indics)
+                        sampled_y_lens[ii] = sampled_y_lens[random_index]
+                        yy[ii] = yy[random_index]
+                    # update sampling_y
+                    sampling_y[n-1] = k2.RaggedTensor(yy).to(x.device)
 
-            if use_efficient:
-                logits_dict = dict()
-                logits_dict["student"] = student_logits
-                logits_dict["teacher"] = teacher_logits
-                tmp_ranges = student_ranges
-                print(f"{y=}")
-                expanded_ranges = tmp_ranges.unsqueeze(3).expand(-1, -1, -1, student_logits.size(-1))
-                #indexed_labels = y_padded.unsqueeze(1).expand(-1, tmp_ranges.size(1), -1).gather(2, tmp_ranges)
-                #s_logits = torch.gather(student_logits, 2, expanded_ranges)
-                #student_logits = torch.gather(s_logits, 2, indexed_labels.unsqueeze(-1))
-                #t_logits = torch.gather(teacher_logits, 2, expanded_ranges)
-                #teacher_logits = torch.gather(t_logits, 2, indexed_labels.unsqueeze(-1))
-                #print(f"{expanded_ranges=}")
-                """
-                ret = get_efficient(logits_dict=logits_dict,
-                                    x_lens=x_lens,
-                                    y=y.clone(),
-                                    blank_id=blank_id,
-                                    is_pruned=True,
-                                    ranges=student_ranges,
-                                    )
-                student = ret["student"]
-                teacher = ret["teacher"]
-                """
-                import sys
-                sys.exit(0)
-            else:
-                student = F.log_softmax(student_logits, dim=-1)
-                teacher = F.softmax(teacher_logits, dim=-1)
+                    for ii in range(len(sampled_y_lens)):
+                        sampled_y_alignments[ii, :teacher_encoder_out_lens[ii]] = create_pseudo_alignment(
+                                                                                        teacher_encoder_out_lens[ii],
+                                                                                        sampled_y_lens[ii],
+                                                                                        is_even_alignment=use_even_alignment,)
+                        max_value = torch.max(sampled_y_alignments[ii])
+                        non_zero_index = torch.nonzero(sampled_y_alignments[ii])
+                        last_non_zero_index = non_zero_index[-1].item()
+                        start_index = last_non_zero_index + 1
+                        sampled_y_alignments[ii, start_index:] = max_value
 
-                # T-axis direction masking
-                max_len = logits.size(1)
-                mask = torch.arange(max_len, device=logits.device).expand(logits.size(0), max_len) < x_lens.unsqueeze(1)
-                mask = mask.unsqueeze(-1).unsqueeze(-1)
+                    sampled_ranges = create_increasing_sublists_torch(sampled_y_alignments, pruned_kd_range)
+                    teacher_logits = teacher_model.get_logits_with_encoder_out_and_ranges(
+                        encoder_out=teacher_encoder_out,
+                        encoder_out_lens=teacher_encoder_out_lens,
+                        y=sampling_y[n-1],
+                        ranges=sampled_ranges,
+                        use_grad=False,
+                    )
 
-                student = student * mask.float()
-                teacher = teacher * mask.float()
+                    teacher_sampling_ranges.append(sampled_ranges)
+                    teacher_sampling_logits.append(teacher_logits)
 
-            pkd_loss = self.pkd_criterion(student, teacher)
-
-        if use_ctc:
-            # print(f"{y_padded=}")
-            # print(f"{y_lens=}")
-            ctc_out = self.ctc_layer(encoder_out)
-            ctc_out = F.log_softmax(ctc_out, dim=-1).transpose(0, 1)
-            ctc_loss = self.ctc_criterion(ctc_out, y_padded, x_lens, y_lens)
-
-        if use_sq_sampling:
-            sampling_loss = torch.tensor(0.0).to(logits.device)
-            for i in range(sq_sampling_num):
-                sampling_logits = self.get_logits(
+                student_sampling_logits = self.get_logits_with_encoder_out_and_ranges(
                     encoder_out=encoder_out,
                     encoder_out_lens=x_lens,
-                    y=sampling_y[i],
-                    prune_range=pkd_range,
-                    am_scale=am_scale,
-                    lm_scale=lm_scale,
-                    ranges=teacher_sampling_ranges[i],
+                    y=sampling_y[n-1],
+                    ranges=teacher_sampling_ranges[n-1],
                     use_grad=True,
                 )
-
-                student_sampling_logits = sampling_logits
-
                 student_sampling = F.log_softmax(student_sampling_logits, dim=-1)
-                teacher_sampling = F.softmax(teacher_sampling_logits[i], dim=-1)
+                teacher_sampling = F.softmax(teacher_sampling_logits[n-1], dim=-1)
 
                 # T-axis direction masking
                 max_len = student_sampling_logits.size(1)
@@ -447,33 +609,42 @@ class Transducer(nn.Module):
 
                 student_sampling = student_sampling * mask.float()
                 teacher_sampling = teacher_sampling * mask.float()
-
-                sampling_loss += self.pkd_criterion(student_sampling, teacher_sampling)
+                sampling_loss += self.kd_criterion(student_sampling, teacher_sampling)
             # getting average for the sampling loss
             sampling_loss /= sq_sampling_num
+
+        if use_token_correlation:
+            teacher_delta = teacher[:, 1:] - teacher[:, :-1]
+            student_delta = student[:, 1:] - student[:, :-1]
+            token_correlation_loss = self.mse_criterion(student_delta, teacher_delta)
+
+        if use_ctc:
+            ctc_out = self.ctc_layer(encoder_out)
+            ctc_out = F.log_softmax(ctc_out, dim=-1).transpose(0, 1)
+            ctc_loss = self.ctc_criterion(ctc_out, y_padded, x_lens, y_lens)
 
         ret = dict()
         ret["simple_loss"] = simple_loss
         ret["pruned_loss"] = pruned_loss
-        if use_pkd:
-            ret["pkd_loss"] = pkd_loss
+        if use_kd:
+            ret["kd_loss"] = kd_loss
         else:
-            ret["pkd_loss"] = torch.tensor(0.0)
+            ret["kd_loss"] = torch.tensor(0.0)
 
         if use_ctc:
             ret["ctc_loss"] = ctc_loss
         else:
             ret["ctc_loss"] = torch.tensor(0.0)
 
-        if use_teacher_simple_proj:
-            ret["teacher_simple_loss"] = teacher_simple_loss
-        else:
-            ret["teacher_simple_loss"] = torch.tensor(0.0)
-
         if use_sq_sampling:
             ret["sampling_loss"] = sampling_loss
         else:
             ret["sampling_loss"] = torch.tensor(0.0)
+
+        if use_token_correlation:
+            ret["token_correlation_loss"] = token_correlation_loss
+        else:
+            ret["token_correlation_loss"] = torch.tensor(0.0)
 
         return ret
 
@@ -557,7 +728,7 @@ class Transducer(nn.Module):
         logits = self.joiner(am_pruned, lm_pruned, project_input=False)
 
         ctc_range.requires_grad_(False)
-        logits = logits.detach_()
+        logits = logits.detach()
 
         return ctc_range, logits
 
@@ -817,7 +988,7 @@ class Transducer(nn.Module):
 
         ranges.requires_grad_(False)
         if use_grad is False:
-            logits = logits.detach_()
+            logits = logits.detach()
 
         masks = None
 
@@ -1026,9 +1197,7 @@ class Transducer(nn.Module):
 
         ranges.requires_grad_(False)
         if use_grad is False:
-            logits = logits.detach_()
-
-        masks = None
+            logits = logits.detach()
 
         ret = (ranges, logits)
 
@@ -1107,9 +1276,7 @@ class Transducer(nn.Module):
 
         ranges.requires_grad_(False)
         if use_grad is False:
-            logits = logits.detach_()
-
-        masks = None
+            logits = logits.detach()
 
         ret = logits
 
@@ -1119,7 +1286,6 @@ class Transducer(nn.Module):
         self,
         x: torch.Tensor,
         x_lens: torch.Tensor,
-        y: k2.RaggedTensor,
         use_grad: bool = False,
     ):
         """
@@ -1144,9 +1310,8 @@ class Transducer(nn.Module):
         """
         assert x.ndim == 3, x.shape
         assert x_lens.ndim == 1, x_lens.shape
-        assert y.num_axes == 2, y.num_axes
 
-        assert x.size(0) == x_lens.size(0) == y.dim0
+        assert x.size(0) == x_lens.size(0)
 
         encoder_out, encoder_out_lens = self.encoder(x, x_lens)
         assert torch.all(x_lens > 0)
@@ -1241,7 +1406,7 @@ class Transducer(nn.Module):
 
         ranges.requires_grad_(False)
         if use_grad is False:
-            logits = logits.detach_()
+            logits = logits.detach()
 
         masks = None
 
