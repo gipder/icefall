@@ -1079,6 +1079,7 @@ def main():
     args.return_cuts = True
     librispeech = LibriSpeechAsrDataModule(args)
 
+    train_cuts = librispeech.train_all_shuf_cuts()
     train_clean_100_cuts = librispeech.train_clean_100_cuts()
     train_small_cuts = librispeech.train_small_cuts()
     test_clean_cuts = librispeech.test_clean_cuts()
@@ -1090,6 +1091,7 @@ def main():
     #train_small_dl = librispeech.train_dataloaders(train_small_cuts)
     test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
     #test_other_dl = librispeech.test_dataloaders(test_other_cuts)
+    train_all_shuf_dl = librispeech.test_dataloaders(train_cuts)
 
     #test_sets = ["test-clean", "test-other"]
     #test_dl = [test_clean_dl, test_other_dl]
@@ -1102,8 +1104,8 @@ def main():
     epoch = 1
     for e in range(1, epoch + 1):
         cache = dict()
-        test_sets = ["train-clean-100"]
-        test_dl = [train_clean_100_dl]
+        test_sets = ["train-all-shuf"]
+        test_dl = [train_all_shuf_dl]
         #test_sets = ["train-small"]
         #test_dl = [train_small_dl]
         #test_sets = ["test-clean"]
