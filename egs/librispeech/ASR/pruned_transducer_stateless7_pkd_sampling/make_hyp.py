@@ -1129,6 +1129,10 @@ def main():
             train_clean_100_cuts = librispeech.train_clean_100_cuts()
             train_clean_100_dl = librispeech.test_dataloaders(train_clean_100_cuts)
             test_dl.append(train_clean_100_dl)
+        elif cut == "train-all-shuf":
+            train_all_shuf_cuts = librispeech.train_all_shuf_cuts()
+            train_all_shuf_dl = librispeech.test_dataloaders(train_all_shuf_cuts)
+            test_dl.append(train_all_shuf_dl)
         elif cut == "train-small":
             train_small_cuts = librispeech.train_small_cuts()
             train_small_dl = librispeech.test_dataloaders(train_small_cuts)
