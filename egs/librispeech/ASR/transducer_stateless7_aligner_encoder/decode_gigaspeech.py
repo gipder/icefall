@@ -92,41 +92,6 @@ Usage:
     --beam 20.0 \
     --max-contexts 8 \
     --max-states 64
-
-(8) modified beam search with RNNLM shallow fusion
-./pruned_transducer_stateless5/decode.py \
-    --epoch 35 \
-    --avg 15 \
-    --exp-dir ./pruned_transducer_stateless5/exp \
-    --max-duration 600 \
-    --decoding-method modified_beam_search_lm_shallow_fusion \
-    --beam-size 4 \
-    --lm-type rnn \
-    --lm-scale 0.3 \
-    --lm-exp-dir /path/to/LM \
-    --rnn-lm-epoch 99 \
-    --rnn-lm-avg 1 \
-    --rnn-lm-num-layers 3 \
-    --rnn-lm-tie-weights 1
-
-(9) modified beam search with LM shallow fusion + LODR
-./pruned_transducer_stateless5/decode.py \
-    --epoch 28 \
-    --avg 15 \
-    --max-duration 600 \
-    --exp-dir ./pruned_transducer_stateless5/exp \
-    --decoding-method modified_beam_search_LODR \
-    --beam-size 4 \
-    --lm-type rnn \
-    --lm-scale 0.4 \
-    --lm-exp-dir /path/to/LM \
-    --rnn-lm-epoch 99 \
-    --rnn-lm-avg 1 \
-    --rnn-lm-num-layers 3 \
-    --rnn-lm-tie-weights 1
-    --tokens-ngram 2 \
-    --ngram-lm-scale -0.16 \
-
 """
 
 
@@ -141,7 +106,9 @@ import k2
 import sentencepiece as spm
 import torch
 import torch.nn as nn
-from asr_datamodule import LibriSpeechAsrDataModule
+
+# from asr_datamodule import LibriSpeechAsrDataModule
+from gigaspeech import GigaSpeechAsrDataModule
 from beam_search import (
     beam_search,
     fast_beam_search_nbest,
@@ -151,15 +118,10 @@ from beam_search import (
     greedy_search,
     greedy_search_batch,
     modified_beam_search,
-    modified_beam_search_for_kd,
-    modified_beam_search_for_kd_nbest,
-    modified_beam_search_lm_shallow_fusion,
-    modified_beam_search_LODR,
-    modified_beam_search_ngram_rescoring,
 )
+from gigaspeech_scoring import asr_text_post_processing
 from train import add_model_arguments, get_params, get_transducer_model
 
-from icefall import LmScorer, NgramLm
 from icefall.checkpoint import (
     average_checkpoints,
     average_checkpoints_with_averaged_model,
@@ -175,10 +137,8 @@ from icefall.utils import (
     write_error_stats,
 )
 
-import pickle
-from hyp_gen import HYPGenDB, HYPGenDict
-
 LOG_EPS = math.log(1e-10)
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -257,8 +217,6 @@ def get_parser():
           - fast_beam_search_nbest
           - fast_beam_search_nbest_oracle
           - fast_beam_search_nbest_LG
-          - modified_beam_search_lm_shallow_fusion # for rnn lm shallow fusion
-          - modified_beam_search_LODR
         If you use fast_beam_search_nbest_LG, you have to specify
         `--lang-dir`, which should contain `LG.pt`.
         """,
@@ -320,7 +278,6 @@ def get_parser():
         default=2,
         help="The context size in the decoder. 1 means bigram; 2 means tri-gram",
     )
-
     parser.add_argument(
         "--max-sym-per-frame",
         type=int,
@@ -348,93 +305,42 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--use-shallow-fusion",
+        "--simulate-streaming",
         type=str2bool,
         default=False,
-        help="""Use neural network LM for shallow fusion.
-        If you want to use LODR, you will also need to set this to true
+        help="""Whether to simulate streaming in decoding, this is a good way to
+        test a streaming model.
         """,
     )
 
     parser.add_argument(
-        "--lm-type",
-        type=str,
-        default="rnn",
-        help="Type of NN lm",
-        choices=["rnn", "transformer"],
-    )
-
-    parser.add_argument(
-        "--lm-scale",
-        type=float,
-        default=0.3,
-        help="""The scale of the neural network LM
-        Used only when `--use-shallow-fusion` is set to True.
-        """,
-    )
-
-    parser.add_argument(
-        "--tokens-ngram",
+        "--decode-chunk-size",
         type=int,
-        default=3,
-        help="""Token Ngram used for rescoring.
-            Used only when the decoding method is
-            modified_beam_search_ngram_rescoring, or LODR
-            """,
+        default=16,
+        help="The chunk size for decoding (in frames after subsampling)",
     )
 
     parser.add_argument(
-        "--backoff-id",
+        "--left-context",
         type=int,
-        default=500,
-        help="""ID of the backoff symbol.
-                Used only when the decoding method is
-                modified_beam_search_ngram_rescoring""",
+        default=64,
+        help="left context can be seen during decoding (in frames after subsampling)",
     )
 
-    parser.add_argument(
-        "--save-hypotheses",
-        type=str,
-        default="hypotheses.pkl",
-        help="""pickle dump file to save hypotheses from ASR.
-                the pkl file consists of a dictionary in python.
-                the dictionary has a key and value pair.
-                the key is the utterance id and the value is
-                a list of hypotheses.""",
-    )
-
-    parser.add_argument(
-        "--topk",
-        type=int,
-        default=4,
-        help="""How many top-k lists we need to keep""",
-    )
-
-    def comma_separated_list(value):
-        # 쉼표로 문자열을 분할하고 공백을 제거한 리스트를 반환
-        return [item.strip() for item in value.split(',')]
-
-    def comma_separated_list_in_float(value):
-        # 쉼표로 문자열을 분할하고 공백을 제거한 리스트를 반환
-        return [float(item.strip()) for item in value.split(',')]
-
-    parser.add_argument(
-        "--test-set",
-        type=comma_separated_list,
-        default=["test-clean-100"],
-        help="Comma separated list to make hypotheses",
-    )
-
-    parser.add_argument(
-        "--use-hyp-gen",
-        type=str2bool,
-        default=False,
-        help="Whether to use HYPGenDicT and HYPGenDB,"
-        " which are classes to save hypotheses in text format",
-    )
     add_model_arguments(parser)
 
     return parser
+
+
+def post_processing(
+    results: List[Tuple[str, List[str], List[str]]],
+) -> List[Tuple[str, List[str], List[str]]]:
+    new_results = []
+    for key, ref, hyp in results:
+        new_ref = asr_text_post_processing(" ".join(ref)).split()
+        new_hyp = asr_text_post_processing(" ".join(hyp)).split()
+        new_results.append((key, new_ref, new_hyp))
+    return new_results
 
 
 def decode_one_batch(
@@ -444,10 +350,6 @@ def decode_one_batch(
     batch: dict,
     word_table: Optional[k2.SymbolTable] = None,
     decoding_graph: Optional[k2.Fsa] = None,
-    ngram_lm: Optional[NgramLm] = None,
-    ngram_lm_scale: float = 1.0,
-    LM: Optional[LmScorer] = None,
-    cache: Optional[dict] = None,
 ) -> Dict[str, List[List[str]]]:
     """Decode one batch and return the result in a dict. The dict has the
     following format:
@@ -476,13 +378,6 @@ def decode_one_batch(
         The decoding graph. Can be either a `k2.trivial_graph` or HLG, Used
         only when --decoding_method is fast_beam_search, fast_beam_search_nbest,
         fast_beam_search_nbest_oracle, and fast_beam_search_nbest_LG.
-      LM:
-        A neural net LM for shallow fusion. Only used when `--use-shallow-fusion`
-        set to true.
-      ngram_lm:
-        A ngram lm. Used in LODR decoding.
-      ngram_lm_scale:
-        The scale of the ngram language model.
     Returns:
       Return the decoding result. See above description for the format of
       the returned dict.
@@ -497,7 +392,22 @@ def decode_one_batch(
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)
 
-    encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
+    if params.simulate_streaming:
+        feature_lens += params.left_context
+        feature = torch.nn.functional.pad(
+            feature,
+            pad=(0, 0, 0, params.left_context),
+            value=LOG_EPS,
+        )
+        encoder_out, encoder_out_lens, _ = model.encoder.streaming_forward(
+            x=feature,
+            x_lens=feature_lens,
+            chunk_size=params.decode_chunk_size,
+            left_context=params.left_context,
+            simulate_streaming=True,
+        )
+    else:
+        encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
 
     hyps = []
 
@@ -571,128 +481,7 @@ def decode_one_batch(
             encoder_out_lens=encoder_out_lens,
             beam=params.beam_size,
         )
-        print(hyp_tokens)
-        print(sp.decode(hyp_tokens))
-        import sys
-        sys.exit(0)
         for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
-    elif params.decoding_method == "modified_beam_search_for_kd":
-        decoding_result = modified_beam_search_for_kd(
-            model=model,
-            x=feature,
-            x_lens=feature_lens,
-            beam=params.beam_size,
-        )
-
-        ids = list()
-        #print(f"{batch['supervisions']['cut'][0].id=}")
-        for i in range(len(batch["supervisions"]['cut'])):
-            ids.append(batch["supervisions"]['cut'][i].id)
-
-        # adding
-        hyp_alignment = torch.zeros(feature_lens.size()[0], math.ceil((feature_lens[0]-8)/4), dtype=torch.int)
-        for i in range(feature_lens.size()[0]):
-            for j in range(len(decoding_result.hyps[i])):
-                hyp_alignment[i, decoding_result.timestamps[i][j]] = decoding_result.hyps[i][j]
-
-        hyp_tokens = hyp_alignment.tolist()
-        for i in range(len(hyp_tokens)):
-            cache[ids[i]] = hyp_tokens[i]
-        #a = list(filter(lambda x:x != 0, hyp_tokens[0]))
-        #print(f"{list(filter(lambda x:x != 0, hyp_tokens[0]))=}")
-        #print(f"{len(list(filter(lambda x:x != 0, hyp_tokens[0])))=}")
-        #print(f"{hyp_tokens[0]=}")
-        # real hyp_tokens
-        hyp_tokens = decoding_result.hyps
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
-        #print(f"{len(hyp_tokens[0])=}")
-        #print(f"{hyp_tokens[0]=}")
-        #print(f"{a==hyp_tokens[0]}")
-
-    elif params.decoding_method == "modified_beam_search_for_kd_nbest":
-        tmp_hyps, timestamps = modified_beam_search_for_kd_nbest(
-            model=model,
-            x=feature,
-            x_lens=feature_lens,
-            beam=params.beam_size,
-            topk=params.topk
-        )
-
-        nbest = params.topk
-        ids = list()
-        #print(f"{hyps=}")
-        #print(f"{timestamps=}")
-        #print(f"{batch['supervisions']['cut'][0].id=}")
-        for i in range(len(batch["supervisions"]['cut'])):
-            ids.append(batch["supervisions"]['cut'][i].id)
-
-        # adding
-        hyp_alignment = torch.zeros(feature_lens.size()[0], nbest, math.ceil((feature_lens[0]-8)/4), dtype=torch.int)
-        #print(f"{hyp_alignment.shape=}")
-        for i in range(feature_lens.size()[0]):
-            for n in range(nbest):
-                for j in range(len(tmp_hyps[i][n])):
-                    hyp_alignment[i, n, timestamps[i][n][j]] = tmp_hyps[i][n][j]
-
-        hyp_tokens = hyp_alignment.tolist()
-        for i in range(len(hyp_tokens)):
-            cache[ids[i]] = hyp_tokens[i]
-
-        nbest_hyp_tokens = list()
-        hyp_tokens = list()
-        for i in tmp_hyps:
-            hyp_tokens.append(i[0]) # 1-best only
-        if params.use_hyp_gen:
-            for i in tmp_hyps:
-                nbest_hyp_token = list()
-                for n in range(len(i)):
-                    nbest_hyp_token.append(i[n])
-                nbest_hyp_tokens.append(nbest_hyp_token)
-
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
-
-        nbest_hyps = list()
-        if params.use_hyp_gen:
-            for i in range(len(nbest_hyp_tokens)):
-                one_nbest_hyps = list()
-                for n in range(params.beam_size):
-                    one_nbest_hyps.append(sp.decode(nbest_hyp_tokens[i][n]))
-                nbest_hyps.append(one_nbest_hyps)
-
-    elif params.decoding_method == "modified_beam_search_lm_shallow_fusion":
-        hyp_tokens = modified_beam_search_lm_shallow_fusion(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=params.beam_size,
-            LM=LM,
-        )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
-    elif params.decoding_method == "modified_beam_search_LODR":
-        hyp_tokens = modified_beam_search_LODR(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=params.beam_size,
-            LODR_lm=ngram_lm,
-            LODR_lm_scale=ngram_lm_scale,
-            LM=LM,
-        )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
-    elif params.decoding_method == "ctc-decoding":
-        logits = model.ctc_layer(encoder_out)
-        predicted_ids = torch.argmax(logits, dim=-1)
-        hyps_list = []
-        for i in range(predicted_ids.shape[0]):
-            tmp_predicted_ids = torch.unique_consecutive(predicted_ids[i, :])
-            tmp_predicted_ids = tmp_predicted_ids[tmp_predicted_ids != 0].cpu().detach()
-            hyps_list.append(tmp_predicted_ids.tolist())
-        for hyp in sp.decode(hyps_list):
             hyps.append(hyp.split())
     else:
         batch_size = encoder_out.size(0)
@@ -733,10 +522,7 @@ def decode_one_batch(
 
         return {key: hyps}
     else:
-        if params.use_hyp_gen:
-            return {f"beam_size_{params.beam_size}": hyps}, nbest_hyps
-        else:
-            return {f"beam_size_{params.beam_size}": hyps}
+        return {f"beam_size_{params.beam_size}": hyps}
 
 
 def decode_dataset(
@@ -746,11 +532,6 @@ def decode_dataset(
     sp: spm.SentencePieceProcessor,
     word_table: Optional[k2.SymbolTable] = None,
     decoding_graph: Optional[k2.Fsa] = None,
-    ngram_lm: Optional[NgramLm] = None,
-    ngram_lm_scale: float = 1.0,
-    LM: Optional[LmScorer] = None,
-    cache: Optional[dict] = None,
-    hyp_gen_db: Optional[HYPGenDB] = None,
 ) -> Dict[str, List[Tuple[str, List[str], List[str]]]]:
     """Decode dataset.
 
@@ -769,8 +550,6 @@ def decode_dataset(
         The decoding graph. Can be either a `k2.trivial_graph` or HLG, Used
         only when --decoding_method is fast_beam_search, fast_beam_search_nbest,
         fast_beam_search_nbest_oracle, and fast_beam_search_nbest_LG.
-      LM:
-        A neural network LM, used during shallow fusion
     Returns:
       Return a dict, whose key may be "greedy_search" if greedy search
       is used, or it may be "beam_7" if beam size of 7 is used.
@@ -792,51 +571,25 @@ def decode_dataset(
 
     results = defaultdict(list)
     for batch_idx, batch in enumerate(dl):
-        #if len(cache.keys()) == 0:
-        #    print(f"{batch}")
         texts = batch["supervisions"]["text"]
         cut_ids = [cut.id for cut in batch["supervisions"]["cut"]]
 
-        if params.use_hyp_gen:
-            hyps_dict, nbest_hyps = decode_one_batch(
-                params=params,
-                model=model,
-                sp=sp,
-                decoding_graph=decoding_graph,
-                word_table=word_table,
-                batch=batch,
-                ngram_lm=ngram_lm,
-                ngram_lm_scale=ngram_lm_scale,
-                LM=LM,
-                cache=cache,
-            )
-        else:
-            hyps_dict = decode_one_batch(
-                params=params,
-                model=model,
-                sp=sp,
-                decoding_graph=decoding_graph,
-                word_table=word_table,
-                batch=batch,
-                ngram_lm=ngram_lm,
-                ngram_lm_scale=ngram_lm_scale,
-                LM=LM,
-                cache=cache,
-            )
+        hyps_dict = decode_one_batch(
+            params=params,
+            model=model,
+            sp=sp,
+            decoding_graph=decoding_graph,
+            word_table=word_table,
+            batch=batch,
+        )
 
         for name, hyps in hyps_dict.items():
             this_batch = []
             assert len(hyps) == len(texts)
-            if params.use_hyp_gen:
-                assert len(hyps) == len(nbest_hyps)
-                for cut_id, hyp_words, ref_text, one_nbest_hyps in zip(cut_ids, hyps, texts, nbest_hyps):
-                    ref_words = ref_text.split()
-                    this_batch.append((cut_id, ref_words, hyp_words))
-                    hyp_gen_db.add_entry(cut_id, ref_text, one_nbest_hyps)
-            else:
-                for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
-                    ref_words = ref_text.split()
-                    this_batch.append((cut_id, ref_words, hyp_words))
+            for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
+                ref_words = ref_text.split()
+                this_batch.append((cut_id, ref_words, hyp_words))
+
             results[name].extend(this_batch)
 
         num_cuts += len(texts)
@@ -845,9 +598,6 @@ def decode_dataset(
             batch_str = f"{batch_idx}/{num_batches}"
 
             logging.info(f"batch {batch_str}, cuts processed until now is {num_cuts}")
-        #break
-        #import sys
-        #sys.exit(0)
     return results
 
 
@@ -855,19 +605,22 @@ def save_results(
     params: AttributeDict,
     test_set_name: str,
     results_dict: Dict[str, List[Tuple[str, List[str], List[str]]]],
-    cache: Optional[dict] = None,
-    hyp_gen_db: Optional[HYPGenDB] = None,
 ):
     test_set_wers = dict()
     for key, results in results_dict.items():
-        recog_path = params.res_dir / f"recogs-{test_set_name}-{params.suffix}.txt"
+        recog_path = (
+            params.res_dir / f"recogs-{test_set_name}-{key}-{params.suffix}.txt"
+        )
+        results = post_processing(results)
         results = sorted(results)
         store_transcripts(filename=recog_path, texts=results)
         logging.info(f"The transcripts are stored in {recog_path}")
 
         # The following prints out WERs, per-word error statistics and aligned
         # ref/hyp pairs.
-        errs_filename = params.res_dir / f"errs-{test_set_name}-{params.suffix}.txt"
+        errs_filename = (
+            params.res_dir / f"errs-{test_set_name}-{key}-{params.suffix}.txt"
+        )
         with open(errs_filename, "w") as f:
             wer = write_error_stats(
                 f, f"{test_set_name}-{key}", results, enable_log=True
@@ -877,7 +630,9 @@ def save_results(
         logging.info("Wrote detailed error stats to {}".format(errs_filename))
 
     test_set_wers = sorted(test_set_wers.items(), key=lambda x: x[1])
-    errs_info = params.res_dir / f"wer-summary-{test_set_name}-{params.suffix}.txt"
+    errs_info = (
+        params.res_dir / f"wer-summary-{test_set_name}-{key}-{params.suffix}.txt"
+    )
     with open(errs_info, "w") as f:
         print("settings\tWER", file=f)
         for key, val in test_set_wers:
@@ -890,21 +645,15 @@ def save_results(
         note = ""
     logging.info(s)
 
-    dump_file = open(f"{params.res_dir}/{test_set_name}.{params.save_hypotheses}", "wb")
-    pickle.dump(cache, dump_file)
-    logging.info(f"Dumped cache to {params.res_dir/params.save_hypotheses}")
-
-    if params.use_hyp_gen:
-        hyp_gen_db_file_name = f"{params.res_dir}/{test_set_name}.{params.save_hypotheses}.hyp_gen_db"
-        hyp_gen_db_file = open(hyp_gen_db_file_name, "wb")
-        pickle.dump(hyp_gen_db, hyp_gen_db_file)
-        logging.info(f"Dumped hyp_gen_db to {hyp_gen_db_file_name}")
 
 @torch.no_grad()
 def main():
+    """
+    This scripts test a libri model with libri BPE
+    on Gigaspeech.
+    """
     parser = get_parser()
-    LibriSpeechAsrDataModule.add_arguments(parser)
-    LmScorer.add_arguments(parser)
+    GigaSpeechAsrDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
 
@@ -919,18 +668,17 @@ def main():
         "fast_beam_search_nbest_LG",
         "fast_beam_search_nbest_oracle",
         "modified_beam_search",
-        "modified_beam_search_lm_shallow_fusion",
-        "modified_beam_search_LODR",
-        "modified_beam_search_for_kd",
-        "modified_beam_search_for_kd_nbest",
-        "ctc-decoding"
     )
-    params.res_dir = params.exp_dir / params.decoding_method
+    params.res_dir = params.exp_dir / (params.decoding_method + "_gigaspeech")
 
     if params.iter > 0:
         params.suffix = f"iter-{params.iter}-avg-{params.avg}"
     else:
         params.suffix = f"epoch-{params.epoch}-avg-{params.avg}"
+
+    if params.simulate_streaming:
+        params.suffix += f"-streaming-chunk-size-{params.decode_chunk_size}"
+        params.suffix += f"-left-context-{params.left_context}"
 
     if "fast_beam_search" in params.decoding_method:
         params.suffix += f"-beam-{params.beam}"
@@ -946,19 +694,6 @@ def main():
     else:
         params.suffix += f"-context-{params.context_size}"
         params.suffix += f"-max-sym-per-frame-{params.max_sym_per_frame}"
-
-    if "ngram" in params.decoding_method:
-        params.suffix += f"-ngram-lm-scale-{params.ngram_lm_scale}"
-    if params.use_shallow_fusion:
-        if params.lm_type == "rnn":
-            params.suffix += f"-rnnlm-lm-scale-{params.lm_scale}"
-        elif params.lm_type == "transformer":
-            params.suffix += f"-transformer-lm-scale-{params.lm_scale}"
-
-        if "LODR" in params.decoding_method:
-            params.suffix += (
-                f"-LODR-{params.tokens_ngram}gram-scale-{params.ngram_lm_scale}"
-            )
 
     if params.use_averaged_model:
         params.suffix += "-use-averaged-model"
@@ -979,6 +714,11 @@ def main():
     params.blank_id = sp.piece_to_id("<blk>")
     params.unk_id = sp.piece_to_id("<unk>")
     params.vocab_size = sp.get_piece_size()
+
+    if params.simulate_streaming:
+        assert (
+            params.causal_convolution
+        ), "Decoding in streaming requires causal convolution"
 
     logging.info(params)
 
@@ -1044,60 +784,27 @@ def main():
                 )
             )
         else:
-            if params.avg == 0:
-                filename = f"{params.exp_dir}/epoch-{params.epoch}.pt"
-                logging.info(f"Loading the model from {filename}")
-                load_checkpoint(filename, model)
-            else:
-                assert params.avg > 0, params.avg
-                start = params.epoch - params.avg
-                assert start >= 1, start
-                filename_start = f"{params.exp_dir}/epoch-{start}.pt"
-                filename_end = f"{params.exp_dir}/epoch-{params.epoch}.pt"
-                logging.info(
-                    f"Calculating the averaged model over epoch range from "
-                    f"{start} (excluded) to {params.epoch}"
+            assert params.avg > 0, params.avg
+            start = params.epoch - params.avg
+            assert start >= 1, start
+            filename_start = f"{params.exp_dir}/epoch-{start}.pt"
+            filename_end = f"{params.exp_dir}/epoch-{params.epoch}.pt"
+            logging.info(
+                f"Calculating the averaged model over epoch range from "
+                f"{start} (excluded) to {params.epoch}"
+            )
+            model.to(device)
+            model.load_state_dict(
+                average_checkpoints_with_averaged_model(
+                    filename_start=filename_start,
+                    filename_end=filename_end,
+                    device=device,
                 )
-                model.to(device)
-                model.load_state_dict(
-                    average_checkpoints_with_averaged_model(
-                        filename_start=filename_start,
-                        filename_end=filename_end,
-                        device=device,
-                    )
-                )
+            )
 
     model.to(device)
     model.eval()
 
-    # only load N-gram LM when needed
-    if "ngram" in params.decoding_method or "LODR" in params.decoding_method:
-        lm_filename = f"{params.tokens_ngram}gram.fst.txt"
-        logging.info(f"lm filename: {lm_filename}")
-        ngram_lm = NgramLm(
-            str(params.lang_dir / lm_filename),
-            backoff_id=params.backoff_id,
-            is_binary=False,
-        )
-        logging.info(f"num states: {ngram_lm.lm.num_states}")
-        ngram_lm_scale = params.ngram_lm_scale
-    else:
-        ngram_lm = None
-        ngram_lm_scale = None
-
-    # only load the neural network LM if doing shallow fusion
-    if params.use_shallow_fusion:
-        LM = LmScorer(
-            lm_type=params.lm_type,
-            params=params,
-            device=device,
-            lm_scale=params.lm_scale,
-        )
-        LM.to(device)
-        LM.eval()
-
-    else:
-        LM = None
     if "fast_beam_search" in params.decoding_method:
         if params.decoding_method == "fast_beam_search_nbest_LG":
             lexicon = Lexicon(params.lang_dir)
@@ -1120,52 +827,18 @@ def main():
 
     # we need cut ids to display recognition results.
     args.return_cuts = True
-    librispeech = LibriSpeechAsrDataModule(args)
+    gigaspeech = GigaSpeechAsrDataModule(args)
 
-    test_dl = list()
-    test_sets = params.test_set
-    for cut in test_sets:
-        if cut == "train-clean-100":
-            train_clean_100_cuts = librispeech.train_clean_100_cuts()
-            train_clean_100_dl = librispeech.test_dataloaders(train_clean_100_cuts)
-            test_dl.append(train_clean_100_dl)
-        elif cut == "train-all-shuf":
-            train_all_shuf_cuts = librispeech.train_all_shuf_cuts()
-            train_all_shuf_dl = librispeech.test_dataloaders(train_all_shuf_cuts)
-            test_dl.append(train_all_shuf_dl)
-        elif cut == "train-small":
-            train_small_cuts = librispeech.train_small_cuts()
-            train_small_dl = librispeech.test_dataloaders(train_small_cuts)
-            test_dl.append(train_small_dl)
-        elif cut == "test-clean":
-            test_clean_cuts = librispeech.test_clean_cuts()
-            test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
-            test_dl.append(test_clean_dl)
-        elif cut == "test-other":
-            test_other_cuts = librispeech.test_other_cuts()
-            test_other_dl = librispeech.test_dataloaders(test_other_cuts)
-            test_dl.append(test_other_dl)
-        elif cut == "dev-clean":
-            dev_clean_cuts = librispeech.dev_clean_cuts()
-            dev_clean_dl = librispeech.test_dataloaders(dev_clean_cuts)
-            test_dl.append(dev_clean_dl)
-        elif cut == "dev-other":
-            dev_other_cuts = librispeech.dev_other_cuts()
-            dev_other_dl = librispeech.test_dataloaders(dev_other_cuts)
-            test_dl.append(dev_other_dl)
-        else:
-            raise ValueError(f"Unsupported test set: {cut}")
-    #train_small_cuts = librispeech.train_small_cuts()
-    #test_clean_cuts = librispeech.test_clean_cuts()
-    #dev_clean_cuts = librispeech.dev_clean_cuts()
-    cache = dict()
-    hyp_gen_db = None
+    dev_cuts = gigaspeech.dev_cuts()
+    test_cuts = gigaspeech.test_cuts()
 
-    for test_set, test_dl in zip(test_sets, test_dl):
-        logging.info(f"Decoding {test_set}")
-        if params.use_hyp_gen:
-            hyp_gen_db = HYPGenDB(test_set=test_set)
+    dev_dl = gigaspeech.test_dataloaders(dev_cuts)
+    test_dl = gigaspeech.test_dataloaders(test_cuts)
 
+    test_sets = ["dev", "test"]
+    test_dls = [dev_dl, test_dl]
+
+    for test_set, test_dl in zip(test_sets, test_dls):
         results_dict = decode_dataset(
             dl=test_dl,
             params=params,
@@ -1173,19 +846,12 @@ def main():
             sp=sp,
             word_table=word_table,
             decoding_graph=decoding_graph,
-            ngram_lm=ngram_lm,
-            ngram_lm_scale=ngram_lm_scale,
-            LM=LM,
-            cache=cache,
-            hyp_gen_db=hyp_gen_db,
         )
 
         save_results(
             params=params,
             test_set_name=test_set,
             results_dict=results_dict,
-            cache=cache,
-            hyp_gen_db=hyp_gen_db,
         )
 
     logging.info("Done!")

@@ -30,7 +30,6 @@ from typing import Union
 
 import numpy as np
 
-
 class Transducer(nn.Module):
     """It implements https://arxiv.org/pdf/1211.3711.pdf
     "Sequence Transduction with Recurrent Neural Networks"
@@ -45,6 +44,7 @@ class Transducer(nn.Module):
         decoder_dim: int,
         joiner_dim: int,
         vocab_size: int,
+        label_smoothing_rate: float = 0.1,
     ):
         """
         Args:
@@ -76,6 +76,11 @@ class Transducer(nn.Module):
         self.kd_criterion = nn.KLDivLoss(reduction="batchmean")
         self.ctc_layer = nn.Linear(encoder_dim, vocab_size)
         self.ctc_criterion = None
+        self.label_smoothing_rate = label_smoothing
+        self.cross_entropy = nn.CrossEntropyLoss(
+            reduction="sum",
+            label_smoothing=self.label_smoothing_rate,
+        )
 
     def forward(
         self,
@@ -102,6 +107,7 @@ class Transducer(nn.Module):
         sq_sampling_num: int = 1,
         pruned_range: int = 5,
         use_sq_simple_loss_range: bool = False,
+        use_aligner_encoder_loss: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -142,15 +148,12 @@ class Transducer(nn.Module):
         # sos_y_padded: [B, S + 1], start with SOS.
         sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
         sos_y_padded = sos_y_padded.to(torch.int64)
-
         # decoder_out: [B, S + 1, decoder_dim]
         decoder_out = self.decoder(sos_y_padded)
 
         encoder_out = self.joiner.encoder_proj(org_encoder_out)
         decoder_out = self.joiner.decoder_proj(decoder_out)
 
-        #print(f"{encoder_out.shape=}")
-        #print(f"{decoder_out.shape=}")
         logits = self.joiner(
             encoder_out=encoder_out,
             decoder_out=decoder_out,
@@ -166,14 +169,31 @@ class Transducer(nn.Module):
             "Please install a version >= 0.10.0"
         )
 
-        loss = torchaudio.functional.rnnt_loss(
-            logits=logits,
-            targets=y_padded,
-            logit_lengths=x_lens,
-            target_lengths=y_lens,
-            blank=blank_id,
-            reduction="sum",
-        )
+        if use_aligner_encoder_loss:
+            max_y = torch.max(y_lens)
+            time_indices = torch.arange(max_y+1)
+            label_indices = torch.arange(max_y+1)
+            diag_logits = logits[:, time_indices, label_indices, :]
+            diag_logits = diag_logits.permute(0, 2, 1)
+            cross_entropy_labels = torch.full_like(sos_y_padded, 0, dtype=torch.long, device=sos_y_padded.device)
+            cross_entropy_labels[:, :max_y] = sos_y_padded[:, 1:]
+            B = y_lens.size(0)
+            L = cross_entropy_labels.size(1)
+            mask = torch.arange(L).unsqueeze(0).expand(B, L).to(y_lens.device) >= (y_lens+1).unsqueeze(1)
+            cross_entropy_labels[mask] = -100
+            loss = self.label_smoothing_loss(
+                diag_logits,
+                target=cross_entropy_labels,
+            )
+        else:
+            loss = torchaudio.functional.rnnt_loss(
+                logits=logits,
+                targets=y_padded,
+                logit_lengths=x_lens,
+                target_lengths=y_lens,
+                blank=blank_id,
+                reduction="sum",
+            )
 
         if use_kd:
             if use_efficient is False and use_1best is False and use_nbest is False and use_pruned is False:
@@ -567,16 +587,19 @@ class Transducer(nn.Module):
                 teacher_sampling = F.softmax(teacher_sampling_logits[i], dim=-1)
         """
         ret = dict()
-        ret["org_loss"] = loss
-        if use_kd:
-            ret["kd_loss"] = kd_loss
+        if use_aligner_encoder_loss:
+            ret["aligner_encoder_loss"] = loss
         else:
-            ret["kd_loss"] = torch.tensor(0.0)
+            ret["org_loss"] = loss
+            if use_kd:
+                ret["kd_loss"] = kd_loss
+            else:
+                ret["kd_loss"] = torch.tensor(0.0)
 
-        if use_sq_sampling:
-            ret["sampling_loss"] = sampling_loss
-        else:
-            ret["sampling_loss"] = torch.tensor(0.0)
+            if use_sq_sampling:
+                ret["sampling_loss"] = sampling_loss
+            else:
+                ret["sampling_loss"] = torch.tensor(0.0)
 
         return ret
 

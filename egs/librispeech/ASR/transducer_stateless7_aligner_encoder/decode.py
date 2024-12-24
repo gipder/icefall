@@ -148,11 +148,11 @@ from beam_search import (
     fast_beam_search_nbest_LG,
     fast_beam_search_nbest_oracle,
     fast_beam_search_one_best,
+    aligner_search,
+    aligner_beam_search,
     greedy_search,
     greedy_search_batch,
     modified_beam_search,
-    modified_beam_search_for_kd,
-    modified_beam_search_for_kd_nbest,
     modified_beam_search_lm_shallow_fusion,
     modified_beam_search_LODR,
     modified_beam_search_ngram_rescoring,
@@ -175,10 +175,8 @@ from icefall.utils import (
     write_error_stats,
 )
 
-import pickle
-from hyp_gen import HYPGenDB, HYPGenDict
-
 LOG_EPS = math.log(1e-10)
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -393,45 +391,19 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--save-hypotheses",
-        type=str,
-        default="hypotheses.pkl",
-        help="""pickle dump file to save hypotheses from ASR.
-                the pkl file consists of a dictionary in python.
-                the dictionary has a key and value pair.
-                the key is the utterance id and the value is
-                a list of hypotheses.""",
-    )
-
-    parser.add_argument(
-        "--topk",
-        type=int,
-        default=4,
-        help="""How many top-k lists we need to keep""",
-    )
-
-    def comma_separated_list(value):
-        # 쉼표로 문자열을 분할하고 공백을 제거한 리스트를 반환
-        return [item.strip() for item in value.split(',')]
-
-    def comma_separated_list_in_float(value):
-        # 쉼표로 문자열을 분할하고 공백을 제거한 리스트를 반환
-        return [float(item.strip()) for item in value.split(',')]
-
-    parser.add_argument(
-        "--test-set",
-        type=comma_separated_list,
-        default=["test-clean-100"],
-        help="Comma separated list to make hypotheses",
-    )
-
-    parser.add_argument(
-        "--use-hyp-gen",
+        "--use-debiasing",
         type=str2bool,
         default=False,
-        help="Whether to use HYPGenDicT and HYPGenDB,"
-        " which are classes to save hypotheses in text format",
+        help="Whether to use label smoothing debiasing",
     )
+
+    parser.add_argument(
+        "--debiasing-alpha",
+        type=float,
+        default=2.0,
+        help="Alpha paramter for debiasing label smoothing",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -447,7 +419,6 @@ def decode_one_batch(
     ngram_lm: Optional[NgramLm] = None,
     ngram_lm_scale: float = 1.0,
     LM: Optional[LmScorer] = None,
-    cache: Optional[dict] = None,
 ) -> Dict[str, List[List[str]]]:
     """Decode one batch and return the result in a dict. The dict has the
     following format:
@@ -571,97 +542,8 @@ def decode_one_batch(
             encoder_out_lens=encoder_out_lens,
             beam=params.beam_size,
         )
-        print(hyp_tokens)
-        print(sp.decode(hyp_tokens))
-        import sys
-        sys.exit(0)
         for hyp in sp.decode(hyp_tokens):
             hyps.append(hyp.split())
-    elif params.decoding_method == "modified_beam_search_for_kd":
-        decoding_result = modified_beam_search_for_kd(
-            model=model,
-            x=feature,
-            x_lens=feature_lens,
-            beam=params.beam_size,
-        )
-
-        ids = list()
-        #print(f"{batch['supervisions']['cut'][0].id=}")
-        for i in range(len(batch["supervisions"]['cut'])):
-            ids.append(batch["supervisions"]['cut'][i].id)
-
-        # adding
-        hyp_alignment = torch.zeros(feature_lens.size()[0], math.ceil((feature_lens[0]-8)/4), dtype=torch.int)
-        for i in range(feature_lens.size()[0]):
-            for j in range(len(decoding_result.hyps[i])):
-                hyp_alignment[i, decoding_result.timestamps[i][j]] = decoding_result.hyps[i][j]
-
-        hyp_tokens = hyp_alignment.tolist()
-        for i in range(len(hyp_tokens)):
-            cache[ids[i]] = hyp_tokens[i]
-        #a = list(filter(lambda x:x != 0, hyp_tokens[0]))
-        #print(f"{list(filter(lambda x:x != 0, hyp_tokens[0]))=}")
-        #print(f"{len(list(filter(lambda x:x != 0, hyp_tokens[0])))=}")
-        #print(f"{hyp_tokens[0]=}")
-        # real hyp_tokens
-        hyp_tokens = decoding_result.hyps
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
-        #print(f"{len(hyp_tokens[0])=}")
-        #print(f"{hyp_tokens[0]=}")
-        #print(f"{a==hyp_tokens[0]}")
-
-    elif params.decoding_method == "modified_beam_search_for_kd_nbest":
-        tmp_hyps, timestamps = modified_beam_search_for_kd_nbest(
-            model=model,
-            x=feature,
-            x_lens=feature_lens,
-            beam=params.beam_size,
-            topk=params.topk
-        )
-
-        nbest = params.topk
-        ids = list()
-        #print(f"{hyps=}")
-        #print(f"{timestamps=}")
-        #print(f"{batch['supervisions']['cut'][0].id=}")
-        for i in range(len(batch["supervisions"]['cut'])):
-            ids.append(batch["supervisions"]['cut'][i].id)
-
-        # adding
-        hyp_alignment = torch.zeros(feature_lens.size()[0], nbest, math.ceil((feature_lens[0]-8)/4), dtype=torch.int)
-        #print(f"{hyp_alignment.shape=}")
-        for i in range(feature_lens.size()[0]):
-            for n in range(nbest):
-                for j in range(len(tmp_hyps[i][n])):
-                    hyp_alignment[i, n, timestamps[i][n][j]] = tmp_hyps[i][n][j]
-
-        hyp_tokens = hyp_alignment.tolist()
-        for i in range(len(hyp_tokens)):
-            cache[ids[i]] = hyp_tokens[i]
-
-        nbest_hyp_tokens = list()
-        hyp_tokens = list()
-        for i in tmp_hyps:
-            hyp_tokens.append(i[0]) # 1-best only
-        if params.use_hyp_gen:
-            for i in tmp_hyps:
-                nbest_hyp_token = list()
-                for n in range(len(i)):
-                    nbest_hyp_token.append(i[n])
-                nbest_hyp_tokens.append(nbest_hyp_token)
-
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
-
-        nbest_hyps = list()
-        if params.use_hyp_gen:
-            for i in range(len(nbest_hyp_tokens)):
-                one_nbest_hyps = list()
-                for n in range(params.beam_size):
-                    one_nbest_hyps.append(sp.decode(nbest_hyp_tokens[i][n]))
-                nbest_hyps.append(one_nbest_hyps)
-
     elif params.decoding_method == "modified_beam_search_lm_shallow_fusion":
         hyp_tokens = modified_beam_search_lm_shallow_fusion(
             model=model,
@@ -684,19 +566,31 @@ def decode_one_batch(
         )
         for hyp in sp.decode(hyp_tokens):
             hyps.append(hyp.split())
-    elif params.decoding_method == "ctc-decoding":
-        logits = model.ctc_layer(encoder_out)
-        predicted_ids = torch.argmax(logits, dim=-1)
-        hyps_list = []
-        for i in range(predicted_ids.shape[0]):
-            tmp_predicted_ids = torch.unique_consecutive(predicted_ids[i, :])
-            tmp_predicted_ids = tmp_predicted_ids[tmp_predicted_ids != 0].cpu().detach()
-            hyps_list.append(tmp_predicted_ids.tolist())
-        for hyp in sp.decode(hyps_list):
-            hyps.append(hyp.split())
+    elif params.decoding_method == "aligner_search":
+        batch_size = encoder_out.size(0)
+        for i in range(batch_size):
+            # fmt: off
+            encoder_out_i = encoder_out[i:i+1, :encoder_out_lens[i]]
+            hyp_tokens = aligner_search(
+                model=model,
+                encoder_out=encoder_out_i,
+                max_sym_per_frame=params.max_sym_per_frame,
+            )
+            hyps.append(sp.decode(hyp_tokens).split())
+    elif params.decoding_method == "aligner_beam_search":
+        batch_size = encoder_out.size(0)
+        for i in range(batch_size):
+            encoder_out_i = encoder_out[i:i+1, :encoder_out_lens[i]]
+            hyp_tokens = aligner_beam_search(
+                model=model,
+                encoder_out=encoder_out_i,
+                beam=params.beam_size,
+                use_debiasing=params.use_debiasing,
+                debiasing_alpha=params.debiasing_alpha,
+            )
+            hyps.append(sp.decode(hyp_tokens).split())
     else:
         batch_size = encoder_out.size(0)
-
         for i in range(batch_size):
             # fmt: off
             encoder_out_i = encoder_out[i:i+1, :encoder_out_lens[i]]
@@ -733,10 +627,7 @@ def decode_one_batch(
 
         return {key: hyps}
     else:
-        if params.use_hyp_gen:
-            return {f"beam_size_{params.beam_size}": hyps}, nbest_hyps
-        else:
-            return {f"beam_size_{params.beam_size}": hyps}
+        return {f"beam_size_{params.beam_size}": hyps}
 
 
 def decode_dataset(
@@ -749,8 +640,6 @@ def decode_dataset(
     ngram_lm: Optional[NgramLm] = None,
     ngram_lm_scale: float = 1.0,
     LM: Optional[LmScorer] = None,
-    cache: Optional[dict] = None,
-    hyp_gen_db: Optional[HYPGenDB] = None,
 ) -> Dict[str, List[Tuple[str, List[str], List[str]]]]:
     """Decode dataset.
 
@@ -792,51 +681,28 @@ def decode_dataset(
 
     results = defaultdict(list)
     for batch_idx, batch in enumerate(dl):
-        #if len(cache.keys()) == 0:
-        #    print(f"{batch}")
         texts = batch["supervisions"]["text"]
         cut_ids = [cut.id for cut in batch["supervisions"]["cut"]]
 
-        if params.use_hyp_gen:
-            hyps_dict, nbest_hyps = decode_one_batch(
-                params=params,
-                model=model,
-                sp=sp,
-                decoding_graph=decoding_graph,
-                word_table=word_table,
-                batch=batch,
-                ngram_lm=ngram_lm,
-                ngram_lm_scale=ngram_lm_scale,
-                LM=LM,
-                cache=cache,
-            )
-        else:
-            hyps_dict = decode_one_batch(
-                params=params,
-                model=model,
-                sp=sp,
-                decoding_graph=decoding_graph,
-                word_table=word_table,
-                batch=batch,
-                ngram_lm=ngram_lm,
-                ngram_lm_scale=ngram_lm_scale,
-                LM=LM,
-                cache=cache,
-            )
+        hyps_dict = decode_one_batch(
+            params=params,
+            model=model,
+            sp=sp,
+            decoding_graph=decoding_graph,
+            word_table=word_table,
+            batch=batch,
+            ngram_lm=ngram_lm,
+            ngram_lm_scale=ngram_lm_scale,
+            LM=LM,
+        )
 
         for name, hyps in hyps_dict.items():
             this_batch = []
             assert len(hyps) == len(texts)
-            if params.use_hyp_gen:
-                assert len(hyps) == len(nbest_hyps)
-                for cut_id, hyp_words, ref_text, one_nbest_hyps in zip(cut_ids, hyps, texts, nbest_hyps):
-                    ref_words = ref_text.split()
-                    this_batch.append((cut_id, ref_words, hyp_words))
-                    hyp_gen_db.add_entry(cut_id, ref_text, one_nbest_hyps)
-            else:
-                for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
-                    ref_words = ref_text.split()
-                    this_batch.append((cut_id, ref_words, hyp_words))
+            for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
+                ref_words = ref_text.split()
+                this_batch.append((cut_id, ref_words, hyp_words))
+
             results[name].extend(this_batch)
 
         num_cuts += len(texts)
@@ -845,9 +711,6 @@ def decode_dataset(
             batch_str = f"{batch_idx}/{num_batches}"
 
             logging.info(f"batch {batch_str}, cuts processed until now is {num_cuts}")
-        #break
-        #import sys
-        #sys.exit(0)
     return results
 
 
@@ -855,8 +718,6 @@ def save_results(
     params: AttributeDict,
     test_set_name: str,
     results_dict: Dict[str, List[Tuple[str, List[str], List[str]]]],
-    cache: Optional[dict] = None,
-    hyp_gen_db: Optional[HYPGenDB] = None,
 ):
     test_set_wers = dict()
     for key, results in results_dict.items():
@@ -890,15 +751,6 @@ def save_results(
         note = ""
     logging.info(s)
 
-    dump_file = open(f"{params.res_dir}/{test_set_name}.{params.save_hypotheses}", "wb")
-    pickle.dump(cache, dump_file)
-    logging.info(f"Dumped cache to {params.res_dir/params.save_hypotheses}")
-
-    if params.use_hyp_gen:
-        hyp_gen_db_file_name = f"{params.res_dir}/{test_set_name}.{params.save_hypotheses}.hyp_gen_db"
-        hyp_gen_db_file = open(hyp_gen_db_file_name, "wb")
-        pickle.dump(hyp_gen_db, hyp_gen_db_file)
-        logging.info(f"Dumped hyp_gen_db to {hyp_gen_db_file_name}")
 
 @torch.no_grad()
 def main():
@@ -912,6 +764,8 @@ def main():
     params.update(vars(args))
 
     assert params.decoding_method in (
+        "aligner_search",
+        "aligner_beam_search",
         "greedy_search",
         "beam_search",
         "fast_beam_search",
@@ -921,9 +775,6 @@ def main():
         "modified_beam_search",
         "modified_beam_search_lm_shallow_fusion",
         "modified_beam_search_LODR",
-        "modified_beam_search_for_kd",
-        "modified_beam_search_for_kd_nbest",
-        "ctc-decoding"
     )
     params.res_dir = params.exp_dir / params.decoding_method
 
@@ -1044,28 +895,23 @@ def main():
                 )
             )
         else:
-            if params.avg == 0:
-                filename = f"{params.exp_dir}/epoch-{params.epoch}.pt"
-                logging.info(f"Loading the model from {filename}")
-                load_checkpoint(filename, model)
-            else:
-                assert params.avg > 0, params.avg
-                start = params.epoch - params.avg
-                assert start >= 1, start
-                filename_start = f"{params.exp_dir}/epoch-{start}.pt"
-                filename_end = f"{params.exp_dir}/epoch-{params.epoch}.pt"
-                logging.info(
-                    f"Calculating the averaged model over epoch range from "
-                    f"{start} (excluded) to {params.epoch}"
+            assert params.avg > 0, params.avg
+            start = params.epoch - params.avg
+            assert start >= 1, start
+            filename_start = f"{params.exp_dir}/epoch-{start}.pt"
+            filename_end = f"{params.exp_dir}/epoch-{params.epoch}.pt"
+            logging.info(
+                f"Calculating the averaged model over epoch range from "
+                f"{start} (excluded) to {params.epoch}"
+            )
+            model.to(device)
+            model.load_state_dict(
+                average_checkpoints_with_averaged_model(
+                    filename_start=filename_start,
+                    filename_end=filename_end,
+                    device=device,
                 )
-                model.to(device)
-                model.load_state_dict(
-                    average_checkpoints_with_averaged_model(
-                        filename_start=filename_start,
-                        filename_end=filename_end,
-                        device=device,
-                    )
-                )
+            )
 
     model.to(device)
     model.eval()
@@ -1122,50 +968,16 @@ def main():
     args.return_cuts = True
     librispeech = LibriSpeechAsrDataModule(args)
 
-    test_dl = list()
-    test_sets = params.test_set
-    for cut in test_sets:
-        if cut == "train-clean-100":
-            train_clean_100_cuts = librispeech.train_clean_100_cuts()
-            train_clean_100_dl = librispeech.test_dataloaders(train_clean_100_cuts)
-            test_dl.append(train_clean_100_dl)
-        elif cut == "train-all-shuf":
-            train_all_shuf_cuts = librispeech.train_all_shuf_cuts()
-            train_all_shuf_dl = librispeech.test_dataloaders(train_all_shuf_cuts)
-            test_dl.append(train_all_shuf_dl)
-        elif cut == "train-small":
-            train_small_cuts = librispeech.train_small_cuts()
-            train_small_dl = librispeech.test_dataloaders(train_small_cuts)
-            test_dl.append(train_small_dl)
-        elif cut == "test-clean":
-            test_clean_cuts = librispeech.test_clean_cuts()
-            test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
-            test_dl.append(test_clean_dl)
-        elif cut == "test-other":
-            test_other_cuts = librispeech.test_other_cuts()
-            test_other_dl = librispeech.test_dataloaders(test_other_cuts)
-            test_dl.append(test_other_dl)
-        elif cut == "dev-clean":
-            dev_clean_cuts = librispeech.dev_clean_cuts()
-            dev_clean_dl = librispeech.test_dataloaders(dev_clean_cuts)
-            test_dl.append(dev_clean_dl)
-        elif cut == "dev-other":
-            dev_other_cuts = librispeech.dev_other_cuts()
-            dev_other_dl = librispeech.test_dataloaders(dev_other_cuts)
-            test_dl.append(dev_other_dl)
-        else:
-            raise ValueError(f"Unsupported test set: {cut}")
-    #train_small_cuts = librispeech.train_small_cuts()
-    #test_clean_cuts = librispeech.test_clean_cuts()
-    #dev_clean_cuts = librispeech.dev_clean_cuts()
-    cache = dict()
-    hyp_gen_db = None
+    test_clean_cuts = librispeech.test_clean_cuts()
+    test_other_cuts = librispeech.test_other_cuts()
+
+    test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
+    test_other_dl = librispeech.test_dataloaders(test_other_cuts)
+
+    test_sets = ["test-clean", "test-other"]
+    test_dl = [test_clean_dl, test_other_dl]
 
     for test_set, test_dl in zip(test_sets, test_dl):
-        logging.info(f"Decoding {test_set}")
-        if params.use_hyp_gen:
-            hyp_gen_db = HYPGenDB(test_set=test_set)
-
         results_dict = decode_dataset(
             dl=test_dl,
             params=params,
@@ -1176,16 +988,12 @@ def main():
             ngram_lm=ngram_lm,
             ngram_lm_scale=ngram_lm_scale,
             LM=LM,
-            cache=cache,
-            hyp_gen_db=hyp_gen_db,
         )
 
         save_results(
             params=params,
             test_set_name=test_set,
             results_dict=results_dict,
-            cache=cache,
-            hyp_gen_db=hyp_gen_db,
         )
 
     logging.info("Done!")

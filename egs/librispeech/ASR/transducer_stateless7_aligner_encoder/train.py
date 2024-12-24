@@ -598,6 +598,27 @@ def get_parser():
         default=False,
         help="Whether to use sample loss in pruned RNN-T to get ranges of logits",
     )
+
+    parser.add_argument(
+        "--use-aligner-encoder-loss",
+        type=str2bool,
+        default=False,
+        help="Whether to use the loss with aligner-encoder approach instead of the original RNN-T loss",
+    )
+
+    parser.add_argument(
+        "--use-label-smoothing",
+        type=str2bool,
+        default=False,
+        help="Whether to use label smoothing in the aligner-encoder loss",
+    )
+
+    parser.add_argument(
+        "--label-smoothing-rate",
+        type=float,
+        default=0.1,
+        help="Label smoothing rate (0.0 means the conventional cross entropy loss)",
+    )
     add_model_arguments(parser)
 
     return parser
@@ -717,7 +738,10 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
     encoder = get_encoder_model(params)
     decoder = get_decoder_model(params)
     joiner = get_joiner_model(params)
-
+    if params.use_label_smoothing:
+        label_smoothing_rate = params.label_smoothing_rate
+    else:
+        label_smoothing_rate = 0.0
     model = Transducer(
         encoder=encoder,
         decoder=decoder,
@@ -726,6 +750,7 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
+        label_smoothing_rate=params.label_smoothing_rate,
     )
     return model
 
@@ -1276,7 +1301,6 @@ def compute_loss(
                 teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
                     x=feature,
                     x_lens=feature_lens,
-                    y=pseudo_y,
                     use_grad=False,
                 )
 
@@ -1338,6 +1362,8 @@ def compute_loss(
 
                 teacher_sampling_logits.append(sampling_ret)
 
+    use_aligner_encoder_loss = params.use_aligner_encoder_loss
+
     with torch.set_grad_enabled(is_training):
         org_loss = torch.tensor(0.0, device=device)
         kd_loss = torch.tensor(0.0, device=device)
@@ -1366,36 +1392,49 @@ def compute_loss(
             sq_sampling_num=sq_sampling_num,
             pruned_range=params.pruned_range,
             use_sq_simple_loss_range=use_sq_simple_loss_range,
+            use_aligner_encoder_loss=use_aligner_encoder_loss,
         )
 
-    kd_loss_scale = params.kd_loss_scale
-    sampling_loss_scale = params.kd_loss_scale * params.sq_sampling_scale
-    org_loss = ret["org_loss"]
-    if use_kd:
-        kd_loss = ret["kd_loss"]
-    if use_sq_sampling:
-        sampling_loss = ret["sampling_loss"]
+    if use_aligner_encoder_loss:
+        loss = ret["aligner_encoder_loss"]
+        assert loss.requires_grad == is_training
+        info = MetricsTracker()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
 
-    loss = org_loss + kd_loss_scale * kd_loss + \
-        sampling_loss_scale * sampling_loss
+        # Note: We use reduction=sum while computing the loss.
+        info["loss"] = loss.detach().cpu().item()
 
-    assert org_loss.requires_grad == is_training
-    if use_kd:
-        assert kd_loss.requires_grad == is_training
-    assert loss.requires_grad == is_training
+    else:
+        kd_loss_scale = params.kd_loss_scale
+        sampling_loss_scale = params.kd_loss_scale * params.sq_sampling_scale
+        org_loss = ret["org_loss"]
+        if use_kd:
+            kd_loss = ret["kd_loss"]
+        if use_sq_sampling:
+            sampling_loss = ret["sampling_loss"]
 
-    info = MetricsTracker()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
+        loss = org_loss + kd_loss_scale * kd_loss + \
+            sampling_loss_scale * sampling_loss
 
-    # Note: We use reduction=sum while computing the loss.
-    info["loss"] = loss.detach().cpu().item()
-    info["org_loss"] = ret["org_loss"].detach().cpu().item()
-    if params.use_kd:
-        info["kd_loss"] = ret["kd_loss"].detach().cpu().item()
-    if params.use_sq_sampling:
-        info["sampling_loss"] = ret["sampling_loss"].detach().cpu().item()
+        assert org_loss.requires_grad == is_training
+        if use_kd:
+            assert kd_loss.requires_grad == is_training
+        assert loss.requires_grad == is_training
+
+        info = MetricsTracker()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
+
+        # Note: We use reduction=sum while computing the loss.
+        info["loss"] = loss.detach().cpu().item()
+        info["org_loss"] = ret["org_loss"].detach().cpu().item()
+        if params.use_kd:
+            info["kd_loss"] = ret["kd_loss"].detach().cpu().item()
+        if params.use_sq_sampling:
+            info["sampling_loss"] = ret["sampling_loss"].detach().cpu().item()
 
     return loss, info
 

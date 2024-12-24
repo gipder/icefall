@@ -71,6 +71,7 @@ from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from zipformer import Zipformer
+from conformer import Conformer
 
 from icefall import diagnostics
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
@@ -126,8 +127,8 @@ def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
 def add_model_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--num-encoder-layers",
-        type=str,
-        default="2,4,3,2,4",
+        type=int,
+        default=17,
         help="Number of zipformer encoder layers, comma separated.",
     )
 
@@ -140,16 +141,16 @@ def add_model_arguments(parser: argparse.ArgumentParser):
 
     parser.add_argument(
         "--nhead",
-        type=str,
-        default="8,8,8,8,8",
+        type=int,
+        default=8,
         help="Number of attention heads in the zipformer encoder layers.",
     )
 
     parser.add_argument(
         "--encoder-dims",
-        type=str,
-        default="384,384,384,384,384",
-        help="Embedding dimension in the 2 blocks of zipformer encoder layers, comma separated",
+        type=int,
+        default=512,
+        help="Embedding dimension in conformer encoder layers, comma separated",
     )
 
     parser.add_argument(
@@ -197,6 +198,14 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="""Dimension used in the joiner model.
         Outputs from the encoder and decoder model are projected
         to this dimension before adding.
+        """,
+    )
+
+    parser.add_argument(
+        "--dim-feedforward",
+        type=int,
+        default=2048,
+        help="""Dimension used in the feedforward in conformer.
         """,
     )
 
@@ -598,6 +607,27 @@ def get_parser():
         default=False,
         help="Whether to use sample loss in pruned RNN-T to get ranges of logits",
     )
+
+    parser.add_argument(
+        "--use-aligner-encoder-loss",
+        type=str2bool,
+        default=False,
+        help="Whether to use the loss with aligner-encoder approach instead of the original RNN-T loss",
+    )
+
+    parser.add_argument(
+        "--use-label-smoothing",
+        type=str2bool,
+        default=False,
+        help="Whether to use label smoothing in the aligner-encoder loss",
+    )
+
+    parser.add_argument(
+        "--label-smoothing-rate",
+        type=float,
+        default=0.1,
+        help="Label smoothing rate (0.0 means the conventional cross entropy loss)",
+    )
     add_model_arguments(parser)
 
     return parser
@@ -672,23 +702,14 @@ def get_params() -> AttributeDict:
 
 
 def get_encoder_model(params: AttributeDict) -> nn.Module:
-    # TODO: We can add an option to switch between Zipformer and Transformer
+    # TODO: We can add an option to switch between Zipformer and Transformer and Conformer
     def to_int_tuple(s: str):
         return tuple(map(int, s.split(",")))
 
-    encoder = Zipformer(
+    encoder = Conformer(
         num_features=params.feature_dim,
-        output_downsampling_factor=2,
-        zipformer_downsampling_factors=to_int_tuple(
-            params.zipformer_downsampling_factors
-        ),
-        encoder_dims=to_int_tuple(params.encoder_dims),
-        attention_dim=to_int_tuple(params.attention_dims),
-        encoder_unmasked_dims=to_int_tuple(params.encoder_unmasked_dims),
-        nhead=to_int_tuple(params.nhead),
-        feedforward_dim=to_int_tuple(params.feedforward_dims),
-        cnn_module_kernels=to_int_tuple(params.cnn_module_kernels),
-        num_encoder_layers=to_int_tuple(params.num_encoder_layers),
+        num_encoder_layers=params.num_encoder_layers,
+        dim_feedforward=params.dim_feedforward,
     )
     return encoder
 
@@ -705,7 +726,7 @@ def get_decoder_model(params: AttributeDict) -> nn.Module:
 
 def get_joiner_model(params: AttributeDict) -> nn.Module:
     joiner = Joiner(
-        encoder_dim=int(params.encoder_dims.split(",")[-1]),
+        encoder_dim=params.encoder_dims, #int(params.encoder_dims.split(",")[-1]),
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
@@ -718,14 +739,20 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
     decoder = get_decoder_model(params)
     joiner = get_joiner_model(params)
 
+    if params.use_label_smoothing:
+        label_smoothing_rate = params.label_smoothing_rate
+    else:
+        label_smoothing_rate = 0.0
+
     model = Transducer(
         encoder=encoder,
         decoder=decoder,
         joiner=joiner,
-        encoder_dim=int(params.encoder_dims.split(",")[-1]),
+        encoder_dim=params.encoder_dims,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
+        label_smoothing_rate=label_smoothing_rate,
     )
     return model
 
@@ -1276,7 +1303,6 @@ def compute_loss(
                 teacher_encoder_out, teacher_encoder_out_lens = teacher_model.get_encoder_out(
                     x=feature,
                     x_lens=feature_lens,
-                    y=pseudo_y,
                     use_grad=False,
                 )
 
@@ -1338,6 +1364,8 @@ def compute_loss(
 
                 teacher_sampling_logits.append(sampling_ret)
 
+    use_aligner_encoder_loss = params.use_aligner_encoder_loss
+
     with torch.set_grad_enabled(is_training):
         org_loss = torch.tensor(0.0, device=device)
         kd_loss = torch.tensor(0.0, device=device)
@@ -1366,36 +1394,49 @@ def compute_loss(
             sq_sampling_num=sq_sampling_num,
             pruned_range=params.pruned_range,
             use_sq_simple_loss_range=use_sq_simple_loss_range,
+            use_aligner_encoder_loss=use_aligner_encoder_loss,
         )
 
-    kd_loss_scale = params.kd_loss_scale
-    sampling_loss_scale = params.kd_loss_scale * params.sq_sampling_scale
-    org_loss = ret["org_loss"]
-    if use_kd:
-        kd_loss = ret["kd_loss"]
-    if use_sq_sampling:
-        sampling_loss = ret["sampling_loss"]
+    if use_aligner_encoder_loss:
+        loss = ret["aligner_encoder_loss"]
+        assert loss.requires_grad == is_training
+        info = MetricsTracker()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
 
-    loss = org_loss + kd_loss_scale * kd_loss + \
-        sampling_loss_scale * sampling_loss
+        # Note: We use reduction=sum while computing the loss.
+        info["loss"] = loss.detach().cpu().item()
 
-    assert org_loss.requires_grad == is_training
-    if use_kd:
-        assert kd_loss.requires_grad == is_training
-    assert loss.requires_grad == is_training
+    else:
+        kd_loss_scale = params.kd_loss_scale
+        sampling_loss_scale = params.kd_loss_scale * params.sq_sampling_scale
+        org_loss = ret["org_loss"]
+        if use_kd:
+            kd_loss = ret["kd_loss"]
+        if use_sq_sampling:
+            sampling_loss = ret["sampling_loss"]
 
-    info = MetricsTracker()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
+        loss = org_loss + kd_loss_scale * kd_loss + \
+            sampling_loss_scale * sampling_loss
 
-    # Note: We use reduction=sum while computing the loss.
-    info["loss"] = loss.detach().cpu().item()
-    info["org_loss"] = ret["org_loss"].detach().cpu().item()
-    if params.use_kd:
-        info["kd_loss"] = ret["kd_loss"].detach().cpu().item()
-    if params.use_sq_sampling:
-        info["sampling_loss"] = ret["sampling_loss"].detach().cpu().item()
+        assert org_loss.requires_grad == is_training
+        if use_kd:
+            assert kd_loss.requires_grad == is_training
+        assert loss.requires_grad == is_training
+
+        info = MetricsTracker()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
+
+        # Note: We use reduction=sum while computing the loss.
+        info["loss"] = loss.detach().cpu().item()
+        info["org_loss"] = ret["org_loss"].detach().cpu().item()
+        if params.use_kd:
+            info["kd_loss"] = ret["kd_loss"].detach().cpu().item()
+        if params.use_sq_sampling:
+            info["sampling_loss"] = ret["sampling_loss"].detach().cpu().item()
 
     return loss, info
 
