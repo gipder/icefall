@@ -29,7 +29,6 @@ from icefall.utils import add_sos
 from typing import Union
 
 import numpy as np
-from label_smoothing import LabelSmoothingLoss
 
 class Transducer(nn.Module):
     """It implements https://arxiv.org/pdf/1211.3711.pdf
@@ -45,7 +44,7 @@ class Transducer(nn.Module):
         decoder_dim: int,
         joiner_dim: int,
         vocab_size: int,
-        label_smoothing: float = 0.1,
+        label_smoothing_rate: float = 0.1,
     ):
         """
         Args:
@@ -77,11 +76,10 @@ class Transducer(nn.Module):
         self.kd_criterion = nn.KLDivLoss(reduction="batchmean")
         self.ctc_layer = nn.Linear(encoder_dim, vocab_size)
         self.ctc_criterion = None
-        self.cross_entropy = nn.CrossEntropyLoss(reduction="sum")
-        self.label_smoothing_loss = LabelSmoothingLoss(
-            ignore_index=-100,
-            label_smoothing=label_smoothing,
+        self.label_smoothing_rate = label_smoothing
+        self.cross_entropy = nn.CrossEntropyLoss(
             reduction="sum",
+            label_smoothing=self.label_smoothing_rate,
         )
 
     def forward(
@@ -110,8 +108,6 @@ class Transducer(nn.Module):
         pruned_range: int = 5,
         use_sq_simple_loss_range: bool = False,
         use_aligner_encoder_loss: bool = False,
-        use_label_smoothing: bool = False,
-        label_smoothing_rate: float = 0.1,
     ) -> torch.Tensor:
         """
         Args:
@@ -185,17 +181,10 @@ class Transducer(nn.Module):
             L = cross_entropy_labels.size(1)
             mask = torch.arange(L).unsqueeze(0).expand(B, L).to(y_lens.device) >= (y_lens+1).unsqueeze(1)
             cross_entropy_labels[mask] = -100
-            if use_label_smoothing:
-                loss = self.label_smoothing_loss(
-                    diag_logits,
-                    target=cross_entropy_labels,
-                )
-            else:
-                loss = self.cross_entropy(
-                    diag_logits,
-                    target=cross_entropy_labels,
-                )
-
+            loss = self.label_smoothing_loss(
+                diag_logits,
+                target=cross_entropy_labels,
+            )
         else:
             loss = torchaudio.functional.rnnt_loss(
                 logits=logits,

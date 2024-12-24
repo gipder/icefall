@@ -605,6 +605,20 @@ def get_parser():
         default=False,
         help="Whether to use the loss with aligner-encoder approach instead of the original RNN-T loss",
     )
+
+    parser.add_argument(
+        "--use-label-smoothing",
+        type=str2bool,
+        default=False,
+        help="Whether to use label smoothing in the aligner-encoder loss",
+    )
+
+    parser.add_argument(
+        "--label-smoothing-rate",
+        type=float,
+        default=0.1,
+        help="Label smoothing rate (0.0 means the conventional cross entropy loss)",
+    )
     add_model_arguments(parser)
 
     return parser
@@ -724,7 +738,10 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
     encoder = get_encoder_model(params)
     decoder = get_decoder_model(params)
     joiner = get_joiner_model(params)
-
+    if params.use_label_smoothing:
+        label_smoothing_rate = params.label_smoothing_rate
+    else:
+        label_smoothing_rate = 0.0
     model = Transducer(
         encoder=encoder,
         decoder=decoder,
@@ -733,6 +750,7 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
+        label_smoothing_rate=params.label_smoothing_rate,
     )
     return model
 

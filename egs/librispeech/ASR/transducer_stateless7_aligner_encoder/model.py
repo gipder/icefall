@@ -30,7 +30,6 @@ from typing import Union
 
 import numpy as np
 
-
 class Transducer(nn.Module):
     """It implements https://arxiv.org/pdf/1211.3711.pdf
     "Sequence Transduction with Recurrent Neural Networks"
@@ -45,6 +44,7 @@ class Transducer(nn.Module):
         decoder_dim: int,
         joiner_dim: int,
         vocab_size: int,
+        label_smoothing_rate: float = 0.1,
     ):
         """
         Args:
@@ -76,7 +76,9 @@ class Transducer(nn.Module):
         self.kd_criterion = nn.KLDivLoss(reduction="batchmean")
         self.ctc_layer = nn.Linear(encoder_dim, vocab_size)
         self.ctc_criterion = None
-        self.cross_entropy = nn.CrossEntropyLoss(reduction="sum")
+        self.label_smoothing_rate = label_smoothing
+        self.cross_entropy = nn.CrossEntropyLoss(reduction="sum",
+                                                 label_smoothing=self.label_smoothing_rate)
 
     def forward(
         self,
@@ -178,10 +180,9 @@ class Transducer(nn.Module):
             mask = torch.arange(L).unsqueeze(0).expand(B, L).to(y_lens.device) >= (y_lens+1).unsqueeze(1)
             cross_entropy_labels[mask] = -100
             loss = self.cross_entropy(
-                diag_logits,
-                target=cross_entropy_labels,
+                    diag_logits,
+                    target=cross_entropy_labels,
             )
-
         else:
             loss = torchaudio.functional.rnnt_loss(
                 logits=logits,

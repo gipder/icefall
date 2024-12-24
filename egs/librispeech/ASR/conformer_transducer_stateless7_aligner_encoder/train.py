@@ -739,6 +739,11 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
     decoder = get_decoder_model(params)
     joiner = get_joiner_model(params)
 
+    if params.use_label_smoothing:
+        label_smoothing_rate = params.label_smoothing_rate
+    else:
+        label_smoothing_rate = 0.0
+
     model = Transducer(
         encoder=encoder,
         decoder=decoder,
@@ -747,6 +752,7 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
+        label_smoothing_rate=label_smoothing_rate,
     )
     return model
 
