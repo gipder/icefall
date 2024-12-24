@@ -76,7 +76,7 @@ class Transducer(nn.Module):
         self.kd_criterion = nn.KLDivLoss(reduction="batchmean")
         self.ctc_layer = nn.Linear(encoder_dim, vocab_size)
         self.ctc_criterion = None
-        self.label_smoothing_rate = label_smoothing
+        self.label_smoothing_rate = label_smoothing_rate
         self.cross_entropy = nn.CrossEntropyLoss(reduction="sum",
                                                  label_smoothing=self.label_smoothing_rate)
 
