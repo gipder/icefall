@@ -181,7 +181,7 @@ class Transducer(nn.Module):
             L = cross_entropy_labels.size(1)
             mask = torch.arange(L).unsqueeze(0).expand(B, L).to(y_lens.device) >= (y_lens+1).unsqueeze(1)
             cross_entropy_labels[mask] = -100
-            loss = self.label_smoothing_loss(
+            loss = self.cross_entropy(
                 diag_logits,
                 target=cross_entropy_labels,
             )
