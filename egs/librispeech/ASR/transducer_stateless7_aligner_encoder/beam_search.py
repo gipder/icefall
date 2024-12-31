@@ -926,8 +926,7 @@ def aligner_beam_search(
             delta = debiasing_alpha / logits.size(-1)
             logits = torch.nn.ReLU()(logits - delta)
             logits = torch.div(logits, logits.sum(dim=-1).unsqueeze(-1))
-            #print(f"{logits=}")
-            #print(f"{delta=}")
+            logits = logits.log()
 
         #import sys
         #sys.exit(0)

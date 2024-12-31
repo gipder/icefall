@@ -738,6 +738,10 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
     encoder = get_encoder_model(params)
     decoder = get_decoder_model(params)
     joiner = get_joiner_model(params)
+    # if there is no attribute `use_label_smoothing`, we set it to False
+    if hasattr(params, "use_label_smoothing") is False:
+        logging.info("use_label_smoothing is not set. Setting it to False.")
+        params.use_label_smoothing = getattr(params, "use_label_smoothing", False)
     if params.use_label_smoothing:
         label_smoothing_rate = params.label_smoothing_rate
     else:
@@ -750,7 +754,7 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
-        label_smoothing_rate=params.label_smoothing_rate,
+        label_smoothing_rate=label_smoothing_rate,
     )
     return model
 

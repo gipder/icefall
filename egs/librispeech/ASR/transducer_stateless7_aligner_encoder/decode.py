@@ -720,6 +720,8 @@ def save_results(
     results_dict: Dict[str, List[Tuple[str, List[str], List[str]]]],
 ):
     test_set_wers = dict()
+    if params.use_debiasing:
+        test_set_name += f"-debiasing-alpha{params.debiasing_alpha}"
     for key, results in results_dict.items():
         recog_path = params.res_dir / f"recogs-{test_set_name}-{params.suffix}.txt"
         results = sorted(results)
