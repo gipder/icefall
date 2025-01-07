@@ -619,6 +619,20 @@ def get_parser():
         default=0.1,
         help="Label smoothing rate (0.0 means the conventional cross entropy loss)",
     )
+
+    parser.add_argument(
+        "--use-monte-carlo-loss",
+        type=str2bool,
+        default=False,
+        help="Whether to use Monte Carlo sampling loss in RNN-T training",
+    )
+
+    parser.add_argument(
+        "--num-mc-samples",
+        type=int,
+        default=1,
+        help="The number of samples of Monte Carlo Method",
+    )
     add_model_arguments(parser)
 
     return parser
@@ -1367,7 +1381,7 @@ def compute_loss(
                 teacher_sampling_logits.append(sampling_ret)
 
     use_aligner_encoder_loss = params.use_aligner_encoder_loss
-
+    use_monte_carlo_loss = params.use_monte_carlo_loss
     with torch.set_grad_enabled(is_training):
         org_loss = torch.tensor(0.0, device=device)
         kd_loss = torch.tensor(0.0, device=device)
@@ -1397,6 +1411,8 @@ def compute_loss(
             pruned_range=params.pruned_range,
             use_sq_simple_loss_range=use_sq_simple_loss_range,
             use_aligner_encoder_loss=use_aligner_encoder_loss,
+            use_monte_carlo_loss=use_monte_carlo_loss,
+            num_mc_samples=params.num_mc_samples,
         )
 
     if use_aligner_encoder_loss:
@@ -1409,7 +1425,16 @@ def compute_loss(
 
         # Note: We use reduction=sum while computing the loss.
         info["loss"] = loss.detach().cpu().item()
+    elif use_monte_carlo_loss:
+        loss = ret["monte_carlo_loss"]
+        assert loss.requires_grad == is_training
+        info = MetricsTracker()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
 
+        # Note: We use reduction=sum while computing the loss.
+        info["loss"] = loss.detach().cpu().item()
     else:
         kd_loss_scale = params.kd_loss_scale
         sampling_loss_scale = params.kd_loss_scale * params.sq_sampling_scale

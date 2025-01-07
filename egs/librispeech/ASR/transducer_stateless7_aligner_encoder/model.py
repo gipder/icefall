@@ -29,6 +29,7 @@ from icefall.utils import add_sos
 from typing import Union
 
 import numpy as np
+from my_utils import create_pseudo_alignment
 
 class Transducer(nn.Module):
     """It implements https://arxiv.org/pdf/1211.3711.pdf
@@ -106,6 +107,8 @@ class Transducer(nn.Module):
         pruned_range: int = 5,
         use_sq_simple_loss_range: bool = False,
         use_aligner_encoder_loss: bool = False,
+        use_monte_carlo_loss: bool = False,
+        num_mc_samples: int = 1,
     ) -> torch.Tensor:
         """
         Args:
@@ -183,6 +186,61 @@ class Transducer(nn.Module):
                     diag_logits,
                     target=cross_entropy_labels,
             )
+        elif use_monte_carlo_loss:
+            loss = torch.tensor(0.0).to(logits.device)
+            for i in range(num_mc_samples):
+                sampled_y_alignments = torch.zeros(org_encoder_out.size(0),
+                                                   org_encoder_out.size(1),
+                                                   dtype=torch.int64,
+                                                   device=org_encoder_out.device)
+
+                for ii in range(len(y_lens)):
+                    sampled_y_alignments[ii, :x_lens[ii]] = create_pseudo_alignment(
+                        x_lens[ii], y_lens[ii], make_zero=False)
+
+                sampled_y_alignments_indices = (
+                    sampled_y_alignments
+                    .unsqueeze(-1)
+                    .unsqueeze(-1)
+                    .expand(-1, -1, -1, logits.shape[-1])
+                )
+
+                # indexing in U-axis
+                # logits.shape: from [B, T, U, vocab_size] to [B, T, 1, vocab_size]
+                logits = torch.gather(logits, 2, sampled_y_alignments_indices)
+
+                # make zeroed sampled_y_alignments
+                zeroed_sampled_y_alignments = sampled_y_alignments.clone()
+                for ii in range(len(y_lens)):
+                    diff = torch.diff(
+                        sampled_y_alignments[ii], prepend=sampled_y_alignments[ii, :1])
+                    repeated_indices = torch.where(diff == 0)[0]
+                    zeroed_sampled_y_alignments[ii, repeated_indices] = 0
+
+                # change the alignments numbers to the actual label numbers
+                # alignment: [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]
+                # from label [0,10,20,30,40]: [0, 0, 10, 0, 20, 0, 30, 0, 40, 0]
+                # cross_entropy_alignments.shape: [B, T, 1]
+                cross_entropy_alignments = (
+                    torch.gather(
+                        (sos_y_padded
+                         .unsqueeze(1)
+                         .expand(-1, zeroed_sampled_y_alignments.shape[-1], -1)),
+                        -1,
+                        zeroed_sampled_y_alignments.unsqueeze(-1))
+                )
+                B = x_lens.size(0)
+                T = cross_entropy_alignments.size(1)
+                mask = torch.arange(T).unsqueeze(0).expand(B, T).to(x_lens.device) >= x_lens.unsqueeze(1)
+                cross_entropy_alignments[mask] = -100
+                #print(f"{logits.shape}")
+                #print(f"{cross_entropy_alignments.shape}")
+                logits = logits.permute(0, 3, 1, 2)
+                loss = loss + self.cross_entropy(
+                    logits,
+                    target=cross_entropy_alignments,
+                )
+            loss /= num_mc_samples
         else:
             loss = torchaudio.functional.rnnt_loss(
                 logits=logits,
@@ -440,7 +498,8 @@ class Transducer(nn.Module):
                     sampled_y_lens = [len(i) for i in sampling_y[i].tolist()]
                     for ii in range(len(sampled_y_lens)):
                         sampled_y_alignments[ii, :x_lens[ii]] = create_pseudo_alignment(x_lens[ii],
-                                                                                      sampled_y_lens[ii])
+                                                                                        sampled_y_lens[ii],
+                                                                                        )
                     idx = sampled_y_alignments.unsqueeze(-1).expand(-1, -1, sampling_logits.shape[-1]).unsqueeze(2)
                     idx = idx.to(torch.int64)
                     teacher = torch.gather(teacher, 2, idx)
@@ -587,6 +646,8 @@ class Transducer(nn.Module):
         ret = dict()
         if use_aligner_encoder_loss:
             ret["aligner_encoder_loss"] = loss
+        elif use_monte_carlo_loss:
+            ret["monte_carlo_loss"] = loss
         else:
             ret["org_loss"] = loss
             if use_kd:
@@ -945,7 +1006,7 @@ def create_increasing_sublists_torch(original_tensor, length=5):
 
     return result_tensor
 
-def create_pseudo_alignment(x_len, y_len):
+def _deprecated_create_pseudo_alignment(x_len, y_len):
     #prepend 0 in the beginning
     padded_y_len = y_len +1
     if x_len < padded_y_len:
