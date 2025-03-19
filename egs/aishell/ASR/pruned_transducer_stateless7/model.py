@@ -24,8 +24,11 @@ import torch.nn.functional as F
 from encoder_interface import EncoderInterface
 from scaling import penalize_abs_values_gt
 
-from icefall.utils import add_sos
+from icefall.utils import add_sos, add_eos
 from typing import Union
+from my_utils import find_best_path, find_best_path_optimized
+from my_utils import find_mono_alignment_optimized, find_mono_alignment_path
+from my_utils import shift_mono_right, shift_alignment_right
 
 class Transducer(nn.Module):
     """It implements https://arxiv.org/pdf/1211.3711.pdf
@@ -113,6 +116,9 @@ class Transducer(nn.Module):
         use_mc_sampling: bool = False,
         mc_sampling_num: int = 1,
         mc_sampling_weight: float = 1.0,
+        use_mc_sampling_y_padded: bool = False,
+        mono_alignment_policy: str = "simple_loss",
+        alignment_policy: str = "b",
     ) -> torch.tensor:
         """
         Args:
@@ -133,6 +139,13 @@ class Transducer(nn.Module):
           lm_scale:
             The scale to smooth the loss with lm (output of predictor network)
             part
+          mono_alignment_strategy:
+            "simple_loss": from simple loss (only working on prune_range 2)
+            "modified_beam_search": from modified beam search
+          alignment_strategy: not yet implemented
+            "b": the beginning of the alignment
+            "m": the middle of the alignment
+            "e": the end of the alignment
         Returns:
           Return the transducer loss.
 
@@ -141,6 +154,9 @@ class Transducer(nn.Module):
            the form:
               lm_scale * lm_probs + am_scale * am_probs +
               (1-lm_scale-am_scale) * combined_probs
+           Define alignment as:
+              Pre-alignment: [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3]
+              alignment:     [423, 0, 0, 333, 0, 0, 124, 0, 0, 56, 0, 0]
         """
         assert x.ndim == 3, x.shape
         assert x_lens.ndim == 1, x_lens.shape
@@ -159,6 +175,10 @@ class Transducer(nn.Module):
         #print(f"{x_lens=}")
         # Now for the decoder, i.e., the prediction network
         #print(f"{y=}")
+        # adding SOS
+        if use_mc_sampling_y_padded:
+            y = add_sos(y, sos_id=self.decoder.blank_id)
+            y = add_eos(y, eos_id=self.decoder.blank_id)
         row_splits = y.shape.row_splits(1)
         y_lens = row_splits[1:] - row_splits[:-1]
 
@@ -259,7 +279,6 @@ class Transducer(nn.Module):
             decode_out = self.joiner.decoder_proj(decoder_out)
 
             logits = self.joiner(encode_out, decode_out, project_input=False)
-
             max_y = torch.max(y_lens) + 1
             time_indices = torch.arange(max_y)
             label_indices = torch.arange(max_y)
@@ -284,6 +303,37 @@ class Transducer(nn.Module):
             decode_out = self.joiner.decoder_proj(decoder_out)
 
             logits = self.joiner(encode_out, decode_out, project_input=False)
+            B = logits.size(0)
+            T = logits.size(1)
+            device = logits.device
+
+            # get an alignment from the logits
+            # logits : [B, T, U, vocab_size]
+            if mono_alignment_policy == "simple_loss":
+                mono = ranges[:, :, 0]
+            elif mono_alignment_policy == "modified_beam_search":
+                mono = find_mono_alignment_optimized(logits,
+                                                     x_lens,
+                                                     y_padded,
+                                                     y_lens)
+            # make alignment from mono
+            alignment = y_padded.gather(1, mono)
+            mask = alignment[:, 1:] == alignment[:, :-1]
+            alignment[:, 1:][mask] = blank_id
+            alignment = alignment.to(device)
+
+            logits = logits[torch.arange(B).view(-1, 1),
+                            torch.arange(T).view(1, -1),
+                            mono]
+
+            # mask out the padding part
+            mask = torch.arange(T, device=device).view(1, -1) >= x_lens.view(-1, 1)
+            alignment[mask] = -100
+
+            ce = nn.CrossEntropyLoss(reduction="sum")
+            logits = logits.permute(0, 2, 1)
+            monte_carlo_ce_loss = ce(logits, alignment)
+            """
             if not use_soft_target:
                 # hard_target
                 mono = ranges[:, :, 0]
@@ -291,9 +341,6 @@ class Transducer(nn.Module):
 
                 mask = alignment[:, 1:] == alignment[:, :-1]
                 alignment[:, 1:][mask] = blank_id
-                B = logits.size(0)
-                T = logits.size(1)
-                device = logits.device
 
                 logits = logits[torch.arange(B).view(-1, 1), torch.arange(T).view(1, -1), mono]
                 alignment = alignment.to(device)
@@ -328,31 +375,72 @@ class Transducer(nn.Module):
                 monte_carlo_ce_loss = -torch.sum(log_probs * soft_alignment)
                 import sys
                 sys.exit(0)
+            """
         elif use_mc_sampling:
             encode_out = self.joiner.encoder_proj(encoder_out)
             decode_out = self.joiner.decoder_proj(decoder_out)
 
             logits = self.joiner(encode_out, decode_out, project_input=False)
-            # hard_target
-            # mono : [B, T]
-            mono = ranges[:, :, 0]
-            alignment = y_padded.gather(1, mono)
-
-            mask = alignment[:, 1:] == alignment[:, :-1]
-            alignment[:, 1:][mask] = blank_id
             B = logits.size(0)
             T = logits.size(1)
             device = logits.device
 
-            logits = logits[torch.arange(B).view(-1, 1), torch.arange(T).view(1, -1), mono]
+            # get an alignment from the logits
+            # logits : [B, T, U, vocab_size]
+            if mono_alignment_policy == "simple_loss":
+                mono = ranges[:, :, 0]
+            elif mono_alignment_policy == "modified_beam_search":
+                mono = find_mono_alignment_optimized(logits,
+                                                     x_lens,
+                                                     y_padded,
+                                                     y_lens)
+            # make alignment from mono
+            alignment = y_padded.gather(1, mono)
+            mask = alignment[:, 1:] == alignment[:, :-1]
+            alignment[:, 1:][mask] = blank_id
             alignment = alignment.to(device)
-            # mask out the padding part
-            t_length_mask = torch.arange(T, device=device).view(1, -1) >= x_lens.view(-1, 1)
-            alignment[t_length_mask] = -100
 
+            # mask out the padding part
+            mask = torch.arange(T, device=device).view(1, -1) >= x_lens.view(-1, 1)
+            alignment[mask] = -100
+
+            # sampling
+            sampled_alignments = list()
+            sampled_alignments.append(alignment)
+            sampled_monos = list()
+            sampled_monos.append(mono)
+            logits_list = list()
+            logits_list.append(logits[torch.arange(B).view(-1, 1),
+                                      torch.arange(T).view(1, -1),
+                                      mono])
+            for i in range(1, mc_sampling_num):
+                sampled_alignment = shift_alignment_right(alignment, i, blank_id)
+                sampled_alignments.append(sampled_alignment)
+                sampled_mono = shift_mono_right(mono, x_lens, i, blank_id)
+                sampled_monos.append(sampled_mono)
+                logits_list.append(logits[torch.arange(B).view(-1, 1),
+                                          torch.arange(T).view(1, -1),
+                                          sampled_mono])
+            """
+            print(f"{sampled_alignments[0][0]=}")
+            print(f"{sampled_alignments[1][0]=}")
+            print(f"{sampled_alignments[-1][0]=}")
+            print(f"{sampled_monos[0][0]=}")
+            print(f"{sampled_monos[1][0]=}")
+            print(f"{sampled_monos[-1][0]=}")
+            print(f"{logits_list[0].shape=}")
+            print(f"{logits_list[1].shape=}")
+            print(f"{logits_list[-1].shape=}")
+            """
             ce = nn.CrossEntropyLoss(reduction="sum")
-            logits = logits.permute(0, 2, 1)
-            mc_sampling_loss = ce(logits, alignment)
+            logits = logits_list[0].permute(0, 2, 1)
+            mc_sampling_loss = ce(logits, sampled_alignments[0])
+            for i in range(1, mc_sampling_num):
+                logits = logits_list[i].permute(0, 2, 1)
+                mc_sampling_loss += mc_sampling_weight * ce(logits, sampled_alignments[i])
+            mc_sampling_loss /= mc_sampling_num
+            """
+            # previous code: it may have a bug
             right_alignment = alignment.clone()
             left_alignment = alignment.clone()
             for i in range(mc_sampling_num-1):
@@ -372,7 +460,7 @@ class Transducer(nn.Module):
                     left_alignment[t_length_mask] = -100
                     mc_sampling_loss = (mc_sampling_loss.clone() +
                                         mc_sampling_weight * ce(logits, left_alignment))
-            mc_sampling_loss = mc_sampling_loss.clone() / mc_sampling_num
+            """
         else:
             # original
             # am_pruned : [B, T, prune_range, encoder_dim]

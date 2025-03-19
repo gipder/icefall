@@ -636,6 +636,33 @@ def get_parser():
         help="MC sampling weight"
     )
 
+    parser.add_argument(
+        "--use-mc-sampling-y-padded",
+        type=str2bool,
+        default=False,
+        help="If the option is enabled, add SOS at the beginning of of ilabels"
+        "and EOS at the end of labels"
+    )
+
+    parser.add_argument(
+        "--mono-alignment-policy",
+        type=str,
+        default="simple_loss",
+        help="The policy to use for mono alignment"
+        "simple_loss: use simple loss"
+        "modified_beam_search: use modified beam search"
+    )
+
+    parser.add_argument(
+        "--alignment-policy",
+        type=str,
+        default="e",
+        help="when mono alignment policy is 'modified beam search',"
+        "'b': labels are located at the beginning of the alignment"
+        "'m': labels are located at the middle of the alignment"
+        "'e': labels are located at the end of the alignment (default)"
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -1134,7 +1161,10 @@ def compute_loss(
             use_only_simple_loss=use_only_simple_loss,
             use_mc_sampling=use_mc_sampling,
             mc_sampling_num=params.mc_sampling_num,
-            mc_sampling_weight=params.mc_sampling_weight
+            mc_sampling_weight=params.mc_sampling_weight,
+            use_mc_sampling_y_padded=params.use_mc_sampling_y_padded,
+            mono_alignment_policy=params.mono_alignment_policy,
+            alignment_policy=params.alignment_policy,
         )
 
         if use_aligner_encoder:
