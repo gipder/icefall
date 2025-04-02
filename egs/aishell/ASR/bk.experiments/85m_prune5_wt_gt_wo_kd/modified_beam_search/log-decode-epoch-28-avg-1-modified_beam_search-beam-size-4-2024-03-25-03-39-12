@@ -1,0 +1,64 @@
+2024-03-25 03:39:12,864 INFO [decode.py:825] Decoding started
+2024-03-25 03:39:12,864 INFO [decode.py:831] Device: cuda:0
+2024-03-25 03:39:13,065 INFO [lexicon.py:168] Loading pre-compiled data/lang_char/Linv.pt
+2024-03-25 03:39:13,093 INFO [decode.py:846] {'frame_shift_ms': 10.0, 'allowed_excess_duration_ratio': 0.1, 'best_train_loss': inf, 'best_valid_loss': inf, 'best_train_epoch': -1, 'best_valid_epoch': -1, 'batch_idx_train': 0, 'log_interval': 50, 'reset_interval': 200, 'valid_interval': 3000, 'feature_dim': 80, 'subsampling_factor': 4, 'warm_step': 2000, 'env_info': {'k2-version': '1.23.4', 'k2-build-type': 'Release', 'k2-with-cuda': True, 'k2-git-sha1': '0d7ef1a7867f70354ab5c59f2feb98c45558dcc7', 'k2-git-date': 'Sat Mar 18 04:59:04 2023', 'lhotse-version': '1.13.0', 'torch-version': '1.12.0a0+git664058f', 'torch-cuda-available': True, 'torch-cuda-version': '11.3', 'python-version': '3.1', 'icefall-git-branch': 'pruned-distillation', 'icefall-git-sha1': '0bc75a0-dirty', 'icefall-git-date': 'Thu Mar 21 06:21:01 2024', 'icefall-path': '/home/sskim/miniconda3/lib/python3.10/site-packages/icefall-1.0-py3.10.egg', 'k2-path': '/home/sskim/miniconda3/lib/python3.10/site-packages/k2-1.23.4.dev20230412+cuda11.3.torch1.12.0a0-py3.10-linux-x86_64.egg/k2/__init__.py', 'lhotse-path': '/home/sskim/miniconda3/lib/python3.10/site-packages/lhotse/__init__.py', 'hostname': 'aishell', 'IP address': '172.17.0.3'}, 'epoch': 28, 'iter': 0, 'avg': 1, 'use_averaged_model': False, 'exp_dir': PosixPath('/home/sskim/work/icefall/egs/aishell/ASR/experiments/85m_prune5_wt_gt_wo_kd'), 'lang_dir': PosixPath('data/lang_char'), 'decoding_method': 'modified_beam_search', 'beam_size': 4, 'beam': 20.0, 'ngram_lm_scale': 0.01, 'max_contexts': 8, 'max_states': 64, 'context_size': 2, 'max_sym_per_frame': 1, 'num_paths': 200, 'nbest_scale': 0.5, 'use_shallow_fusion': False, 'lm_type': 'rnn', 'lm_scale': 0.3, 'tokens_ngram': 3, 'backoff_id': 500, 'num_encoder_layers': '2,4,3,2,4', 'feedforward_dims': '1024,1024,2048,2048,1024', 'nhead': '8,8,8,8,8', 'encoder_dims': '384,384,384,384,384', 'attention_dims': '192,192,192,192,192', 'encoder_unmasked_dims': '256,256,256,256,256', 'zipformer_downsampling_factors': '1,2,4,8,2', 'cnn_module_kernels': '31,31,31,31,31', 'decoder_dim': 512, 'joiner_dim': 512, 'max_duration': 200, 'bucketing_sampler': True, 'num_buckets': 30, 'shuffle': True, 'return_cuts': True, 'num_workers': 2, 'enable_spec_aug': True, 'spec_aug_time_warp_factor': 80, 'enable_musan': True, 'manifest_dir': PosixPath('data/fbank'), 'on_the_fly_feats': False, 'lm_vocab_size': 500, 'lm_epoch': 7, 'lm_avg': 1, 'lm_exp_dir': None, 'rnn_lm_embedding_dim': 2048, 'rnn_lm_hidden_dim': 2048, 'rnn_lm_num_layers': 3, 'rnn_lm_tie_weights': True, 'transformer_lm_exp_dir': None, 'transformer_lm_dim_feedforward': 2048, 'transformer_lm_encoder_dim': 768, 'transformer_lm_embedding_dim': 768, 'transformer_lm_nhead': 8, 'transformer_lm_num_layers': 16, 'transformer_lm_tie_weights': True, 'res_dir': PosixPath('/home/sskim/work/icefall/egs/aishell/ASR/experiments/85m_prune5_wt_gt_wo_kd/modified_beam_search'), 'suffix': 'epoch-28-avg-1-modified_beam_search-beam-size-4', 'blank_id': 0, 'vocab_size': 4336}
+2024-03-25 03:39:13,093 INFO [decode.py:848] About to create model
+2024-03-25 03:39:13,800 INFO [zipformer.py:178] At encoder stack 4, which has downsampling_factor=2, we will combine the outputs of layers 1 and 3, with downsampling_factors=2 and 8.
+2024-03-25 03:39:13,873 INFO [checkpoint.py:112] Loading checkpoint from /home/sskim/work/icefall/egs/aishell/ASR/experiments/85m_prune5_wt_gt_wo_kd/epoch-28.pt
+2024-03-25 03:39:24,821 INFO [decode.py:982] Number of model parameters: 79415379
+2024-03-25 03:39:24,821 INFO [aishell.py:51] About to get test cuts from data/fbank/aishell_cuts_test.jsonl.gz
+2024-03-25 03:39:24,824 INFO [aishell.py:45] About to get valid cuts from data/fbank/aishell_cuts_dev.jsonl.gz
+2024-03-25 03:39:29,203 INFO [decode.py:679] batch 0/?, cuts processed until now is 31
+2024-03-25 03:39:51,510 INFO [decode.py:679] batch 20/?, cuts processed until now is 691
+2024-03-25 03:40:13,863 INFO [decode.py:679] batch 40/?, cuts processed until now is 1392
+2024-03-25 03:40:35,871 INFO [decode.py:679] batch 60/?, cuts processed until now is 2164
+2024-03-25 03:40:58,282 INFO [decode.py:679] batch 80/?, cuts processed until now is 2791
+2024-03-25 03:41:20,272 INFO [decode.py:679] batch 100/?, cuts processed until now is 3573
+2024-03-25 03:41:42,400 INFO [decode.py:679] batch 120/?, cuts processed until now is 4240
+2024-03-25 03:42:04,125 INFO [decode.py:679] batch 140/?, cuts processed until now is 5057
+2024-03-25 03:42:10,645 INFO [zipformer.py:1454] attn_weights_entropy = tensor([2.4911, 2.4170, 2.7463, 2.8390, 2.6008, 2.6540, 2.8341, 1.9445],
+       device='cuda:0'), covar=tensor([0.1272, 0.0681, 0.0802, 0.0813, 0.0515, 0.0960, 0.0781, 0.3653],
+       device='cuda:0'), in_proj_covar=tensor([0.0086, 0.0085, 0.0113, 0.0085, 0.0078, 0.0080, 0.0090, 0.0177],
+       device='cuda:0'), out_proj_covar=tensor([0.0001, 0.0001, 0.0002, 0.0001, 0.0001, 0.0001, 0.0001, 0.0002],
+       device='cuda:0')
+2024-03-25 03:42:25,901 INFO [decode.py:679] batch 160/?, cuts processed until now is 5869
+2024-03-25 03:42:47,887 INFO [decode.py:679] batch 180/?, cuts processed until now is 6575
+2024-03-25 03:43:06,484 INFO [decode.py:679] batch 200/?, cuts processed until now is 7116
+2024-03-25 03:43:08,496 INFO [decode.py:692] The transcripts are stored in /home/sskim/work/icefall/egs/aishell/ASR/experiments/85m_prune5_wt_gt_wo_kd/modified_beam_search/recogs-test-epoch-28-avg-1-modified_beam_search-beam-size-4.txt
+2024-03-25 03:43:08,704 INFO [utils.py:558] [test-beam_size_4] %WER 7.27% [7612 / 104765, 90 ins, 1439 del, 6083 sub ]
+2024-03-25 03:43:09,093 INFO [decode.py:707] Wrote detailed error stats to /home/sskim/work/icefall/egs/aishell/ASR/experiments/85m_prune5_wt_gt_wo_kd/modified_beam_search/errs-test-epoch-28-avg-1-modified_beam_search-beam-size-4.txt
+2024-03-25 03:43:09,093 INFO [decode.py:721] 
+For test, CER of different settings are:
+beam_size_4	7.27	best for test
+
+2024-03-25 03:43:11,162 INFO [decode.py:679] batch 0/?, cuts processed until now is 35
+2024-03-25 03:43:33,587 INFO [decode.py:679] batch 20/?, cuts processed until now is 783
+2024-03-25 03:44:00,741 INFO [decode.py:679] batch 40/?, cuts processed until now is 1571
+2024-03-25 03:44:27,451 INFO [decode.py:679] batch 60/?, cuts processed until now is 2429
+2024-03-25 03:44:54,797 INFO [decode.py:679] batch 80/?, cuts processed until now is 3151
+2024-03-25 03:45:21,397 INFO [decode.py:679] batch 100/?, cuts processed until now is 4021
+2024-03-25 03:45:47,895 INFO [decode.py:679] batch 120/?, cuts processed until now is 4764
+2024-03-25 03:46:14,235 INFO [decode.py:679] batch 140/?, cuts processed until now is 5645
+2024-03-25 03:46:40,516 INFO [decode.py:679] batch 160/?, cuts processed until now is 6538
+2024-03-25 03:47:07,309 INFO [decode.py:679] batch 180/?, cuts processed until now is 7374
+2024-03-25 03:47:34,066 INFO [decode.py:679] batch 200/?, cuts processed until now is 8191
+2024-03-25 03:48:00,826 INFO [decode.py:679] batch 220/?, cuts processed until now is 8985
+2024-03-25 03:48:27,552 INFO [decode.py:679] batch 240/?, cuts processed until now is 9797
+2024-03-25 03:48:31,601 INFO [zipformer.py:1454] attn_weights_entropy = tensor([3.3894, 3.7154, 2.2438, 4.0200, 3.9050, 4.1382, 4.0119, 3.6287],
+       device='cuda:0'), covar=tensor([0.1407, 0.0438, 0.5144, 0.0549, 0.0498, 0.0642, 0.0411, 0.0708],
+       device='cuda:0'), in_proj_covar=tensor([0.0222, 0.0166, 0.0276, 0.0198, 0.0189, 0.0230, 0.0209, 0.0169],
+       device='cuda:0'), out_proj_covar=tensor([1.1127e-04, 8.3385e-05, 1.2984e-04, 8.8648e-05, 8.3981e-05, 1.0460e-04,
+        9.3179e-05, 7.9690e-05], device='cuda:0')
+2024-03-25 03:48:54,400 INFO [decode.py:679] batch 260/?, cuts processed until now is 10605
+2024-03-25 03:49:20,910 INFO [decode.py:679] batch 280/?, cuts processed until now is 11495
+2024-03-25 03:49:47,141 INFO [decode.py:679] batch 300/?, cuts processed until now is 12341
+2024-03-25 03:50:14,083 INFO [decode.py:679] batch 320/?, cuts processed until now is 13095
+2024-03-25 03:50:40,949 INFO [decode.py:679] batch 340/?, cuts processed until now is 13832
+2024-03-25 03:50:59,667 INFO [decode.py:692] The transcripts are stored in /home/sskim/work/icefall/egs/aishell/ASR/experiments/85m_prune5_wt_gt_wo_kd/modified_beam_search/recogs-dev-epoch-28-avg-1-modified_beam_search-beam-size-4.txt
+2024-03-25 03:51:00,156 INFO [utils.py:558] [dev-beam_size_4] %WER 6.69% [13747 / 205341, 216 ins, 2572 del, 10959 sub ]
+2024-03-25 03:51:00,912 INFO [decode.py:707] Wrote detailed error stats to /home/sskim/work/icefall/egs/aishell/ASR/experiments/85m_prune5_wt_gt_wo_kd/modified_beam_search/errs-dev-epoch-28-avg-1-modified_beam_search-beam-size-4.txt
+2024-03-25 03:51:00,912 INFO [decode.py:721] 
+For dev, CER of different settings are:
+beam_size_4	6.69	best for dev
+
+2024-03-25 03:51:00,924 INFO [decode.py:1014] Done!

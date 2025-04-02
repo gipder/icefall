@@ -973,7 +973,6 @@ def modified_beam_search_for_kd(
 
         A = [list(b) for b in B]
         B = [HypothesisList() for _ in range(batch_size)]
-        C = [HypothesisList() for _ in range(batch_size)]
 
         ys_log_probs = torch.cat(
             [hyp.log_prob.reshape(1, 1) for hyps in A for hyp in hyps]
@@ -1597,6 +1596,138 @@ def _deprecated_modified_beam_search(
             B.add(new_hyp)
 
     best_hyp = B.get_most_probable(length_norm=True)
+    ys = best_hyp.ys[context_size:]  # [context_size:] to remove blanks
+
+    if not return_timestamps:
+        return ys
+    else:
+        return DecodingResults(hyps=[ys], timestamps=[best_hyp.timestamp])
+
+def aligner_encoder_beam_search(
+    model: Transducer,
+    encoder_out: torch.Tensor,
+    beam: int = 4,
+    return_timestamps: bool = False,
+) -> Union[List[int], DecodingResults]:
+    """It limits the maximum number of symbols per frame to 1.
+
+    It decodes only one utterance at a time. We keep it only for reference.
+    The function :func:`modified_beam_search` should be preferred as it
+    supports batch decoding.
+
+
+    Args:
+      model:
+        An instance of `Transducer`.
+      encoder_out:
+        A tensor of shape (N, T, C) from the encoder. Support only N==1 for now.
+      beam:
+        Beam size.
+      return_timestamps:
+        Whether to return timestamps.
+
+    Returns:
+      If return_timestamps is False, return the decoded result.
+      Else, return a DecodingResults object containing
+      decoded result and corresponding timestamps.
+    """
+
+    assert encoder_out.ndim == 3
+
+    # support only batch_size == 1 for now
+    assert encoder_out.size(0) == 1, encoder_out.size(0)
+    blank_id = model.decoder.blank_id
+    unk_id = getattr(model, "unk_id", blank_id)
+    context_size = model.decoder.context_size
+
+    device = next(model.parameters()).device
+
+    T = encoder_out.size(1)
+
+    B = HypothesisList()
+    B.add(
+        Hypothesis(
+            ys=[blank_id] * context_size,
+            log_prob=torch.zeros(1, dtype=torch.float32, device=device),
+            timestamp=[],
+        )
+    )
+    encoder_out = model.joiner.encoder_proj(encoder_out)
+
+    remaining_beam_size = beam
+    finalized_B = HypothesisList()
+    for t in range(T):
+        # fmt: off
+        current_encoder_out = encoder_out[:, t:t+1, :].unsqueeze(2)
+        # current_encoder_out is of shape (1, 1, 1, encoder_out_dim)
+        # fmt: on
+        A = list(B)
+        B = HypothesisList()
+
+        ys_log_probs = torch.cat([hyp.log_prob.reshape(1, 1) for hyp in A])
+        # ys_log_probs is of shape (num_hyps, 1)
+
+        decoder_input = torch.tensor(
+            [hyp.ys[-context_size:] for hyp in A],
+            device=device,
+            dtype=torch.int64,
+        )
+        # decoder_input is of shape (num_hyps, context_size)
+
+        decoder_out = model.decoder(decoder_input, need_pad=False).unsqueeze(1)
+        decoder_out = model.joiner.decoder_proj(decoder_out)
+        # decoder_output is of shape (num_hyps, 1, 1, joiner_dim)
+
+        current_encoder_out = current_encoder_out.expand(
+            decoder_out.size(0), 1, 1, -1
+        )  # (num_hyps, 1, 1, encoder_out_dim)
+
+        logits = model.joiner(
+            current_encoder_out,
+            decoder_out,
+            project_input=False,
+        )
+        # logits is of shape (num_hyps, 1, 1, vocab_size)
+        logits = logits.squeeze(1).squeeze(1)
+
+        # now logits is of shape (num_hyps, vocab_size)
+        log_probs = logits.log_softmax(dim=-1)
+
+        log_probs.add_(ys_log_probs)
+
+        log_probs = log_probs.reshape(-1)
+        topk_log_probs, topk_indexes = log_probs.topk(remaining_beam_size )
+
+        # topk_hyp_indexes are indexes into `A`
+        topk_hyp_indexes = torch.div(topk_indexes, logits.size(-1), rounding_mode='floor')
+        topk_token_indexes = topk_indexes % logits.size(-1)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            topk_hyp_indexes = topk_hyp_indexes.tolist()
+            topk_token_indexes = topk_token_indexes.tolist()
+
+        for i in range(len(topk_hyp_indexes)):
+            hyp = A[topk_hyp_indexes[i]]
+            new_ys = hyp.ys[:]
+            new_timestamp = hyp.timestamp[:]
+            new_token = topk_token_indexes[i]
+            if new_token not in (blank_id, unk_id):
+                new_ys.append(new_token)
+                new_timestamp.append(t)
+            else:
+                finalized_B.add(hyp)
+                remaining_beam_size -= 1
+            new_log_prob = topk_log_probs[i]
+            new_hyp = Hypothesis(
+                ys=new_ys, log_prob=new_log_prob, timestamp=new_timestamp
+            )
+            B.add(new_hyp)
+
+        if remaining_beam_size == 0:
+            break
+
+    best_hyp = finalized_B.get_most_probable(length_norm=True)
     ys = best_hyp.ys[context_size:]  # [context_size:] to remove blanks
 
     if not return_timestamps:

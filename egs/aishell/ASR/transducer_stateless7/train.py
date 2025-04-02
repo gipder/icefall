@@ -552,13 +552,6 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--use-sequence",
-        type=str2bool,
-        default=False,
-        help="Whether to use sequence-level learning when doing knowledge distillation",
-    )
-
-    parser.add_argument(
         "--use-sq-sampling",
         type=str2bool,
         default=False,
@@ -577,6 +570,13 @@ def get_parser():
         type=float,
         default=1.0,
         help="ratio between sampling loss and kd_loss, default is 1",
+    )
+
+    parser.add_argument(
+        "--use-aligner-encoder",
+        type=str2bool,
+        default=False,
+        help="Whether to use aligner-encoder loss",
     )
 
     add_model_arguments(parser)
@@ -891,6 +891,7 @@ def compute_loss(
     pseudo_y = None
     beam_search_alignment = None
     pseudo_y_sequence = None
+    use_aligner_encoder = params.use_aligner_encoder
 
     if teacher_model is None:
         use_kd = False
@@ -1095,21 +1096,23 @@ def compute_loss(
             use_efficient=params.use_efficient,
             use_1best=params.use_1best,
             pseudo_y_alignment=beam_search_alignment,
-            use_sequence=params.use_sequence,
-            pseudo_y_sequence=pseudo_y_sequence,
             use_sq_sampling=use_sq_sampling,
             sampling_y=sampling_y,
             teacher_sampling_logits=teacher_sampling_logits,
             sq_sampling_num=sq_sampling_num,
+            use_aligner_encoder=use_aligner_encoder,
         )
 
     kd_loss_scale = params.kd_loss_scale
     sampling_loss_scale = params.kd_loss_scale * params.sq_sampling_scale
-    org_loss = ret["org_loss"]
-    if use_kd:
-        kd_loss = ret["kd_loss"]
-    if use_sq_sampling:
-        sampling_loss = ret["sampling_loss"]
+    if use_aligner_encoder:
+        org_loss = ret["aligner_encoder_loss"]
+    else:
+        org_loss = ret["org_loss"]
+        if use_kd:
+            kd_loss = ret["kd_loss"]
+        if use_sq_sampling:
+            sampling_loss = ret["sampling_loss"]
 
     loss = org_loss + kd_loss_scale * kd_loss + \
         sampling_loss_scale * sampling_loss
@@ -1126,11 +1129,14 @@ def compute_loss(
 
     # Note: We use reduction=sum while computing the loss.
     info["loss"] = loss.detach().cpu().item()
-    info["org_loss"] = ret["org_loss"].detach().cpu().item()
-    if params.use_kd:
-        info["kd_loss"] = ret["kd_loss"].detach().cpu().item()
-    if params.use_sq_sampling:
-        info["sampling_loss"] = ret["sampling_loss"].detach().cpu().item()
+    if use_aligner_encoder:
+        info["aligner_encoder_loss"] = ret["aligner_encoder_loss"].detach().cpu().item()
+    else:
+        info["org_loss"] = ret["org_loss"].detach().cpu().item()
+        if params.use_kd:
+            info["kd_loss"] = ret["kd_loss"].detach().cpu().item()
+        if params.use_sq_sampling:
+            info["sampling_loss"] = ret["sampling_loss"].detach().cpu().item()
 
     return loss, info
 

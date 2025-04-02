@@ -422,6 +422,13 @@ class Transducer(nn.Module):
                                           torch.arange(T).view(1, -1),
                                           sampled_mono])
             """
+            print(f"{ranges[0]=}")
+            print(f"{alignment[0]=}")
+            print(f"{mono[0]=}")
+            # getting index where the first value is 1
+            idx = torch.where(sampled_monos[-1][0] == 1)
+            idx2 = torch.where(sampled_alignments[-1][0] == 60)
+            print(f"{idx=}, {idx2=}")
             print(f"{sampled_alignments[0][0]=}")
             print(f"{sampled_alignments[1][0]=}")
             print(f"{sampled_alignments[-1][0]=}")
@@ -431,6 +438,8 @@ class Transducer(nn.Module):
             print(f"{logits_list[0].shape=}")
             print(f"{logits_list[1].shape=}")
             print(f"{logits_list[-1].shape=}")
+            import sys
+            sys.exit(0)
             """
             ce = nn.CrossEntropyLoss(reduction="sum")
             logits = logits_list[0].permute(0, 2, 1)

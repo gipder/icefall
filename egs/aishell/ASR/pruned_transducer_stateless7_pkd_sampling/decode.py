@@ -155,6 +155,7 @@ from beam_search import (
     modified_beam_search_lm_shallow_fusion,
     modified_beam_search_LODR,
     modified_beam_search_ngram_rescoring,
+    aligner_encoder_beam_search,
 )
 from train import add_model_arguments, get_params, get_transducer_model
 
@@ -570,6 +571,17 @@ def decode_one_batch(
                     encoder_out=encoder_out_i,
                     max_sym_per_frame=params.max_sym_per_frame,
                 )
+            if params.decoding_method == "aligner_encoder_beam_search":
+                hyp = aligner_encoder_beam_search(
+                    model=model,
+                    encoder_out=encoder_out_i,
+                    beam=params.beam_size,
+                )
+                #hyp = greedy_search(
+                #    model=model,
+                #    encoder_out=encoder_out_i,
+                #    max_sym_per_frame=params.max_sym_per_frame,
+                #)
             elif params.decoding_method == "beam_search":
                 hyp = beam_search(
                     model=model,
@@ -748,7 +760,8 @@ def main():
         "modified_beam_search",
         "modified_beam_search_lm_shallow_fusion",
         "modified_beam_search_LODR",
-        "ctc-decoding"
+        "ctc-decoding",
+        "aligner_encoder_beam_search",
     )
     params.res_dir = params.exp_dir / params.decoding_method
 
