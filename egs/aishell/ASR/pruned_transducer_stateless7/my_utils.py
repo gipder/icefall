@@ -627,3 +627,98 @@ def shift_mono_right(mono, mono_lens, shift=1, pad_value=0, ignore_value=-100):
     shifted[mask] = pad_value
 
     return shifted
+
+def make_soft_target(mono: torch.Tensor,
+                     alignment: torch.Tensor,
+                     x_lens: torch.Tensor,
+                     y: torch.Tensor,
+                     y_lens: torch.Tensor,
+                     num_classes: int,
+                     blank_id: int = 0,
+                     lambda_right: float = 1.0,
+                     lambda_left: float = 2.0) -> torch.Tensor:
+    """
+    Make soft weight from alignment information
+    Args:
+      mono: 2D tensor [batch_size, time], monotonically aligned label sequences
+      alignment: 2D tensor [batch_size, time], alignment according to the mono
+      x_lens: 1D tensor [batch_size]
+              The lengths of the input feature sequences
+      y: 2D tensor [batch_size, label]
+         The label sequences that don't align with the logits
+      y_lens: 1D tensor [batch_size]
+              The lengths of the label sequences
+      num_classes: int, number of classes
+      blank_id: int, blank label index
+
+    Returns:
+      weight: 3D tensor [batch_size, time, vocaburary], soft weight for the alignment
+    """
+    B, T = mono.shape
+    U = y.shape[-1]
+    V = num_classes
+    blank_id = blank_id
+    device = mono.device
+
+    # make hard target first
+    hard_target = torch.zeros((B, T, U), dtype=torch.float32, device=device)
+    mask = ((alignment != -100) & (alignment != blank_id)).float()
+    hard_target.scatter_(2, mono.unsqueeze(-1), mask.unsqueeze(-1))
+
+    # make soft target
+    peak_t = torch.argmax(hard_target, dim=1)
+    time_idx = torch.arange(T, device=device).view(1, T, 1)
+    delta = time_idx - peak_t.unsqueeze(1)
+
+    soft_target = torch.where(
+        delta < 0,
+        torch.exp(lambda_left * delta.float()),    # negative delta → left
+        torch.exp(-lambda_right * delta.float())   # positive delta → right
+    )
+
+    u_mask = torch.arange(U).to(device) < y_lens.unsqueeze(1).to(device)
+    u_mask = u_mask.unsqueeze(1).expand(-1, T, -1)
+    soft_target[~u_mask] = 0
+
+    # make soft target
+    peak_t = torch.argmax(hard_target, dim=1)
+    time_idx = torch.arange(T, device=device).view(1, T, 1)
+    delta = time_idx - peak_t.unsqueeze(1)
+
+    soft_target = torch.where(
+            delta < 0,
+            torch.exp(lambda_left * delta.float()),    # negative delta → left
+            torch.exp(-lambda_right * delta.float())   # positive delta → right
+    )
+
+    # make soft target
+    peak_t = torch.argmax(hard_target, dim=1)
+    time_idx = torch.arange(T, device=device).view(1, T, 1)
+    delta = time_idx - peak_t.unsqueeze(1)
+
+    soft_target = torch.where(
+            delta < 0,
+            torch.exp(lambda_left * delta.float()),    # negative delta → left
+            torch.exp(-lambda_right * delta.float())   # positive delta → right
+    )
+
+    # masking
+    t_mask = torch.arange(T).to(device) < x_lens.unsqueeze(1).to(device)
+    soft_target[~u_mask] = 0
+    soft_target[~t_mask] = 0
+
+    # soft target
+    y_exp = y.unsqueeze(1).expand(-1, T, -1)  # (B, T, U)
+    weight = torch.zeros(B, T, V,
+                         dtype=soft_target.dtype,
+                         device=soft_target.device)
+    weight.scatter_(dim=2,
+                    index=y_exp,
+                    src=soft_target)
+
+    # the probability of blank label = 1.0 - sum(p(other labels))
+    zero_val = torch.clamp(1.0 - soft_target[:, :, 1:].sum(dim=-1), min=0.0)
+    weight[:, :, blank_id] = zero_val
+    weight = weight / weight.sum(dim=-1, keepdim=True)
+
+    return weight

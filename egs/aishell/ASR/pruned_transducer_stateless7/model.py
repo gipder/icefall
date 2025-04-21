@@ -29,6 +29,7 @@ from typing import Union
 from my_utils import find_best_path, find_best_path_optimized
 from my_utils import find_mono_alignment_optimized, find_mono_alignment_path
 from my_utils import shift_mono_right, shift_alignment_right
+from my_utils import make_soft_target
 
 class Transducer(nn.Module):
     """It implements https://arxiv.org/pdf/1211.3711.pdf
@@ -329,7 +330,6 @@ class Transducer(nn.Module):
             # mask out the padding part
             mask = torch.arange(T, device=device).view(1, -1) >= x_lens.view(-1, 1)
             alignment[mask] = -100
-
             ce = nn.CrossEntropyLoss(reduction="sum")
             logits = logits.permute(0, 2, 1)
             monte_carlo_ce_loss = ce(logits, alignment)
@@ -395,7 +395,9 @@ class Transducer(nn.Module):
                                                      y_padded,
                                                      y_lens)
             # make alignment from mono
+
             alignment = y_padded.gather(1, mono)
+            orig_alignment = alignment.clone()
             mask = alignment[:, 1:] == alignment[:, :-1]
             alignment[:, 1:][mask] = blank_id
             alignment = alignment.to(device)
@@ -403,6 +405,33 @@ class Transducer(nn.Module):
             # mask out the padding part
             mask = torch.arange(T, device=device).view(1, -1) >= x_lens.view(-1, 1)
             alignment[mask] = -100
+
+            # get softweight
+            soft_targets = list()
+            if use_soft_target:
+                soft_target = make_soft_target(mono=mono,
+                                               alignment=alignment,
+                                               x_lens=x_lens,
+                                               y=y_padded,
+                                               y_lens=y_lens,
+                                               num_classes=logits.size(3),
+                                               blank_id=blank_id,
+                                               )
+                soft_targets.append(soft_target)
+                if torch.isnan(soft_target).any() or torch.isinf(soft_target).any():
+                    print(f"{torch.where(torch.isnan(soft_target))=}")
+                    idx = torch.where(torch.isnan(soft_target))[0][0]
+                    idx2 = torch.where(torch.isnan(soft_target))[1][0]
+                    print(f"{idx=}, {idx2=}")
+                    print(f"{orig_alignment[idx]=}")
+                    print(f"{alignment[idx]=}")
+                    print(f"{mono[idx]=}")
+                    print(f"{x_lens[idx]=}")
+                    print(f"{y_padded[idx]=}")
+                    print(f"{y_lens[idx]=}")
+                    print(f"{soft_target[idx, idx2]=}")
+                    import sys
+                    sys.exit(0)
 
             # sampling
             sampled_alignments = list()
@@ -421,6 +450,21 @@ class Transducer(nn.Module):
                 logits_list.append(logits[torch.arange(B).view(-1, 1),
                                           torch.arange(T).view(1, -1),
                                           sampled_mono])
+                if use_soft_target:
+                    sampled_soft_target = make_soft_target(mono=sampled_mono,
+                                                           alignment=sampled_alignment,
+                                                           x_lens=x_lens,
+                                                           y=y_padded,
+                                                           y_lens=y_lens,
+                                                           num_classes=logits.size(3),
+                                                           blank_id=blank_id,
+                                                           )
+                    soft_targets.append(sampled_soft_target)
+                    if torch.isnan(sampled_soft_target).any() or torch.isinf(sampled_soft_target).any():
+                        print(f"{sampled_soft_target=}")
+                        import sys
+                        sys.exit(0)
+
             """
             print(f"{ranges[0]=}")
             print(f"{alignment[0]=}")
@@ -441,13 +485,25 @@ class Transducer(nn.Module):
             import sys
             sys.exit(0)
             """
-            ce = nn.CrossEntropyLoss(reduction="sum")
-            logits = logits_list[0].permute(0, 2, 1)
-            mc_sampling_loss = ce(logits, sampled_alignments[0])
-            for i in range(1, mc_sampling_num):
-                logits = logits_list[i].permute(0, 2, 1)
-                mc_sampling_loss += mc_sampling_weight * ce(logits, sampled_alignments[i])
-            mc_sampling_loss /= mc_sampling_num
+            if use_soft_target is False:  # hard target
+                ce = nn.CrossEntropyLoss(reduction="sum")
+                logits = logits_list[0].permute(0, 2, 1)
+                mc_sampling_loss = ce(logits, sampled_alignments[0])
+                for i in range(1, mc_sampling_num):
+                    logits = logits_list[i].permute(0, 2, 1)
+                    mc_sampling_loss += mc_sampling_weight * ce(logits, sampled_alignments[i])
+                mc_sampling_loss /= mc_sampling_num
+            else:  # soft target
+                logits = logits_list[0]
+                logits = torch.log_softmax(logits, dim=-1)
+                mask = torch.arange(T, device=device).view(1, -1) >= x_lens.view(-1, 1)
+                mask = mask.unsqueeze(-1)
+                mc_sampling_loss = -torch.sum(logits * soft_targets[0] * mask)
+                for i in range(1, mc_sampling_num):
+                    logits = logits_list[i]
+                    mc_sampling_loss += mc_sampling_weight * -torch.sum(logits * soft_targets[i] * mask)
+                mc_sampling_loss /= mc_sampling_num
+
             """
             # previous code: it may have a bug
             right_alignment = alignment.clone()
