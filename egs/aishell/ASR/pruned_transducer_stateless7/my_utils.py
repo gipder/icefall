@@ -588,6 +588,32 @@ def shift_alignment_right(alignment, shift=1, pad_value=0, ignore_value=-100):
     return shifted
 
 
+def shift_alignment_left(alignment, shift=1, pad_value=0, ignore_value=-100):
+    shifted = alignment.clone()
+    if shift <= 0:
+        return shifted
+
+    for i in range(shifted.size(0)):
+        row = alignment[i]
+        mask = row != ignore_value
+        valid_values = row[mask]
+        length = valid_values.shape[0]
+        step = shift
+        while step > 0:
+            first_pad_idxs = torch.where(valid_values == pad_value)[0]
+            if len(first_pad_idxs) == 0:
+                break
+            first_pad_idx = first_pad_idxs[0]
+            shifted[i, :first_pad_idx] = valid_values[:first_pad_idx]
+            if first_pad_idx + 1 < len(valid_values):
+                shifted[i, first_pad_idx:length-1] = valid_values[first_pad_idx+1:]
+                shifted[i, length-1] = pad_value
+                valid_values = shifted[i, :length].clone()
+            step -= 1
+
+    return shifted
+
+
 def shift_mono_right(mono, mono_lens, shift=1, pad_value=0, ignore_value=-100):
     shifted = mono.clone()
     device = shifted.device
@@ -628,6 +654,47 @@ def shift_mono_right(mono, mono_lens, shift=1, pad_value=0, ignore_value=-100):
 
     return shifted
 
+
+def shift_mono_left(mono, mono_lens, shift=1, pad_value=0, ignore_value=-100):
+    shifted = mono.clone()
+    device = shifted.device
+
+    # transfrom mono to alignment-like tensor
+    mask = shifted[:, 1:] == shifted[:, :-1]
+    shifted[:, 1:][mask] = pad_value
+
+    seq_indices = torch.arange(shifted.size(1), device=device)
+    mask = seq_indices.view(1, -1) >= mono_lens.view(-1, 1)
+    shifted[mask] = -100
+
+    for i in range(mono.size(0)):
+        row = shifted[i]
+        mask = (row != ignore_value)  # -100이 아닌 부분을 찾기
+        valid_values = row[mask]  # 유효한 값만 추출
+        length = valid_values.shape[0]
+        step = shift
+        while step > 0:
+            first_pad_idxs = torch.where(valid_values == pad_value)[0]
+            if len(first_pad_idxs) == 0:
+                break
+            first_pad_idx = first_pad_idxs[0]
+            shifted[i, :first_pad_idx] = valid_values[:first_pad_idx]
+            if first_pad_idx + 1 < len(valid_values):
+                shifted[i, first_pad_idx:length-1] = valid_values[first_pad_idx+1:]
+                shifted[i, length-1] = pad_value
+                valid_values = shifted[i, :length].clone()
+            step -= 1
+
+    # transform alignment-like tensor to mono
+    mask = shifted != pad_value
+    shifted = torch.cumsum(mask, dim=-1)
+    seq_indices = torch.arange(shifted.size(1), device=device)
+    mask = seq_indices.view(1, -1) >= mono_lens.view(-1, 1)
+    shifted[mask] = pad_value
+
+    return shifted
+
+
 def make_soft_target(mono: torch.Tensor,
                      alignment: torch.Tensor,
                      x_lens: torch.Tensor,
@@ -635,8 +702,8 @@ def make_soft_target(mono: torch.Tensor,
                      y_lens: torch.Tensor,
                      num_classes: int,
                      blank_id: int = 0,
-                     lambda_right: float = 1.0,
-                     lambda_left: float = 2.0) -> torch.Tensor:
+                     lambda_right: float = 2.0,
+                     lambda_left: float = 4.0) -> torch.Tensor:
     """
     Make soft weight from alignment information
     Args:
@@ -652,7 +719,9 @@ def make_soft_target(mono: torch.Tensor,
       blank_id: int, blank label index
 
     Returns:
-      weight: 3D tensor [batch_size, time, vocaburary], soft weight for the alignment
+      soft_target: 3D tensor [batch_size, time, vocaburary], soft weight for the alignment
+      hard_target: 3D tensor [batch_size, time, vocaburary], hard (1.0 or 0.0) weight for the alignment
+      # (deprecated)label_alignment: 2D tensor [batch_size, time], label_alignment (i.e. 1186, 0, 0, 34, 0, 0) for ce loss
     """
     B, T = mono.shape
     U = y.shape[-1]
@@ -661,64 +730,52 @@ def make_soft_target(mono: torch.Tensor,
     device = mono.device
 
     # make hard target first
-    hard_target = torch.zeros((B, T, U), dtype=torch.float32, device=device)
+    hard_lattice = torch.zeros((B, T, U), dtype=torch.float32, device=device)
     mask = ((alignment != -100) & (alignment != blank_id)).float()
-    hard_target.scatter_(2, mono.unsqueeze(-1), mask.unsqueeze(-1))
+    hard_src = torch.ones((B, T, 1), dtype=torch.float32, device=device)
+    hard_lattice.scatter_(dim=-1, index=mono.unsqueeze(-1), src=hard_src)
 
     # make soft target
-    peak_t = torch.argmax(hard_target, dim=1)
+    peak_t = torch.argmax(hard_lattice, dim=1)
     time_idx = torch.arange(T, device=device).view(1, T, 1)
     delta = time_idx - peak_t.unsqueeze(1)
 
-    soft_target = torch.where(
+    soft_lattice = torch.where(
         delta < 0,
         torch.exp(lambda_left * delta.float()),    # negative delta → left
         torch.exp(-lambda_right * delta.float())   # positive delta → right
     )
 
+    # masking
     u_mask = torch.arange(U).to(device) < y_lens.unsqueeze(1).to(device)
     u_mask = u_mask.unsqueeze(1).expand(-1, T, -1)
-    soft_target[~u_mask] = 0
-
-    # make soft target
-    peak_t = torch.argmax(hard_target, dim=1)
-    time_idx = torch.arange(T, device=device).view(1, T, 1)
-    delta = time_idx - peak_t.unsqueeze(1)
-
-    soft_target = torch.where(
-            delta < 0,
-            torch.exp(lambda_left * delta.float()),    # negative delta → left
-            torch.exp(-lambda_right * delta.float())   # positive delta → right
-    )
-
-    # make soft target
-    peak_t = torch.argmax(hard_target, dim=1)
-    time_idx = torch.arange(T, device=device).view(1, T, 1)
-    delta = time_idx - peak_t.unsqueeze(1)
-
-    soft_target = torch.where(
-            delta < 0,
-            torch.exp(lambda_left * delta.float()),    # negative delta → left
-            torch.exp(-lambda_right * delta.float())   # positive delta → right
-    )
-
-    # masking
     t_mask = torch.arange(T).to(device) < x_lens.unsqueeze(1).to(device)
-    soft_target[~u_mask] = 0
-    soft_target[~t_mask] = 0
+    soft_lattice[~u_mask] = 0
+    soft_lattice[~t_mask] = 0
 
     # soft target
     y_exp = y.unsqueeze(1).expand(-1, T, -1)  # (B, T, U)
-    weight = torch.zeros(B, T, V,
-                         dtype=soft_target.dtype,
-                         device=soft_target.device)
-    weight.scatter_(dim=2,
-                    index=y_exp,
-                    src=soft_target)
+
+    soft_target = torch.zeros((B, T, V),
+                              dtype=soft_lattice.dtype,
+                              device=soft_lattice.device)
+    soft_target.scatter_(dim=-1,
+                         index=y_exp,
+                         src=soft_lattice)
 
     # the probability of blank label = 1.0 - sum(p(other labels))
     zero_val = torch.clamp(1.0 - soft_target[:, :, 1:].sum(dim=-1), min=0.0)
-    weight[:, :, blank_id] = zero_val
-    weight = weight / weight.sum(dim=-1, keepdim=True)
+    soft_target[:, :, blank_id] = zero_val
+    soft_target = soft_target / soft_target.sum(dim=-1, keepdim=True)
 
-    return weight
+    # hard_target
+    hard_target = torch.zeros((B, T, V), dtype=torch.float32, device=device)
+    label_alignment = torch.gather(y, dim=-1, index=mono)
+    l_mask = label_alignment[:, :-1] == label_alignment[:, 1:]
+    label_alignment[:, 1:][l_mask] = 0
+    hard_target.scatter_(dim=-1, index=label_alignment.unsqueeze(-1), src=hard_src)
+    hard_target[~t_mask] = 0
+    soft_target[~t_mask] = 0
+    #label_alignment[~t_mask] = -100
+
+    return soft_target, hard_target

@@ -29,7 +29,10 @@ from typing import Union
 from my_utils import find_best_path, find_best_path_optimized
 from my_utils import find_mono_alignment_optimized, find_mono_alignment_path
 from my_utils import shift_mono_right, shift_alignment_right
+from my_utils import shift_mono_left, shift_alignment_left
 from my_utils import make_soft_target
+
+import numpy as np
 
 class Transducer(nn.Module):
     """It implements https://arxiv.org/pdf/1211.3711.pdf
@@ -120,6 +123,8 @@ class Transducer(nn.Module):
         use_mc_sampling_y_padded: bool = False,
         mono_alignment_policy: str = "simple_loss",
         alignment_policy: str = "b",
+        mc_sampling_left_lambda: float = 10.0,
+        mc_sampling_right_lambda: float = 5.0,
     ) -> torch.tensor:
         """
         Args:
@@ -333,49 +338,6 @@ class Transducer(nn.Module):
             ce = nn.CrossEntropyLoss(reduction="sum")
             logits = logits.permute(0, 2, 1)
             monte_carlo_ce_loss = ce(logits, alignment)
-            """
-            if not use_soft_target:
-                # hard_target
-                mono = ranges[:, :, 0]
-                alignment = y_padded.gather(1, mono)
-
-                mask = alignment[:, 1:] == alignment[:, :-1]
-                alignment[:, 1:][mask] = blank_id
-
-                logits = logits[torch.arange(B).view(-1, 1), torch.arange(T).view(1, -1), mono]
-                alignment = alignment.to(device)
-                # mask out the padding part
-                mask = torch.arange(T, device=device).view(1, -1) >= x_lens.view(-1, 1)
-                alignment[mask] = -100
-
-                ce = nn.CrossEntropyLoss(reduction="sum")
-                logits = logits.permute(0, 2, 1)
-                monte_carlo_ce_loss = ce(logits, alignment)
-            else:
-                # soft_target blank:the_other_labels = 0.5:0.5
-                B = logits.size(0)
-                T = logits.size(1)
-                V = logits.size(3)
-                device = logits.device
-                mono = ranges[:, :, 0]
-                print(f"{ranges=}")
-                print(f"{mono=}")
-                print(f"{y=}")
-                logits = logits[torch.arange(B).view(-1, 1),
-                                torch.arange(T).view(1, -1),
-                                mono]
-                log_probs = F.log_softmax(logits, dim=-1)
-                alignment = y_padded.gather(1, mono)
-                print(f"{alignment[:, -1]=}")
-                soft_alignment = torch.zeros(B, T, V, device=device)
-                soft_alignment[torch.arange(B).view(-1, 1), torch.arange(T).view(1, -1), alignment] = 0.5
-                soft_alignment[:, :, blank_id] += 0.5
-                print(f"{soft_alignment[0, 1, 0]=}")
-                print(f"{soft_alignment[0, 1, 60]=}")
-                monte_carlo_ce_loss = -torch.sum(log_probs * soft_alignment)
-                import sys
-                sys.exit(0)
-            """
         elif use_mc_sampling:
             encode_out = self.joiner.encoder_proj(encoder_out)
             decode_out = self.joiner.decoder_proj(decoder_out)
@@ -383,6 +345,7 @@ class Transducer(nn.Module):
             logits = self.joiner(encode_out, decode_out, project_input=False)
             B = logits.size(0)
             T = logits.size(1)
+            U = logits.size(2)
             device = logits.device
 
             # get an alignment from the logits
@@ -395,43 +358,56 @@ class Transducer(nn.Module):
                                                      y_padded,
                                                      y_lens)
             # make alignment from mono
-
             alignment = y_padded.gather(1, mono)
-            orig_alignment = alignment.clone()
             mask = alignment[:, 1:] == alignment[:, :-1]
             alignment[:, 1:][mask] = blank_id
+            alignment = alignment.to(device)
+            """
+            # make alignment from mono
+            mask = mono[:, :-1] != mono[:, 1:]
+            mask = torch.concat([torch.ones(B, 1, device=device).bool(), mask], dim=-1)
+            tmp_mono = torch.cumsum(mask, dim=-1)
+            tmp_mono[~mask] = blank_id
+            tmp_mono[mask] = tmp_mono[mask] - 1
+            t_mask = torch.arange(T, device=device).view(1, -1) >= x_lens.view(-1, 1)
+            u_mask = torch.arange(U, device=device).view(1, -1) >= y_lens.view(-1, 1)
+            tmp_mono[t_mask] = blank_id
+            #y_padded_exp = y_padded.unsqueeze(1).expand(-1, T, -1)
+            #tmp_mono = tmp_mono.unsqueeze(-1).expand(-1, -1, U)
+            alignment = y_padded.gather(-1, tmp_mono)
+            mask = tmp_mono == blank_id
+            mask[:, 0] = False
+            alignment[mask] = blank_id
             alignment = alignment.to(device)
 
             # mask out the padding part
             mask = torch.arange(T, device=device).view(1, -1) >= x_lens.view(-1, 1)
             alignment[mask] = -100
-
+            """
             # get softweight
-            soft_targets = list()
-            if use_soft_target:
-                soft_target = make_soft_target(mono=mono,
-                                               alignment=alignment,
-                                               x_lens=x_lens,
-                                               y=y_padded,
-                                               y_lens=y_lens,
-                                               num_classes=logits.size(3),
-                                               blank_id=blank_id,
-                                               )
-                soft_targets.append(soft_target)
-                if torch.isnan(soft_target).any() or torch.isinf(soft_target).any():
-                    print(f"{torch.where(torch.isnan(soft_target))=}")
-                    idx = torch.where(torch.isnan(soft_target))[0][0]
-                    idx2 = torch.where(torch.isnan(soft_target))[1][0]
-                    print(f"{idx=}, {idx2=}")
-                    print(f"{orig_alignment[idx]=}")
-                    print(f"{alignment[idx]=}")
-                    print(f"{mono[idx]=}")
-                    print(f"{x_lens[idx]=}")
-                    print(f"{y_padded[idx]=}")
-                    print(f"{y_lens[idx]=}")
-                    print(f"{soft_target[idx, idx2]=}")
-                    import sys
-                    sys.exit(0)
+            soft_target, hard_target = make_soft_target(mono=mono,
+                                                        alignment=alignment,
+                                                        x_lens=x_lens,
+                                                        y=y_padded,
+                                                        y_lens=y_lens,
+                                                        num_classes=logits.size(3),
+                                                        blank_id=blank_id,
+                                                        lambda_right=mc_sampling_right_lambda,
+                                                        lambda_left=mc_sampling_left_lambda,
+                                                        )
+            if torch.isnan(soft_target).any() or torch.isinf(soft_target).any():
+                print(f"{torch.where(torch.isnan(soft_target))=}")
+                idx = torch.where(torch.isnan(soft_target))[0][0]
+                idx2 = torch.where(torch.isnan(soft_target))[1][0]
+                print(f"{idx=}, {idx2=}")
+                print(f"{alignment[idx]=}")
+                print(f"{mono[idx]=}")
+                print(f"{x_lens[idx]=}")
+                print(f"{y_padded[idx]=}")
+                print(f"{y_lens[idx]=}")
+                print(f"{soft_target[idx, idx2]=}")
+                import sys
+                sys.exit(0)
 
             # sampling
             sampled_alignments = list()
@@ -442,66 +418,68 @@ class Transducer(nn.Module):
             logits_list.append(logits[torch.arange(B).view(-1, 1),
                                       torch.arange(T).view(1, -1),
                                       mono])
+            soft_targets = list()
+            soft_targets.append(soft_target)
+            hard_targets = list()
+            hard_targets.append(hard_target)
             for i in range(1, mc_sampling_num):
-                sampled_alignment = shift_alignment_right(alignment, i, blank_id)
-                sampled_alignments.append(sampled_alignment)
-                sampled_mono = shift_mono_right(mono, x_lens, i, blank_id)
-                sampled_monos.append(sampled_mono)
+                step = int(np.ceil(i / 2))
+                if i % 2 == 1:
+                    sampled_alignment = shift_alignment_left(alignment, step, blank_id)
+                    sampled_alignments.append(sampled_alignment)
+                    sampled_mono = shift_mono_left(mono, x_lens, step, blank_id)
+                    sampled_monos.append(sampled_mono)
+                else:
+                    sampled_alignment = shift_alignment_right(alignment, step, blank_id)
+                    sampled_alignments.append(sampled_alignment)
+                    sampled_mono = shift_mono_right(mono, x_lens, step, blank_id)
+                    sampled_monos.append(sampled_mono)
+
                 logits_list.append(logits[torch.arange(B).view(-1, 1),
                                           torch.arange(T).view(1, -1),
                                           sampled_mono])
                 if use_soft_target:
-                    sampled_soft_target = make_soft_target(mono=sampled_mono,
-                                                           alignment=sampled_alignment,
-                                                           x_lens=x_lens,
-                                                           y=y_padded,
-                                                           y_lens=y_lens,
-                                                           num_classes=logits.size(3),
-                                                           blank_id=blank_id,
-                                                           )
+                    ret = make_soft_target(mono=sampled_mono,
+                                           alignment=sampled_alignment,
+                                           x_lens=x_lens,
+                                           y=y_padded,
+                                           y_lens=y_lens,
+                                           num_classes=logits.size(3),
+                                           blank_id=blank_id,
+                                           lambda_right=mc_sampling_right_lambda,
+                                           lambda_left=mc_sampling_left_lambda,
+                                           )
+                    sampled_soft_target = ret[0]
+                    sampled_hard_target = ret[1]
                     soft_targets.append(sampled_soft_target)
+                    hard_targets.append(sampled_hard_target)
                     if torch.isnan(sampled_soft_target).any() or torch.isinf(sampled_soft_target).any():
                         print(f"{sampled_soft_target=}")
                         import sys
                         sys.exit(0)
 
-            """
-            print(f"{ranges[0]=}")
-            print(f"{alignment[0]=}")
-            print(f"{mono[0]=}")
-            # getting index where the first value is 1
-            idx = torch.where(sampled_monos[-1][0] == 1)
-            idx2 = torch.where(sampled_alignments[-1][0] == 60)
-            print(f"{idx=}, {idx2=}")
-            print(f"{sampled_alignments[0][0]=}")
-            print(f"{sampled_alignments[1][0]=}")
-            print(f"{sampled_alignments[-1][0]=}")
-            print(f"{sampled_monos[0][0]=}")
-            print(f"{sampled_monos[1][0]=}")
-            print(f"{sampled_monos[-1][0]=}")
-            print(f"{logits_list[0].shape=}")
-            print(f"{logits_list[1].shape=}")
-            print(f"{logits_list[-1].shape=}")
-            import sys
-            sys.exit(0)
-            """
-            if use_soft_target is False:  # hard target
+            if use_soft_target is False:  # hard target # original CE loss
                 ce = nn.CrossEntropyLoss(reduction="sum")
                 logits = logits_list[0].permute(0, 2, 1)
-                mc_sampling_loss = ce(logits, sampled_alignments[0])
+                weight = (1.0 - mc_sampling_weight * (mc_sampling_num-1))
+                mc_sampling_loss = weight * ce(logits, sampled_alignments[0])
                 for i in range(1, mc_sampling_num):
                     logits = logits_list[i].permute(0, 2, 1)
                     mc_sampling_loss += mc_sampling_weight * ce(logits, sampled_alignments[i])
-                mc_sampling_loss /= mc_sampling_num
-            else:  # soft target
+                #mc_sampling_loss /= mc_sampling_num
+            else:  # soft target # 04.27 hard target for debugging
                 logits = logits_list[0]
-                logits = torch.log_softmax(logits, dim=-1)
-                mask = torch.arange(T, device=device).view(1, -1) >= x_lens.view(-1, 1)
-                mask = mask.unsqueeze(-1)
-                mc_sampling_loss = -torch.sum(logits * soft_targets[0] * mask)
+                temperature = 1
+                logits = torch.log_softmax(logits/temperature, dim=-1)
+                target = hard_targets[0]
+                mask = torch.arange(T, device=device).view(1, -1) < x_lens.view(-1, 1)
+                mc_sampling_loss = -((logits * target).sum(dim=-1) * mask.float()).sum()
                 for i in range(1, mc_sampling_num):
                     logits = logits_list[i]
-                    mc_sampling_loss += mc_sampling_weight * -torch.sum(logits * soft_targets[i] * mask)
+                    logits = torch.log_softmax(logits/temperature, dim=-1)
+                    target = hard_targets[i]
+                    mc_sampling_loss += mc_sampling_weight * -((logits * target).sum(dim=-1) * mask.float()).sum()
+                    #mc_sampling_loss += torch.nn.functional.kl_div(logits, soft_targets[i], reduction="sum")
                 mc_sampling_loss /= mc_sampling_num
 
             """

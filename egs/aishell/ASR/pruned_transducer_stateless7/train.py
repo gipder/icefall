@@ -663,6 +663,20 @@ def get_parser():
         "'e': labels are located at the end of the alignment (default)"
     )
 
+    parser.add_argument(
+        "--mc-sampling-left-lambda",
+        type=float,
+        default=10.0,
+        help="The left lambda for soft target"
+    )
+
+    parser.add_argument(
+        "--mc-sampling-right-lambda",
+        type=float,
+        default=5.0,
+        help="The right lambda for soft target"
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -1165,6 +1179,8 @@ def compute_loss(
             use_mc_sampling_y_padded=params.use_mc_sampling_y_padded,
             mono_alignment_policy=params.mono_alignment_policy,
             alignment_policy=params.alignment_policy,
+            mc_sampling_left_lambda=params.mc_sampling_left_lambda,
+            mc_sampling_right_lambda=params.mc_sampling_right_lambda,
         )
 
         if use_aligner_encoder:
