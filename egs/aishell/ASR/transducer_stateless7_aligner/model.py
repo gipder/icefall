@@ -165,11 +165,11 @@ class Transducer(nn.Module):
         if use_independent_aligner:
             # loss for independent aligner
             mask = y_padded != 0
-            alinger_y_padded = y_padded.clone()
-            alinger_y_padded[mask] = 1
+            aligner_y_padded = y_padded.clone()
+            aligner_y_padded[mask] = 1
             aligner_loss = torchaudio.functional.rnnt_loss(
                 logits=aligner_logits,
-                targets=alinger_y_padded,
+                targets=aligner_y_padded,
                 logit_lengths=x_lens,
                 target_lengths=y_lens,
                 blank=blank_id,
@@ -181,7 +181,7 @@ class Transducer(nn.Module):
             if debugging is True:
                 dump_data = {
                     "aligner_logits": aligner_logits,
-                    "aligner_y_padded": alinger_y_padded,
+                    "aligner_y_padded": aligner_y_padded,
                     "sos_y_padded": sos_y_padded,
                     "y_padded": y_padded,
                     "x_lens": x_lens,

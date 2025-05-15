@@ -141,7 +141,8 @@ import k2
 import sentencepiece as spm
 import torch
 import torch.nn as nn
-from asr_datamodule import LibriSpeechAsrDataModule
+from aishell import AIShell
+from asr_datamodule import AsrDataModule
 from beam_search import (
     beam_search,
     fast_beam_search_nbest,
@@ -149,11 +150,14 @@ from beam_search import (
     fast_beam_search_nbest_oracle,
     fast_beam_search_one_best,
     greedy_search,
-    greedy_search_batch,
+    greedy_search_independent_aligner,
+    greedy_search_batch_independent_aligner,
+    greedy_search_batch_ctc,
     modified_beam_search,
     modified_beam_search_lm_shallow_fusion,
     modified_beam_search_LODR,
     modified_beam_search_ngram_rescoring,
+    _deprecated_modified_beam_search,
 )
 from train import add_model_arguments, get_params, get_transducer_model
 
@@ -171,6 +175,12 @@ from icefall.utils import (
     store_transcripts,
     str2bool,
     write_error_stats,
+)
+
+from icefall.char_graph_compiler import CharCtcTrainingGraphCompiler
+from icefall.decode import (
+    get_lattice,
+    one_best_decoding,
 )
 
 LOG_EPS = math.log(1e-10)
@@ -237,7 +247,7 @@ def get_parser():
     parser.add_argument(
         "--lang-dir",
         type=Path,
-        default="data/lang_bpe_500",
+        default="data/lang_char",
         help="The lang dir containing word table and LG graph",
     )
 
@@ -387,21 +397,51 @@ def get_parser():
                 Used only when the decoding method is
                 modified_beam_search_ngram_rescoring""",
     )
+
+    parser.add_argument(
+        "--use-ctc",
+        type=str2bool,
+        default=False,
+        help="""Use neural network LM for shallow fusion.
+        If you want to use LODR, you will also need to set this to true
+        """,
+    )
     add_model_arguments(parser)
 
     return parser
 
 
+def get_decoding_params() -> AttributeDict:
+    """Parameters for decoding"""
+    params = AttributeDict(
+        {
+            "frame_shift_ms": 10,
+            "search_beam": 4,
+            "output_beam": 4,
+            "min_active_states": 30,
+            "max_active_states": 10000,
+            "use_double_scores": True,
+        }
+    )
+
+    return params
+
+
 def decode_one_batch(
     params: AttributeDict,
     model: nn.Module,
-    sp: spm.SentencePieceProcessor,
+    token_table: k2.SymbolTable,
     batch: dict,
     word_table: Optional[k2.SymbolTable] = None,
     decoding_graph: Optional[k2.Fsa] = None,
     ngram_lm: Optional[NgramLm] = None,
     ngram_lm_scale: float = 1.0,
     LM: Optional[LmScorer] = None,
+    HLG: Optional[k2.Fsa] = None,
+    H: Optional[k2.Fsa] = None,
+    lexicon: Optional[Lexicon] = None,
+    sos_id: Optional[int] = 1,
+    eos_id: Optional[int] = 1,
 ) -> Dict[str, List[List[str]]]:
     """Decode one batch and return the result in a dict. The dict has the
     following format:
@@ -418,8 +458,8 @@ def decode_one_batch(
         It's the return value of :func:`get_params`.
       model:
         The neural model.
-      sp:
-        The BPE model.
+      token_table:
+        It maps token ID to a string.
       batch:
         It is the return value from iterating
         `lhotse.dataset.K2SpeechRecognitionDataset`. See its documentation
@@ -454,6 +494,52 @@ def decode_one_batch(
     encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
 
     hyps = []
+
+    if params.use_ctc:
+        encoder_out = model.ctc_layer(encoder_out)
+        if params.decoding_method != "greedy_search":
+            if HLG is not None:
+                device = HLG.device
+            else:
+                device = H.device
+            nnet_output = encoder_out
+
+            supervision_segments = torch.stack(
+                (
+                    supervisions["sequence_idx"],
+                    supervisions["start_frame"] // params.subsampling_factor,
+                    supervisions["num_frames"] // params.subsampling_factor,
+                ),
+                1,
+            ).to(torch.int32)
+
+            if H is None:
+                assert HLG is not None
+                decoding_graph = HLG
+            else:
+                assert HLG is None
+                decoding_graph = H
+
+            lattice = get_lattice(
+                nnet_output=nnet_output,
+                decoding_graph=decoding_graph,
+                supervision_segments=supervision_segments,
+                search_beam=params.search_beam,
+                output_beam=params.output_beam,
+                min_active_states=params.min_active_states,
+                max_active_states=params.max_active_states,
+                subsampling_factor=params.subsampling_factor,
+            )
+
+            assert params.decoding_method == "ctc-decoding"
+            best_path = one_best_decoding(
+                lattice=lattice, use_double_scores=True
+            )
+
+            token_ids = get_texts(best_path)
+            hyps_tokens = token_ids
+            hyps = [[token_table[t] for t in tokens] for tokens in hyp_tokens]
+
 
     if params.decoding_method == "fast_beam_search":
         hyp_tokens = fast_beam_search_one_best(
@@ -510,14 +596,19 @@ def decode_one_batch(
         )
         for hyp in sp.decode(hyp_tokens):
             hyps.append(hyp.split())
-    elif params.decoding_method == "greedy_search" and params.max_sym_per_frame == 1:
-        hyp_tokens = greedy_search_batch(
+    elif params.decoding_method == "greedy_search_ctc" and params.max_sym_per_frame == 1:
+        # hyp_tokens = greedy_search_batch_independent_aligner(
+        hyp_tokens = greedy_search_batch_ctc(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
         )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
+    elif params.decoding_method == "greedy_search_aligner" and params.max_sym_per_frame == 1:
+        hyp_tokens = greedy_search_batch_independent_aligner(
+            model=model,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens,
+        )
     elif params.decoding_method == "modified_beam_search":
         hyp_tokens = modified_beam_search(
             model=model,
@@ -525,8 +616,6 @@ def decode_one_batch(
             encoder_out_lens=encoder_out_lens,
             beam=params.beam_size,
         )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
     elif params.decoding_method == "modified_beam_search_lm_shallow_fusion":
         hyp_tokens = modified_beam_search_lm_shallow_fusion(
             model=model,
@@ -549,7 +638,21 @@ def decode_one_batch(
         )
         for hyp in sp.decode(hyp_tokens):
             hyps.append(hyp.split())
+    elif params.decoding_method == "ctc-decoding":
+        pass
+        """
+        logits = model.ctc_layer(encoder_out)
+        predicted_ids = torch.argmax(logits, dim=-1)
+        hyps_list = []
+        for i in range(predicted_ids.shape[0]):
+            tmp_predicted_ids = torch.unique_consecutive(predicted_ids[i, :])
+            tmp_predicted_ids = tmp_predicted_ids[tmp_predicted_ids != 0].cpu().detach()
+            hyps_list.append(tmp_predicted_ids.tolist())
+        for hyp in sp.decode(hyps_list):
+            hyps.append(hyp.split())
+        """
     else:
+        hyp_tokens = []
         batch_size = encoder_out.size(0)
 
         for i in range(batch_size):
@@ -568,14 +671,26 @@ def decode_one_batch(
                     encoder_out=encoder_out_i,
                     beam=params.beam_size,
                 )
+            elif params.decoding_method == "_deprecated_modified_beam_search":
+                hyp = _deprecated_modified_beam_search(
+                    model=model,
+                    encoder_out=encoder_out_i,
+                    beam=params.beam_size,
+                )
             else:
                 raise ValueError(
                     f"Unsupported decoding method: {params.decoding_method}"
                 )
-            hyps.append(sp.decode(hyp).split())
+            hyp_tokens.append(hyp)
+            import sys
+            sys.exit(0)
+
+    hyps = [[token_table[t] for t in tokens] for tokens in hyp_tokens]
 
     if params.decoding_method == "greedy_search":
         return {"greedy_search": hyps}
+    elif params.decoding_method == "ctc-decoding":
+        return {"ctc-decoding": hyps}
     elif "fast_beam_search" in params.decoding_method:
         key = f"beam_{params.beam}_"
         key += f"max_contexts_{params.max_contexts}_"
@@ -595,12 +710,16 @@ def decode_dataset(
     dl: torch.utils.data.DataLoader,
     params: AttributeDict,
     model: nn.Module,
-    sp: spm.SentencePieceProcessor,
-    word_table: Optional[k2.SymbolTable] = None,
+    token_table: k2.SymbolTable,
     decoding_graph: Optional[k2.Fsa] = None,
     ngram_lm: Optional[NgramLm] = None,
     ngram_lm_scale: float = 1.0,
     LM: Optional[LmScorer] = None,
+    HLG: Optional[k2.Fsa] = None,
+    H: Optional[k2.Fsa] = None,
+    lexicon: Optional[Lexicon] = None,
+    sos_id: Optional[int] = 1,
+    eos_id: Optional[int] = 1,
 ) -> Dict[str, List[Tuple[str, List[str], List[str]]]]:
     """Decode dataset.
 
@@ -611,10 +730,8 @@ def decode_dataset(
         It is returned by :func:`get_params`.
       model:
         The neural model.
-      sp:
-        The BPE model.
-      word_table:
-        The word symbol table.
+      token_table:
+        It maps a token ID to a string.
       decoding_graph:
         The decoding graph. Can be either a `k2.trivial_graph` or HLG, Used
         only when --decoding_method is fast_beam_search, fast_beam_search_nbest,
@@ -648,17 +765,23 @@ def decode_dataset(
         hyps_dict = decode_one_batch(
             params=params,
             model=model,
-            sp=sp,
+            token_table=token_table,
             decoding_graph=decoding_graph,
-            word_table=word_table,
             batch=batch,
             ngram_lm=ngram_lm,
             ngram_lm_scale=ngram_lm_scale,
             LM=LM,
+            HLG=HLG,
+            H=H,
+            lexicon=lexicon,
+            sos_id=sos_id,
+            eos_id=eos_id,
         )
 
         for name, hyps in hyps_dict.items():
             this_batch = []
+            #print(f"{hyps=}")
+            #print(f"{texts=}")
             assert len(hyps) == len(texts)
             for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
                 ref_words = ref_text.split()
@@ -690,9 +813,13 @@ def save_results(
         # The following prints out WERs, per-word error statistics and aligned
         # ref/hyp pairs.
         errs_filename = params.res_dir / f"errs-{test_set_name}-{params.suffix}.txt"
+        # we compute CER for aishell dataset.
+        results_char = []
+        for res in results:
+            results_char.append((res[0], list("".join(res[1])), list("".join(res[2]))))
         with open(errs_filename, "w") as f:
             wer = write_error_stats(
-                f, f"{test_set_name}-{key}", results, enable_log=True
+                f, f"{test_set_name}-{key}", results_char, enable_log=True
             )
             test_set_wers[key] = wer
 
@@ -701,11 +828,11 @@ def save_results(
     test_set_wers = sorted(test_set_wers.items(), key=lambda x: x[1])
     errs_info = params.res_dir / f"wer-summary-{test_set_name}-{params.suffix}.txt"
     with open(errs_info, "w") as f:
-        print("settings\tWER", file=f)
+        print("settings\tCER", file=f)
         for key, val in test_set_wers:
             print("{}\t{}".format(key, val), file=f)
 
-    s = "\nFor {}, WER of different settings are:\n".format(test_set_name)
+    s = "\nFor {}, CER of different settings are:\n".format(test_set_name)
     note = "\tbest for {}".format(test_set_name)
     for key, val in test_set_wers:
         s += "{}\t{}{}\n".format(key, val, note)
@@ -716,16 +843,21 @@ def save_results(
 @torch.no_grad()
 def main():
     parser = get_parser()
-    LibriSpeechAsrDataModule.add_arguments(parser)
+    AsrDataModule.add_arguments(parser)
     LmScorer.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
+    args.lang_dir = Path(args.lang_dir)
 
     params = get_params()
+    params.update(get_decoding_params())
     params.update(vars(args))
+    params.datatang_prob = 0
 
     assert params.decoding_method in (
         "greedy_search",
+        "greedy_search_ctc",
+        "greedy_search_aligner",
         "beam_search",
         "fast_beam_search",
         "fast_beam_search_nbest",
@@ -734,6 +866,8 @@ def main():
         "modified_beam_search",
         "modified_beam_search_lm_shallow_fusion",
         "modified_beam_search_LODR",
+        "ctc-decoding",
+        "_deprecated_modified_beam_search",
     )
     params.res_dir = params.exp_dir / params.decoding_method
 
@@ -782,15 +916,32 @@ def main():
 
     logging.info(f"Device: {device}")
 
-    sp = spm.SentencePieceProcessor()
-    sp.load(params.bpe_model)
-
-    # <blk> and <unk> are defined in local/train_bpe_model.py
-    params.blank_id = sp.piece_to_id("<blk>")
-    params.unk_id = sp.piece_to_id("<unk>")
-    params.vocab_size = sp.get_piece_size()
+    lexicon = Lexicon(params.lang_dir)
+    max_token_id = max(lexicon.tokens)
+    params.blank_id = 0
+    params.vocab_size = max(lexicon.tokens) + 1
 
     logging.info(params)
+
+    HLG = None
+    H = None
+
+    if params.use_ctc:
+        logging.info("Using CTC Model")
+        graph_compiler = CharCtcTrainingGraphCompiler(
+            lexicon=lexicon,
+            device=device,
+            sos_token="<sos/eos>",
+            eos_token="<sos/eos>",
+        )
+        sos_id = graph_compiler.sos_id
+        eos_id = graph_compiler.eos_id
+        HLG = None
+        H = k2.ctc_topo(
+            max_token=max_token_id,
+            modified=False,
+            device=device,
+        )
 
     logging.info("About to create model")
     model = get_transducer_model(params)
@@ -812,7 +963,9 @@ def main():
                 )
             logging.info(f"averaging {filenames}")
             model.to(device)
-            model.load_state_dict(average_checkpoints(filenames, device=device))
+            model.load_state_dict(
+                average_checkpoints(filenames, device=device), strict=False
+            )
         elif params.avg == 1:
             load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
         else:
@@ -823,7 +976,9 @@ def main():
                     filenames.append(f"{params.exp_dir}/epoch-{i}.pt")
             logging.info(f"averaging {filenames}")
             model.to(device)
-            model.load_state_dict(average_checkpoints(filenames, device=device))
+            model.load_state_dict(
+                average_checkpoints(filenames, device=device), strict=False
+            )
     else:
         if params.iter > 0:
             filenames = find_checkpoints(params.exp_dir, iteration=-params.iter)[
@@ -854,23 +1009,28 @@ def main():
                 )
             )
         else:
-            assert params.avg > 0, params.avg
-            start = params.epoch - params.avg
-            assert start >= 1, start
-            filename_start = f"{params.exp_dir}/epoch-{start}.pt"
-            filename_end = f"{params.exp_dir}/epoch-{params.epoch}.pt"
-            logging.info(
-                f"Calculating the averaged model over epoch range from "
-                f"{start} (excluded) to {params.epoch}"
-            )
-            model.to(device)
-            model.load_state_dict(
-                average_checkpoints_with_averaged_model(
-                    filename_start=filename_start,
-                    filename_end=filename_end,
-                    device=device,
+            if params.avg == 0:
+                filename = f"{params.exp_dir}/epoch-{params.epoch}.pt"
+                logging.info(f"Loading the model from {filename}")
+                load_checkpoint(filename, model)
+            else:
+                assert params.avg > 0, params.avg
+                start = params.epoch - params.avg
+                assert start >= 1, start
+                filename_start = f"{params.exp_dir}/epoch-{start}.pt"
+                filename_end = f"{params.exp_dir}/epoch-{params.epoch}.pt"
+                logging.info(
+                    f"Calculating the averaged model over epoch range from "
+                    f"{start} (excluded) to {params.epoch}"
                 )
-            )
+                model.to(device)
+                model.load_state_dict(
+                    average_checkpoints_with_averaged_model(
+                        filename_start=filename_start,
+                        filename_end=filename_end,
+                        device=device,
+                    )
+                )
 
     model.to(device)
     model.eval()
@@ -925,28 +1085,25 @@ def main():
 
     # we need cut ids to display recognition results.
     args.return_cuts = True
-    librispeech = LibriSpeechAsrDataModule(args)
+    asr_datamodule = AsrDataModule(args)
+    aishell = AIShell(manifest_dir=args.manifest_dir)
+    test_cuts = aishell.test_cuts()
+    dev_cuts = aishell.valid_cuts()
+    test_dl = asr_datamodule.test_dataloaders(test_cuts)
+    dev_dl = asr_datamodule.test_dataloaders(dev_cuts)
 
-    test_clean_cuts = librispeech.test_clean_cuts()
-    test_other_cuts = librispeech.test_other_cuts()
+    test_sets = ["test", "dev"]
+    test_dls = [test_dl, dev_dl]
 
-    test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
-    test_other_dl = librispeech.test_dataloaders(test_other_cuts)
-
-    test_sets = ["test-clean", "test-other"]
-    test_dl = [test_clean_dl, test_other_dl]
-
-    for test_set, test_dl in zip(test_sets, test_dl):
+    for test_set, test_dl in zip(test_sets, test_dls):
         results_dict = decode_dataset(
             dl=test_dl,
             params=params,
             model=model,
-            sp=sp,
-            word_table=word_table,
+            token_table=lexicon.token_table,
             decoding_graph=decoding_graph,
             ngram_lm=ngram_lm,
             ngram_lm_scale=ngram_lm_scale,
-            LM=LM,
         )
 
         save_results(

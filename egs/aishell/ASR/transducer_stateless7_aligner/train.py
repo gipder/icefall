@@ -1145,7 +1145,7 @@ def compute_loss(
         info["aligner_encoder_loss"] = ret["aligner_encoder_loss"].detach().cpu().item()
     elif use_independent_aligner:
         info["independent_aligner_loss"] = ret["independent_aligner_loss"].detach().cpu().item()
-        info["alinger_loss"] = ret["aligner_loss"].detach().cpu().item()
+        info["aligner_loss"] = ret["aligner_loss"].detach().cpu().item()
         info["classifier_loss"] = ret["classifier_loss"].detach().cpu().item()
     else:
         info["org_loss"] = ret["org_loss"].detach().cpu().item()
