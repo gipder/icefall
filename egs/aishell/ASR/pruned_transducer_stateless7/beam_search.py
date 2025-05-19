@@ -1376,6 +1376,7 @@ def modified_beam_search(
             dtype=torch.int64,
         )  # (num_hyps, context_size)
 
+        #print(f"{decoder_input.shape=}")
         decoder_out = model.decoder(decoder_input, need_pad=False).unsqueeze(1)
         decoder_out = model.joiner.decoder_proj(decoder_out)
         # decoder_out is of shape (num_hyps, 1, 1, joiner_dim)
@@ -1546,6 +1547,13 @@ def _deprecated_modified_beam_search(
             dtype=torch.int64,
         )
         # decoder_input is of shape (num_hyps, context_size)
+        for i in range(len(A)):
+            print(f"{A[i].timestamp=}")
+            print(f"{A[i].ys=}")
+            print(f"{A[i].ys[-2:]=}")
+        if t > 20:
+            import sys
+            sys.exit(0)
 
         decoder_out = model.decoder(decoder_input, need_pad=False).unsqueeze(1)
         decoder_out = model.joiner.decoder_proj(decoder_out)
@@ -1566,7 +1574,7 @@ def _deprecated_modified_beam_search(
         # now logits is of shape (num_hyps, vocab_size)
         log_probs = logits.log_softmax(dim=-1)
         probs = logits.softmax(dim=-1)
-        logit_out = torch.cat((logit_out, probs), dim=0)
+        # logit_out = torch.cat((logit_out, probs), dim=0)
 
         log_probs.add_(ys_log_probs)
 
@@ -1587,6 +1595,7 @@ def _deprecated_modified_beam_search(
             new_ys = hyp.ys[:]
             new_timestamp = hyp.timestamp[:]
             new_token = topk_token_indexes[i]
+            print(f"{new_token=}")
             if new_token not in (blank_id, unk_id):
                 new_ys.append(new_token)
                 new_timestamp.append(t)
@@ -1599,7 +1608,7 @@ def _deprecated_modified_beam_search(
     best_hyp = B.get_most_probable(length_norm=True)
     ys = best_hyp.ys[context_size:]  # [context_size:] to remove blanks
 
-    pickle.dump(logit_out, dump)
+    # pickle.dump(logit_out, dump)
     if not return_timestamps:
         return ys
     else:

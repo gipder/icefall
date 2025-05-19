@@ -82,7 +82,7 @@ class Transducer(nn.Module):
         self.teacher_simple_am_proj = None
         self.teacher_simple_lm_proj = None
         self.ctc_layer = nn.Linear(encoder_dim, vocab_size)
-        self.ctc_criterion = None
+        self.ctc_criterion = nn.CTCLoss(reduction="sum", zero_infinity=True, blank=0)
         self.alphas_criterion = nn.MSELoss(reduction='none')
 
     def forward(
@@ -125,6 +125,7 @@ class Transducer(nn.Module):
         alignment_policy: str = "b",
         mc_sampling_left_lambda: float = 10.0,
         mc_sampling_right_lambda: float = 5.0,
+        mc_sampling_method: str = "hard_target",
     ) -> torch.tensor:
         """
         Args:
@@ -325,7 +326,7 @@ class Transducer(nn.Module):
             # make alignment from mono
             alignment = y_padded.gather(1, mono)
             mask = alignment[:, 1:] == alignment[:, :-1]
-            alignment[:, 1:][mask] = blank_id
+            alignment[:, :-1][mask] = blank_id
             alignment = alignment.to(device)
 
             logits = logits[torch.arange(B).view(-1, 1),
@@ -360,7 +361,7 @@ class Transducer(nn.Module):
             # make alignment from mono
             alignment = y_padded.gather(1, mono)
             mask = alignment[:, 1:] == alignment[:, :-1]
-            alignment[:, 1:][mask] = blank_id
+            alignment[:, :-1][mask] = blank_id
             alignment = alignment.to(device)
             """
             # make alignment from mono
@@ -458,16 +459,21 @@ class Transducer(nn.Module):
                         import sys
                         sys.exit(0)
 
-            if use_soft_target is False:  # hard target # original CE loss
+            if mc_sampling_method == "hard_target":  # hard target # original CE loss
                 ce = nn.CrossEntropyLoss(reduction="sum")
                 logits = logits_list[0].permute(0, 2, 1)
                 weight = (1.0 - mc_sampling_weight * (mc_sampling_num-1))
+                if weight < 0:
+                    logger.warning(f"weight is negative: {weight}")
+                    import sys
+                    sys.exit(0)
                 mc_sampling_loss = weight * ce(logits, sampled_alignments[0])
                 for i in range(1, mc_sampling_num):
                     logits = logits_list[i].permute(0, 2, 1)
                     mc_sampling_loss += mc_sampling_weight * ce(logits, sampled_alignments[i])
                 #mc_sampling_loss /= mc_sampling_num
-            else:  # soft target # 04.27 hard target for debugging
+            elif mc_sampling_method == "soft_target":  # since 04.27 hard target for debugging
+                """
                 logits = logits_list[0]
                 temperature = 1
                 logits = torch.log_softmax(logits/temperature, dim=-1)
@@ -481,7 +487,45 @@ class Transducer(nn.Module):
                     mc_sampling_loss += mc_sampling_weight * -((logits * target).sum(dim=-1) * mask.float()).sum()
                     #mc_sampling_loss += torch.nn.functional.kl_div(logits, soft_targets[i], reduction="sum")
                 mc_sampling_loss /= mc_sampling_num
+                """
+                # stack and get loss once
+                logits = logits_list[0]
+                temperature = 1
+                logits = torch.log_softmax(logits/temperature, dim=-1)
+                logits_stack = torch.stack([logits], dim=0)
+                target = hard_targets[0]
+                target_stack = torch.stack([target], dim=0)
+                mask = torch.arange(T, device=device).view(1, -1) < x_lens.view(-1, 1)
+                mask_stack = torch.stack([mask], dim=0)
+                #mc_sampling_loss = -((logits * target).sum(dim=-1) * mask.float()).sum()
+                for i in range(1, mc_sampling_num):
+                    logits = logits_list[i]
+                    logits = torch.log_softmax(logits/temperature, dim=-1)
+                    logits_stack = torch.cat([logits_stack, logits.unsqueeze(0)], dim=0)
+                    target = mc_sampling_weight * hard_targets[i]
+                    target_stack = torch.cat([target_stack, target.unsqueeze(0)], dim=0)
+                    mask_stack = torch.cat([mask_stack, mask.unsqueeze(0)], dim=0)
+                mc_sampling_loss = -((logits_stack * target_stack).sum(dim=-1) * mask_stack.float()).sum()
+                mc_sampling_loss /= mc_sampling_num
+            elif mc_sampling_method == "ctc":
+                temperature = 1
+                logits = logits_list[0]
+                logits = torch.log_softmax(logits/temperature, dim=-1).transpose(0, 1)
+                weight = (1.0 - mc_sampling_weight * (mc_sampling_num-1))
+                if weight < 0:
+                    logger.warning(f"weight is negative: {weight}")
+                    import sys
+                    sys.exit(0)
+                mc_sampling_loss = weight * self.ctc_criterion(
+                    logits, y_padded, x_lens, y_lens)
+                for i in range(1, mc_sampling_num):
+                    logits = logits_list[i]
+                    logits = torch.log_softmax(logits/temperature, dim=-1).transpose(0, 1)
+                    mc_sampling_loss += mc_sampling_weight * self.ctc_criterion(
+                        logits, y_padded, x_lens, y_lens)
 
+                    #mc_sampling_loss += torch.nn.functional.kl_div(logits, soft_targets[i], reduction="sum")
+                #mc_sampling_loss /= mc_sampling_num
             """
             # previous code: it may have a bug
             right_alignment = alignment.clone()

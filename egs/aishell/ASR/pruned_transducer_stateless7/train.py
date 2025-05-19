@@ -677,6 +677,13 @@ def get_parser():
         help="The right lambda for soft target"
     )
 
+    parser.add_argument(
+        "--mc-sampling-method",
+        type=str,
+        default="hard_target",
+        help="The loss for MC sampling (hard_target, soft_target, ctc)"
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -1181,6 +1188,7 @@ def compute_loss(
             alignment_policy=params.alignment_policy,
             mc_sampling_left_lambda=params.mc_sampling_left_lambda,
             mc_sampling_right_lambda=params.mc_sampling_right_lambda,
+            mc_sampling_method=params.mc_sampling_method,
         )
 
         if use_aligner_encoder:
