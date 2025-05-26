@@ -326,7 +326,7 @@ class Transducer(nn.Module):
             # make alignment from mono
             alignment = y_padded.gather(1, mono)
             mask = alignment[:, 1:] == alignment[:, :-1]
-            alignment[:, :-1][mask] = blank_id
+            alignment[:, 1:][mask] = blank_id
             alignment = alignment.to(device)
 
             logits = logits[torch.arange(B).view(-1, 1),
@@ -361,30 +361,13 @@ class Transducer(nn.Module):
             # make alignment from mono
             alignment = y_padded.gather(1, mono)
             mask = alignment[:, 1:] == alignment[:, :-1]
-            alignment[:, :-1][mask] = blank_id
-            alignment = alignment.to(device)
-            """
-            # make alignment from mono
-            mask = mono[:, :-1] != mono[:, 1:]
-            mask = torch.concat([torch.ones(B, 1, device=device).bool(), mask], dim=-1)
-            tmp_mono = torch.cumsum(mask, dim=-1)
-            tmp_mono[~mask] = blank_id
-            tmp_mono[mask] = tmp_mono[mask] - 1
-            t_mask = torch.arange(T, device=device).view(1, -1) >= x_lens.view(-1, 1)
-            u_mask = torch.arange(U, device=device).view(1, -1) >= y_lens.view(-1, 1)
-            tmp_mono[t_mask] = blank_id
-            #y_padded_exp = y_padded.unsqueeze(1).expand(-1, T, -1)
-            #tmp_mono = tmp_mono.unsqueeze(-1).expand(-1, -1, U)
-            alignment = y_padded.gather(-1, tmp_mono)
-            mask = tmp_mono == blank_id
-            mask[:, 0] = False
-            alignment[mask] = blank_id
+            alignment[:, 1:][mask] = blank_id
             alignment = alignment.to(device)
 
             # mask out the padding part
             mask = torch.arange(T, device=device).view(1, -1) >= x_lens.view(-1, 1)
             alignment[mask] = -100
-            """
+
             # get softweight
             soft_target, hard_target = make_soft_target(mono=mono,
                                                         alignment=alignment,
@@ -470,7 +453,7 @@ class Transducer(nn.Module):
                 mc_sampling_loss = weight * ce(logits, sampled_alignments[0])
                 for i in range(1, mc_sampling_num):
                     logits = logits_list[i].permute(0, 2, 1)
-                    mc_sampling_loss += mc_sampling_weight * ce(logits, sampled_alignments[i])
+                    mc_sampling_loss += mc_sampling_weight * ce(logits, sampled_alignments[0])
                 #mc_sampling_loss /= mc_sampling_num
             elif mc_sampling_method == "soft_target":  # since 04.27 hard target for debugging
                 """
@@ -502,7 +485,7 @@ class Transducer(nn.Module):
                     logits = logits_list[i]
                     logits = torch.log_softmax(logits/temperature, dim=-1)
                     logits_stack = torch.cat([logits_stack, logits.unsqueeze(0)], dim=0)
-                    target = mc_sampling_weight * hard_targets[i]
+                    target = mc_sampling_weight * hard_targets[0]
                     target_stack = torch.cat([target_stack, target.unsqueeze(0)], dim=0)
                     mask_stack = torch.cat([mask_stack, mask.unsqueeze(0)], dim=0)
                 mc_sampling_loss = -((logits_stack * target_stack).sum(dim=-1) * mask_stack.float()).sum()
