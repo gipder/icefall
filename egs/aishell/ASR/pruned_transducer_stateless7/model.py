@@ -408,16 +408,18 @@ class Transducer(nn.Module):
             hard_targets.append(hard_target)
             for i in range(1, mc_sampling_num):
                 step = int(np.ceil(i / 2))
+                """
                 if i % 2 == 1:
                     sampled_alignment = shift_alignment_left(alignment, step, blank_id)
                     sampled_alignments.append(sampled_alignment)
                     sampled_mono = shift_mono_left(mono, x_lens, step, blank_id)
                     sampled_monos.append(sampled_mono)
                 else:
-                    sampled_alignment = shift_alignment_right(alignment, step, blank_id)
-                    sampled_alignments.append(sampled_alignment)
-                    sampled_mono = shift_mono_right(mono, x_lens, step, blank_id)
-                    sampled_monos.append(sampled_mono)
+                """
+                sampled_alignment = shift_alignment_right(alignment, step, blank_id)
+                sampled_alignments.append(sampled_alignment)
+                sampled_mono = shift_mono_right(mono, x_lens, step, blank_id)
+                sampled_monos.append(sampled_mono)
 
                 logits_list.append(logits[torch.arange(B).view(-1, 1),
                                           torch.arange(T).view(1, -1),
@@ -453,7 +455,7 @@ class Transducer(nn.Module):
                 mc_sampling_loss = weight * ce(logits, sampled_alignments[0])
                 for i in range(1, mc_sampling_num):
                     logits = logits_list[i].permute(0, 2, 1)
-                    mc_sampling_loss += mc_sampling_weight * ce(logits, sampled_alignments[0])
+                    mc_sampling_loss += mc_sampling_weight * ce(logits, sampled_alignments[i])
                 #mc_sampling_loss /= mc_sampling_num
             elif mc_sampling_method == "soft_target":  # since 04.27 hard target for debugging
                 """
@@ -485,7 +487,7 @@ class Transducer(nn.Module):
                     logits = logits_list[i]
                     logits = torch.log_softmax(logits/temperature, dim=-1)
                     logits_stack = torch.cat([logits_stack, logits.unsqueeze(0)], dim=0)
-                    target = mc_sampling_weight * hard_targets[0]
+                    target = mc_sampling_weight * hard_targets[i]
                     target_stack = torch.cat([target_stack, target.unsqueeze(0)], dim=0)
                     mask_stack = torch.cat([mask_stack, mask.unsqueeze(0)], dim=0)
                 mc_sampling_loss = -((logits_stack * target_stack).sum(dim=-1) * mask_stack.float()).sum()
