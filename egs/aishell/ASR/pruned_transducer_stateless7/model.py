@@ -408,19 +408,16 @@ class Transducer(nn.Module):
             hard_targets.append(hard_target)
             for i in range(1, mc_sampling_num):
                 step = int(np.ceil(i / 2))
-                """
-                if i % 2 == 1:
-                    sampled_alignment = shift_alignment_left(alignment, step, blank_id)
-                    sampled_alignments.append(sampled_alignment)
-                    sampled_mono = shift_mono_left(mono, x_lens, step, blank_id)
-                    sampled_monos.append(sampled_mono)
-                else:
+                sampled_alignment = shift_alignment_left(alignment, step, blank_id)
+                sampled_alignments.append(sampled_alignment)
+                sampled_mono = shift_mono_left(mono, x_lens, step, blank_id)
+                sampled_monos.append(sampled_mono)
                 """
                 sampled_alignment = shift_alignment_right(alignment, step, blank_id)
                 sampled_alignments.append(sampled_alignment)
                 sampled_mono = shift_mono_right(mono, x_lens, step, blank_id)
                 sampled_monos.append(sampled_mono)
-
+                """
                 logits_list.append(logits[torch.arange(B).view(-1, 1),
                                           torch.arange(T).view(1, -1),
                                           sampled_mono])
