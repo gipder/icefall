@@ -2,3 +2,6 @@
 ./data
 ./download
 ./shared
+train_*_tr*.sh
+decode*.sh
+vocab_test
