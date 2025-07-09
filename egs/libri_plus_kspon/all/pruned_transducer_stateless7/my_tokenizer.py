@@ -15,6 +15,7 @@ class MyTokenizer:
         self.sos_id = 1
         self.eos_id = 1
         self.unk_id = 2
+        self.skip_tokens = ['#0', '#1']
         self._init_vocab()
         self.tokenize = self.build_tokenizer()
 
@@ -23,6 +24,8 @@ class MyTokenizer:
             idx = 0
             for line in f:
                 token = line.strip().split()[0]
+                if token in self.skip_tokens:
+                    continue
                 self.vocab_dict[int(idx)] = token
                 idx += 1
         self.vocab_size = len(self.vocab_dict)
