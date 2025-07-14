@@ -66,7 +66,9 @@ from typing import Dict, List, Optional, Tuple
 import k2
 import torch
 import torch.nn as nn
-from aishell import AIShell
+from libri_plus_kspon import LibriPlusKspon
+from librispeech import LibriSpeech
+from ksponspeech import KsponSpeech
 from asr_datamodule import AsrDataModule
 from beam_search import (
     beam_search,
@@ -94,7 +96,7 @@ from icefall.utils import (
     str2bool,
     write_error_stats,
 )
-
+from my_tokenizer import MyTokenizer, get_norm_text
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -235,6 +237,14 @@ def get_parser():
         """,
     )
 
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="all",
+        help="""Selecting the dataset for training
+        among 'all'=='libri_plus_kspon', 'libirspeech', 'ksponspeech'""",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -243,7 +253,7 @@ def get_parser():
 def decode_one_batch(
     params: AttributeDict,
     model: nn.Module,
-    token_table: k2.SymbolTable,
+    tokenizer: MyTokenizer,
     batch: dict,
     decoding_graph: Optional[k2.Fsa] = None,
 ) -> Dict[str, List[List[str]]]:
@@ -335,7 +345,8 @@ def decode_one_batch(
                 )
             hyp_tokens.append(hyp)
 
-    hyps = [[token_table[t] for t in tokens] for tokens in hyp_tokens]
+    #hyps = [[token_table[t] for t in tokens] for tokens in hyp_tokens]
+    hyps = tokenizer.decode_batch(hyp_tokens)
 
     if params.decoding_method == "greedy_search":
         return {"greedy_search": hyps}
@@ -360,7 +371,8 @@ def decode_dataset(
     dl: torch.utils.data.DataLoader,
     params: AttributeDict,
     model: nn.Module,
-    token_table: k2.SymbolTable,
+    tokenizer: MyTokenizer,
+    # token_table: k2.SymbolTable,
     decoding_graph: Optional[k2.Fsa] = None,
 ) -> Dict[str, List[Tuple[str, List[str], List[str]]]]:
     """Decode dataset.
@@ -400,21 +412,28 @@ def decode_dataset(
     for batch_idx, batch in enumerate(dl):
         texts = batch["supervisions"]["text"]
         cut_ids = [cut.id for cut in batch["supervisions"]["cut"]]
-
+        #languages = [supervisions[0].language for supervisions in batch["supervisions"]["cut"]]
         hyps_dict = decode_one_batch(
             params=params,
             model=model,
-            token_table=token_table,
+            tokenizer=tokenizer,
             decoding_graph=decoding_graph,
             batch=batch,
         )
 
+        idx = 0
         for name, hyps in hyps_dict.items():
             this_batch = []
             assert len(hyps) == len(texts)
             for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
+                language = batch['supervisions']['cut'][idx].supervisions[0].language
+                if language == 'Korean':
+                    hyp_text = ' '.join(hyp_words)
+                    _, hyp_text = get_norm_text(ref_text, hyp_text)
+                    hyp_words = hyp_text.split()
                 ref_words = ref_text.split()
                 this_batch.append((cut_id, ref_words, hyp_words))
+                idx += 1
 
             results[name].extend(this_batch)
 
@@ -436,13 +455,15 @@ def save_results(
     for key, results in results_dict.items():
         recog_path = params.res_dir / f"recogs-{test_set_name}-{params.suffix}.txt"
         results = sorted(results)
+        """
         # we compute CER for aishell dataset.
         results_char = []
         for res in results:
             results_char.append((res[0], list("".join(res[1])), list("".join(res[2]))))
+        """
 
         #store_transcripts(filename=recog_path, texts=results_char, char_level=True)
-        store_transcripts(filename=recog_path, texts=results_char)
+        store_transcripts(filename=recog_path, texts=results)
         logging.info(f"The transcripts are stored in {recog_path}")
 
         # The following prints out WERs, per-word error statistics and aligned
@@ -452,7 +473,7 @@ def save_results(
             wer = write_error_stats(
                 f,
                 f"{test_set_name}-{key}",
-                results_char,
+                results,
                 enable_log=True,
             )
             test_set_wers[key] = wer
@@ -462,11 +483,11 @@ def save_results(
     test_set_wers = sorted(test_set_wers.items(), key=lambda x: x[1])
     errs_info = params.res_dir / f"wer-summary-{test_set_name}-{params.suffix}.txt"
     with open(errs_info, "w") as f:
-        print("settings\tCER", file=f)
+        print("settings\tWER", file=f)
         for key, val in test_set_wers:
             print("{}\t{}".format(key, val), file=f)
 
-    s = "\nFor {}, CER of different settings are:\n".format(test_set_name)
+    s = "\nFor {}, WER of different settings are:\n".format(test_set_name)
     note = "\tbest for {}".format(test_set_name)
     for key, val in test_set_wers:
         s += "{}\t{}{}\n".format(key, val, note)
@@ -530,14 +551,10 @@ def main():
 
     logging.info(f"Device: {device}")
 
-    lexicon = Lexicon(params.lang_dir)
-    params.blank_id = 0
-    params.vocab_size = max(lexicon.tokens) + 1
+    my_tokenizer = MyTokenizer(params.lang_dir/"tokens.txt")
 
-    graph_compiler = CharCtcTrainingGraphCompiler(
-        lexicon=lexicon,
-        device=device,
-    )
+    params.blank_id = my_tokenizer.blank_id
+    params.vocab_size = my_tokenizer.vocab_size
 
     logging.info(params)
 
@@ -640,7 +657,8 @@ def main():
             contexts_text = []
             for line in open(params.context_file).readlines():
                 contexts_text.append(line.strip())
-            contexts = graph_compiler.texts_to_ids(contexts_text)
+            contexts = my_tokenizer.encode(contexts_text)
+            #graph_compiler.texts_to_ids(contexts_text)
             #context_graph = ContextGraph(params.context_score)
             context_graph.build([(c, 0.0) for c in contexts])
         else:
@@ -654,21 +672,58 @@ def main():
     # we need cut ids to display recognition results.
     args.return_cuts = True
     asr_datamodule = AsrDataModule(args)
-    aishell = AIShell(manifest_dir=args.manifest_dir)
-    test_cuts = aishell.test_cuts()
-    dev_cuts = aishell.valid_cuts()
-    test_dl = asr_datamodule.test_dataloaders(test_cuts)
-    dev_dl = asr_datamodule.test_dataloaders(dev_cuts)
-
-    test_sets = ["test", "dev"]
-    test_dls = [test_dl, dev_dl]
+    if params.dataset == "libri_plus_kspon" or params.dataset == "all":
+        logging.info("Using LibriPlusKspon dataset")
+        libri_plus_kspon = LibriPlusKspon(manifest_dir=args.manifest_dir)
+        test_kspon_eval_clean_cuts = libri_plus_kspon.test_kspon_eval_clean_cuts()
+        test_kspon_eval_other_cuts = libri_plus_kspon.test_kspon_eval_other_cuts()
+        test_libri_test_clean_cuts = libri_plus_kspon.test_libri_test_clean_cuts()
+        test_libri_test_other_cuts = libri_plus_kspon.test_libri_test_other_cuts()
+        test_kspon_eval_clean_dl = asr_datamodule.test_dataloaders(
+            test_kspon_eval_clean_cuts)
+        test_kspon_eval_other_dl = asr_datamodule.test_dataloaders(
+            test_kspon_eval_other_cuts)
+        test_libri_test_clean_dl = asr_datamodule.test_dataloaders(
+            test_libri_test_clean_cuts)
+        test_libri_test_other_dl = asr_datamodule.test_dataloaders(
+            test_libri_test_other_cuts)
+        test_sets = ["kspon_eval_clean", "kspon_eval_other",
+                     "libri_test_clean", "libri_test_other"]
+        test_dls = [test_kspon_eval_clean_dl,
+                    test_kspon_eval_other_dl,
+                    test_libri_test_clean_dl,
+                    test_libri_test_other_dl]
+    elif params.dataset == "libri" or params.dataset == "librispeech":
+        logging.info("Using LibriSpeech dataset")
+        libri_plus_kspon = LibriPlusKspon(manifest_dir=args.manifest_dir)
+        test_libri_test_clean_cuts = libri_plus_kspon.test_libri_test_clean_cuts()
+        test_libri_test_other_cuts = libri_plus_kspon.test_libri_test_other_cuts()
+        test_libri_test_clean_dl = asr_datamodule.test_dataloaders(
+            test_libri_test_clean_cuts)
+        test_libri_test_other_dl = asr_datamodule.test_dataloaders(
+            test_libri_test_other_cuts)
+        test_sets = ["libri_test_clean", "libri_test_other"]
+        test_dls = [test_libri_test_clean_dl,
+                    test_libri_test_other_dl]
+    elif params.dataset == "kspon" or params.dataset == "ksponspeech":
+        logging.info("Using KsponSpeech dataset")
+        libri_plus_kspon = LibriPlusKspon(manifest_dir=args.manifest_dir)
+        test_kspon_eval_clean_cuts = libri_plus_kspon.test_kspon_eval_clean_cuts()
+        test_kspon_eval_other_cuts = libri_plus_kspon.test_kspon_eval_other_cuts()
+        test_kspon_eval_clean_dl = asr_datamodule.test_dataloaders(
+            test_kspon_eval_clean_cuts)
+        test_kspon_eval_other_dl = asr_datamodule.test_dataloaders(
+            test_kspon_eval_other_cuts)
+        test_sets = ["kspon_eval_clean", "kspon_eval_other"]
+        test_dls = [test_kspon_eval_clean_dl,
+                    test_kspon_eval_other_dl]
 
     for test_set, test_dl in zip(test_sets, test_dls):
         results_dict = decode_dataset(
             dl=test_dl,
             params=params,
             model=model,
-            token_table=lexicon.token_table,
+            tokenizer=my_tokenizer,
             decoding_graph=decoding_graph,
         )
 
