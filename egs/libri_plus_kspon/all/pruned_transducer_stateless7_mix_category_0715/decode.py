@@ -427,7 +427,7 @@ def decode_dataset(
             assert len(hyps) == len(texts)
             for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
                 language = batch['supervisions']['cut'][idx].supervisions[0].language
-                if language == 'Korean':
+                if language == 'Korean' or language == 'korean':
                     hyp_text = ' '.join(hyp_words)
                     _, hyp_text = get_norm_text(ref_text, hyp_text)
                     hyp_words = hyp_text.split()
@@ -441,8 +441,8 @@ def decode_dataset(
 
         if batch_idx % log_interval == 0:
             batch_str = f"{batch_idx}/{num_batches}"
-
             logging.info(f"batch {batch_str}, cuts processed until now is {num_cuts}")
+
     return results
 
 
