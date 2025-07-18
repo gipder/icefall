@@ -991,7 +991,7 @@ def modified_beam_search(
             index=hyps_shape.row_ids(1).to(torch.int64),
         )  # (num_hyps, 1, 1, encoder_out_dim)
 
-        logits = model.joiner(
+        logits, _ = model.joiner(
             current_encoder_out,
             decoder_out,
             project_input=False,
