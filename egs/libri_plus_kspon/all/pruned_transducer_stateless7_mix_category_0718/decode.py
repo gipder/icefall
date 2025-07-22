@@ -98,6 +98,11 @@ from icefall.utils import (
 )
 from my_tokenizer import MyTokenizer, get_norm_text
 
+
+def comma_separated_list(value):
+    return [int(x) for x in value.split(',')]
+
+
 def get_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -252,6 +257,13 @@ def get_parser():
         help="""
         The number of categories for the category-aware decoding.
         """
+    )
+
+    parser.add_argument(
+        "--num-category-list",
+        type=comma_separated_list,
+        default=[10, 50],
+        help="The list of category number [eng, kor]."
     )
 
     add_model_arguments(parser)
@@ -418,6 +430,7 @@ def decode_dataset(
         log_interval = 20
 
     results = defaultdict(list)
+    cer_results = defaultdict(list)
     for batch_idx, batch in enumerate(dl):
         texts = batch["supervisions"]["text"]
         cut_ids = [cut.id for cut in batch["supervisions"]["cut"]]
@@ -433,6 +446,7 @@ def decode_dataset(
         idx = 0
         for name, hyps in hyps_dict.items():
             this_batch = []
+            this_cer_batch = []
             assert len(hyps) == len(texts)
             for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
                 language = batch['supervisions']['cut'][idx].supervisions[0].language
@@ -440,11 +454,16 @@ def decode_dataset(
                     hyp_text = ' '.join(hyp_words)
                     _, hyp_text = get_norm_text(ref_text, hyp_text)
                     hyp_words = hyp_text.split()
+                    # for CER
+                    cer_hyp_words = list(hyp_text.replace(" ", ""))
+                    cer_ref_words = list(ref_text.replace(" ", ""))
+                    this_cer_batch.append((cut_id, cer_ref_words, cer_hyp_words))
                 ref_words = ref_text.split()
                 this_batch.append((cut_id, ref_words, hyp_words))
                 idx += 1
 
             results[name].extend(this_batch)
+            cer_results[name].extend(this_cer_batch)
 
         num_cuts += len(texts)
 
@@ -452,7 +471,7 @@ def decode_dataset(
             batch_str = f"{batch_idx}/{num_batches}"
 
             logging.info(f"batch {batch_str}, cuts processed until now is {num_cuts}")
-    return results
+    return results, cer_results
 
 
 def save_results(
@@ -499,6 +518,54 @@ def save_results(
     s = "\nFor {}, WER of different settings are:\n".format(test_set_name)
     note = "\tbest for {}".format(test_set_name)
     for key, val in test_set_wers:
+        s += "{}\t{}{}\n".format(key, val, note)
+        note = ""
+    logging.info(s)
+
+
+def save_cer_results(
+    params: AttributeDict,
+    test_set_name: str,
+    cer_results_dict: Dict[str, List[Tuple[str, List[str], List[str]]]],
+):
+    test_set_cers = dict()
+    for key, results in cer_results_dict.items():
+        recog_path = params.res_dir / f"recogs-cer-{test_set_name}-{params.suffix}.txt"
+        results = sorted(results)
+        """
+        # we compute CER for aishell dataset.
+        results_char = []
+        for res in results:
+            results_char.append((res[0], list("".join(res[1])), list("".join(res[2]))))
+        """
+
+        store_transcripts(filename=recog_path, texts=results)
+        logging.info(f"The transcripts are stored in {recog_path}")
+
+        # The following prints out WERs, per-word error statistics and aligned
+        # ref/hyp pairs.
+        errs_filename = params.res_dir / f"errs-cer-{test_set_name}-{params.suffix}.txt"
+        with open(errs_filename, "w") as f:
+            cer = write_error_stats(
+                f,
+                f"{test_set_name}-{key}",
+                results,
+                enable_log=True,
+            )
+            test_set_cers[key] = cer
+
+        logging.info("Wrote detailed error stats to {}".format(errs_filename))
+
+    test_set_cers = sorted(test_set_cers.items(), key=lambda x: x[1])
+    errs_info = params.res_dir / f"cer-summary-{test_set_name}-{params.suffix}.txt"
+    with open(errs_info, "w") as f:
+        print("settings\tCER", file=f)
+        for key, val in test_set_cers:
+            print("{}\t{}".format(key, val), file=f)
+
+    s = "\nFor {}, CER of different settings are:\n".format(test_set_name)
+    note = "\tbest for {}".format(test_set_name)
+    for key, val in test_set_cers:
         s += "{}\t{}{}\n".format(key, val, note)
         note = ""
     logging.info(s)
@@ -728,7 +795,7 @@ def main():
                     test_kspon_eval_other_dl]
 
     for test_set, test_dl in zip(test_sets, test_dls):
-        results_dict = decode_dataset(
+        results_dict, cer_results_dict = decode_dataset(
             dl=test_dl,
             params=params,
             model=model,
@@ -741,6 +808,13 @@ def main():
             test_set_name=test_set,
             results_dict=results_dict,
         )
+
+        if test_set.startswith("kspon"):
+            save_cer_results(
+                params=params,
+                test_set_name=test_set,
+                cer_results_dict=cer_results_dict,
+            )
 
     logging.info("Done!")
 
