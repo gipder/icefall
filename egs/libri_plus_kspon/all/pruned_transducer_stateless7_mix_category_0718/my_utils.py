@@ -428,3 +428,139 @@ def cluster_tokens_using_ipa_by_language(
     }
 
     return reverse_clusters
+
+
+def cluster_tokens_using_ipa_by_list(
+    tokens=dict(),
+    num_language_clusters=list(),
+    last_first_lang_id=499,
+    exceptions=("<blk>", "<unk>",
+                "<sos/eos>"),
+    blank_id=0,
+    punc_symbols=(".", ",", "!",
+                  ":", ";", "?",
+                  "▁", "'", "\"",
+                  "-", "%", "&"),
+    punc_id=1,
+    random_state=42,
+    front_space='▁',
+    skip_symbols=("#0", "#1", "#2")# it is different with '_'
+):
+    """
+    Clusters tokens based on their IPA representations.
+    Args:
+        tokens (dict): A dictionary contains BPE tokens.
+        num_language_clusters (list): Numbers of language clusters ([eng, kor])
+                                      except for blank_id 0 and punc_id 1
+        last_first_lang_id: The last first language (english) token ID
+        exceptions (Tuple or List): List of tokens that should be treated as exceptions.
+        blank_id (int): ID for the blank token.
+        punc_symbols (Tuple or List): List of punctuation symbols in BPE tokens.
+        punc_id (int): ID for punctuation symbols
+        random_state (int): Random state for reproducibility.
+        front_space (str): a front space symbol in BPE tokens
+    Returns:
+        dict: A dictionary mapping IDs to their cluster IDs.
+              key: original token id, value: group(cluster) id
+    """
+    kor_and_digit = re.compile(r'[가-힣a-z\d]')
+
+    espeaks = list()
+    espeak_ko = EspeakBackend(language='kok', language_switch='remove-flags')
+    espeak_en = EspeakBackend(language='en-us')
+    espeaks.append(espeak_en)
+    espeaks.append(espeak_ko)
+    separator = Separator(phone=' ', word='=', syllable='|')
+
+    ipa_set = set()
+    tokens_list = list()
+    num_lang = len(num_language_clusters)
+    for i in range(num_lang):
+        tokens_list.append(list())
+
+    for token in tokens:
+        if (
+            token in exceptions
+            or token in punc_symbols
+            or token in skip_symbols
+        ):
+            continue
+        else:
+            modified_token = token.replace(front_space, '')
+            if tokens[token] > last_first_lang_id:
+                tokens_list[-1].append(modified_token)
+            else:
+                tokens_list[0].append(modified_token)
+
+    ipas_list = list()
+    for i in range(num_lang):
+        ipas_list.append(
+            list(
+                espeaks[i].phonemize(tokens_list[i], strip=True,
+                                     separator=separator)
+            )
+        )
+
+    labels = list()
+    ipa_converted_tokens_list = list()
+    for i in range(num_lang):
+        ipa_converted_tokens_list.append(list())
+
+    for i in range(num_lang):
+        for ipa in ipas_list[i]:
+            ipa_list = ipa.strip().split()
+            if len(ipa_list) == 0:
+                print("This is NOT possible")
+                import sys
+                sys.exit(0)
+
+            ipa_converted_tokens_list[i].append(ipa_list)
+            for j in ipa_list:
+                ipa_set.add(j)
+
+    # vectorize
+    for i in range(num_lang):
+        vectors = np.array([ipa_to_vector(ipa_text_list=ipa_list,
+                                          ipa_set=ipa_set,
+                                          exceptions=exceptions)
+                            for ipa_list in ipa_converted_tokens_list[i]])
+        kmeans = KMeans(n_clusters=num_language_clusters[i], random_state=random_state)
+        labels.append(kmeans.fit_predict(vectors))
+
+    # indexing bias + eng_label + kor_label
+    bias = 2  # because of blank symbols and punc symbols
+    biased_labels = list()
+    for i in range(num_lang):
+        biased_labels.append(labels[i] + bias)
+        if i > 0:
+            biased_labels[i] += num_language_clusters[i-1]
+    labels = np.concatenate(biased_labels)
+
+    clusters = {}
+    clusters[blank_id] = []
+    clusters[punc_id] = []
+    tokens_clone = copy.deepcopy(tokens)
+    for key in tokens.keys():
+        if key in exceptions:
+            clusters[blank_id].append(key)
+            del tokens_clone[key]
+        elif key in punc_symbols:
+            clusters[punc_id].append(key)
+            del tokens_clone[key]
+        elif key in skip_symbols:
+            del tokens_clone[key]
+
+    for label, token in zip(labels, tokens_clone.keys()):
+        if label not in clusters:
+            clusters[label] = []
+        clusters[label].append(token)
+
+    logging.info(f"Clustering is done: {clusters}")
+    reverse_clusters = {
+        tokens[token]: cluster_id
+        for cluster_id, token_list in clusters.items()
+        for token in token_list
+    }
+
+    return reverse_clusters
+

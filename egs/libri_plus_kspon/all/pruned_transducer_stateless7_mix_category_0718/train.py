@@ -101,6 +101,7 @@ from icefall.utils import (
 from my_tokenizer import MyTokenizer
 import os
 from my_utils import cluster_tokens_using_ipa_by_language
+from my_utils import cluster_tokens_using_ipa_by_list
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -1066,7 +1067,7 @@ def run(rank, world_size, args):
         value = int(idx)
         token_dict[key] = value
     print(f"{params.num_category_list}")
-    token_cluster = cluster_tokens_using_ipa_by_language(
+    token_cluster = cluster_tokens_using_ipa_by_list(
         token_dict, params.num_category_list)
     max_index = max(token_cluster.keys())
     token_to_cluster_table = torch.zeros(max_index+1, dtype=torch.int32)
