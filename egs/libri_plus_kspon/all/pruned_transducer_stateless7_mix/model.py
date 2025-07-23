@@ -191,5 +191,10 @@ class Transducer(nn.Module):
                 boundary=boundary,
                 reduction="sum",
             )
-
+        """
+        print(f"{x_lens.size(0)=}")
+        print(f"{x_lens=}")
+        print(f"{y_lens=}")
+        print("=" * 20)
+        """
         return (simple_loss, pruned_loss)

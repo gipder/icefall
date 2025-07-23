@@ -99,6 +99,7 @@ from icefall.utils import (
     str2bool,
 )
 from my_tokenizer import MyTokenizer
+import os
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -827,7 +828,7 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(train_dl):
         params.batch_idx_train += 1
         batch_size = len(batch["supervisions"]["text"])
-
+        #print(f"{batch['supervisions']['text']=}")
         try:
             with torch.amp.autocast('cuda', enabled=params.use_fp16):
                 loss, loss_info = compute_loss(
@@ -990,6 +991,8 @@ def run(rank, world_size, args):
     logging.info(f"Device: {device}")
 
     my_tokenizer = MyTokenizer(params.lang_dir/"tokens.txt")
+    logging.info("Loading tokenizer is done")
+
     """
     graph_compiler = CharCtcTrainingGraphCompiler(
         lexicon=lexicon,
@@ -1073,7 +1076,15 @@ def run(rank, world_size, args):
                 f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
             )
             return False
-
+        """
+        tokens = my_tokenizer.encode(c.supervisions[0].text)
+        if 100 < len(tokens):
+            logging.warning(
+                f"Exclude cut with ID {c.id} from training."
+                f"The length of tokens: {len(tokens)}"
+            )
+            return False
+        """
         # In pruned RNN-T, we require that T >= S
         # where T is the number of feature frames after subsampling
         # and S is the number of tokens in the utterance
