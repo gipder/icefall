@@ -1211,10 +1211,10 @@ def run(rank, world_size, args):
         logging.info("Using full dataset")
         if params.dataset == "libri_plus_kspon" or params.dataset == "all":
             logging.info("NOT IMPLEMENTED")
-        elif params.dataset == "libri":
+        elif params.dataset.startswith("libri"):
             train_cuts = librispeech.train_all_shuf_cuts()
-        elif params.dataset == "kspon":
-            train_cuts = ksponspeech.train_cuts()
+        elif params.dataset.startswith("kspon"):
+            train_cuts = ksponspeech.train_all_cuts()
     else:
         logging.info("Using 1/10 cuts for training")
         if params.dataset == "libri_plus_kspon" or params.dataset == "all":

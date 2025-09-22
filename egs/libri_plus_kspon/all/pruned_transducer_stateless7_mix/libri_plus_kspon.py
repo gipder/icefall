@@ -76,3 +76,15 @@ class LibriPlusKspon:
         logging.info(f"About to get test cuts from {f}")
         cuts_test = load_manifest_lazy(f)
         return cuts_test
+
+    def test_mixed_eval_clean_cuts(self) -> CutSet:
+        f = self.manifest_dir / "libri_plus_kspon_mixed_cuts_eval_clean.jsonl.gz"
+        logging.info(f"About to get test cuts from {f}")
+        cuts_test = load_manifest_lazy(f)
+        return cuts_test
+
+    def test_mixed_eval_other_cuts(self) -> CutSet:
+        f = self.manifest_dir / "libri_plus_kspon_mixed_cuts_eval_other.jsonl.gz"
+        logging.info(f"About to get test cuts from {f}")
+        cuts_test = load_manifest_lazy(f)
+        return cuts_test

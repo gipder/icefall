@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-# Copyright    2023  Xiaomi Corp.        (authors: Xiaoyu Yang)
+# Copyright    2021-2022  Xiaomi Corp.        (authors: Fangjun Kuang,
+#                                                       Wei Kang,
+#                                                       Mingshuang Luo,)
+#                                                       Zengwei Yao)
+# Copyright    2021                      (Pingfeng Luo)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -59,12 +63,9 @@ import optim
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
-# from aishell import AIShell
-from libri_plus_kspon import LibriPlusKspon
-from librispeech import LibriSpeech
-from ksponspeech import KsponSpeech
+from aishell import AIShell
 from asr_datamodule import AsrDataModule
-from decoder import Decoder
+from decoder2 import Decoder
 from joiner import Joiner
 from lhotse import CutSet, load_manifest
 from lhotse.cut import Cut
@@ -88,8 +89,7 @@ from icefall.checkpoint import (
 )
 from icefall.dist import cleanup_dist, setup_dist
 from icefall.env import get_env_info
-#from icefall.err import raise_grad_scale_is_too_small_error
-from icefall.hooks import register_inf_check_hooks
+from icefall.err import raise_grad_scale_is_too_small_error
 from icefall.lexicon import Lexicon
 from icefall.utils import (
     AttributeDict,
@@ -98,8 +98,6 @@ from icefall.utils import (
     setup_logger,
     str2bool,
 )
-from my_tokenizer import MyTokenizer
-import os
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -388,21 +386,6 @@ def get_parser():
         help="Whether to use half precision training.",
     )
 
-    parser.add_argument(
-        "--use-full-dataset",
-        type=str2bool,
-        default=True,
-        help="Whether or not to use the whole dataset.",
-    )
-
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="all",
-        help="""Selecting the dataset for training
-        among 'all'=='libri_plus_kspon', 'libirspeech', 'ksponspeech'""",
-    )
-
     add_model_arguments(parser)
 
     return parser
@@ -654,7 +637,7 @@ def save_checkpoint(
 def compute_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    tokenizer: MyTokenizer,
+    graph_compiler: CharCtcTrainingGraphCompiler,
     batch: dict,
     is_training: bool,
 ) -> Tuple[Tensor, MetricsTracker]:
@@ -700,8 +683,7 @@ def compute_loss(
     warm_step = params.warm_step
 
     texts = batch["supervisions"]["text"]
-    y = tokenizer.encode_batch(texts)
-    #y = graph_compiler.texts_to_ids(texts)
+    y = graph_compiler.texts_to_ids(texts)
     y = k2.RaggedTensor(y).to(device)
 
     with torch.set_grad_enabled(is_training):
@@ -725,7 +707,7 @@ def compute_loss(
             if batch_idx_train >= warm_step
             else 0.1 + 0.9 * (batch_idx_train / warm_step)
         )
-        loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
+        loss = params.simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
 
     assert loss.requires_grad == is_training
 
@@ -745,7 +727,7 @@ def compute_loss(
 def compute_validation_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    tokenizer: MyTokenizer,
+    graph_compiler: CharCtcTrainingGraphCompiler,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
 ) -> MetricsTracker:
@@ -758,7 +740,7 @@ def compute_validation_loss(
         loss, loss_info = compute_loss(
             params=params,
             model=model,
-            tokenizer=tokenizer,
+            graph_compiler=graph_compiler,
             batch=batch,
             is_training=False,
         )
@@ -781,7 +763,7 @@ def train_one_epoch(
     model: Union[nn.Module, DDP],
     optimizer: torch.optim.Optimizer,
     scheduler: LRSchedulerType,
-    tokenizer: MyTokenizer,
+    graph_compiler: CharCtcTrainingGraphCompiler,
     train_dl: torch.utils.data.DataLoader,
     valid_dl: torch.utils.data.DataLoader,
     scaler: GradScaler,
@@ -828,13 +810,13 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(train_dl):
         params.batch_idx_train += 1
         batch_size = len(batch["supervisions"]["text"])
-        #print(f"{batch['supervisions']['text']=}")
+
         try:
-            with torch.amp.autocast('cuda', enabled=params.use_fp16):
+            with torch.cuda.amp.autocast(enabled=params.use_fp16):
                 loss, loss_info = compute_loss(
                     params=params,
                     model=model,
-                    tokenizer=tokenizer,
+                    graph_compiler=graph_compiler,
                     batch=batch,
                     is_training=True,
                 )
@@ -851,7 +833,7 @@ def train_one_epoch(
             scaler.update()
             optimizer.zero_grad()
         except:  # noqa
-            display_and_save_batch(batch, params=params, tokenizer=tokenizer)
+            display_and_save_batch(batch, params=params, graph_compiler=graph_compiler)
             raise
 
         if params.print_diagnostics and batch_idx == 5:
@@ -900,10 +882,7 @@ def train_one_epoch(
             if cur_grad_scale < 0.01:
                 logging.warning(f"Grad scale is small: {cur_grad_scale}")
             if cur_grad_scale < 1.0e-05:
-                # raise_grad_scale_is_too_small_error(cur_grad_scale)
-                raise RuntimeError(
-                    f"grad_scale is too small, exiting: {cur_grad_scale}"
-                )
+                raise_grad_scale_is_too_small_error()
         if batch_idx % params.log_interval == 0:
             cur_lr = scheduler.get_last_lr()[0]
             cur_grad_scale = scaler._scale.item() if params.use_fp16 else 1.0
@@ -937,7 +916,7 @@ def train_one_epoch(
             valid_info = compute_validation_loss(
                 params=params,
                 model=model,
-                tokenizer=tokenizer,
+                graph_compiler=graph_compiler,
                 valid_dl=valid_dl,
                 world_size=world_size,
             )
@@ -990,19 +969,15 @@ def run(rank, world_size, args):
         device = torch.device("cuda", rank)
     logging.info(f"Device: {device}")
 
-    my_tokenizer = MyTokenizer(params.lang_dir/"tokens.txt")
-    logging.info("Loading tokenizer is done")
-
-    """
+    lexicon = Lexicon(params.lang_dir)
     graph_compiler = CharCtcTrainingGraphCompiler(
         lexicon=lexicon,
         device=device,
         oov="<unk>",
     )
-    """
 
-    params.blank_id = my_tokenizer.blank_id
-    params.vocab_size = my_tokenizer.vocab_size
+    params.blank_id = 0
+    params.vocab_size = max(lexicon.tokens) + 1
 
     logging.info(params)
 
@@ -1059,9 +1034,6 @@ def run(rank, world_size, args):
         )  # allow 4 megabytes per sub-module
         diagnostic = diagnostics.attach_diagnostics(model, opts)
 
-    if params.inf_check:
-        register_inf_check_hooks(model)
-
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 20 seconds
         #
@@ -1071,20 +1043,12 @@ def run(rank, world_size, args):
         # You should use ../local/display_manifest_statistics.py to get
         # an utterance duration distribution for your dataset to select
         # the threshold
-        if c.duration < 1.0 or c.duration > 20.0:
+        if c.duration < 1.0 or c.duration > 12.0:
             logging.warning(
                 f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
             )
             return False
-        """
-        tokens = my_tokenizer.encode(c.supervisions[0].text)
-        if 100 < len(tokens):
-            logging.warning(
-                f"Exclude cut with ID {c.id} from training."
-                f"The length of tokens: {len(tokens)}"
-            )
-            return False
-        """
+
         # In pruned RNN-T, we require that T >= S
         # where T is the number of feature frames after subsampling
         # and S is the number of tokens in the utterance
@@ -1107,39 +1071,8 @@ def run(rank, world_size, args):
 
         return True
 
-    if params.dataset == "libri_plus_kspon" or params.dataset == "all":
-        logging.info("Using LibriPlusKspon dataset")
-        libri_plus_kspon = LibriPlusKspon(manifest_dir=args.manifest_dir)
-    elif params.dataset == "libri" or params.dataset == "librispeech":
-        logging.info("Using LibriSpeech dataset")
-        librispeech = LibriSpeech(manifest_dir=args.manifest_dir)
-    elif params.dataset == "kspon" or params.dataset == "ksponspeech":
-        logging.info("Using KsponSpeech dataset")
-        ksponspeech = KsponSpeech(manifest_dir=args.manifest_dir)
-
-    if params.use_full_dataset:
-        logging.info("Using full dataset")
-        if (
-            params.dataset.startswith("libri_plus_kspon") or
-            params.dataset.startswith("all")
-        ):
-            logging.info("NOT IMPLEMENTED")
-        elif params.dataset.startswith("libri"):
-            train_cuts = librispeech.train_all_shuf_cuts()
-        elif params.dataset.startswith("kspon"):
-            train_cuts = ksponspeech.train_all_cuts()
-    else:
-        logging.info("Using 1/10 cuts for training")
-        if (
-            params.dataset.startswith("libri_plus_kspon") or
-            params.dataset.startswith("all")
-        ):
-            train_cuts = libri_plus_kspon.train_200_cuts(shuf=True)
-        elif params.dataset.startswith("libri"):
-            train_cuts = librispeech.train_clean_100_cuts()
-        elif params.dataset.startswith("kspon"):
-            train_cuts = ksponspeech.train_100_cuts()
-
+    aishell = AIShell(manifest_dir=args.manifest_dir)
+    train_cuts = aishell.train_cuts()
     train_cuts = train_cuts.filter(remove_short_and_long_utt)
 
     if args.enable_musan:
@@ -1163,28 +1096,16 @@ def run(rank, world_size, args):
         sampler_state_dict=sampler_state_dict,
     )
 
-    if params.dataset == "libri_plus_kspon" or params.dataset == "all":
-        logging.info("Using LibriPlusKspon validation cuts")
-        valid_cuts = libri_plus_kspon.valid_cuts()
-    elif params.dataset == "libri" or params.dataset == "librispeech":
-        logging.info("Using LibriSpeech validation cuts")
-        valid_cuts = librispeech.dev_clean_cuts()
-        valid_cuts += librispeech.dev_other_cuts()
-    elif params.dataset == "kspon" or params.dataset == "ksponspeech":
-        logging.info("Using KsponSpeech validation cuts")
-        valid_cuts = ksponspeech.dev_cuts()
-
+    valid_cuts = aishell.valid_cuts()
     valid_dl = asr_datamodule.valid_dataloaders(valid_cuts)
-    """
-    if not params.print_diagnostics:
-        scan_pessimistic_batches_for_oom(
-            model=model,
-            train_dl=train_dl,
-            optimizer=optimizer,
-            tokenizer=my_tokenizer,
-            params=params,
-        )
-    """
+    # if not params.print_diagnostics:
+    #     scan_pessimistic_batches_for_oom(
+    #         model=model,
+    #         train_dl=train_dl,
+    #         optimizer=optimizer,
+    #         graph_compiler=graph_compiler,
+    #         params=params,
+    #     )
 
     scaler = GradScaler(enabled=params.use_fp16, init_scale=1.0)
     if checkpoints and "grad_scaler" in checkpoints:
@@ -1192,7 +1113,6 @@ def run(rank, world_size, args):
         scaler.load_state_dict(checkpoints["grad_scaler"])
 
     logging.info(f"start training from epoch {params.start_epoch}")
-
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)
         fix_random_seed(params.seed + epoch - 1)
@@ -1209,7 +1129,7 @@ def run(rank, world_size, args):
             model_avg=model_avg,
             optimizer=optimizer,
             scheduler=scheduler,
-            tokenizer=my_tokenizer,
+            graph_compiler=graph_compiler,
             train_dl=train_dl,
             valid_dl=valid_dl,
             scaler=scaler,
@@ -1243,7 +1163,7 @@ def run(rank, world_size, args):
 def display_and_save_batch(
     batch: dict,
     params: AttributeDict,
-    tokenizer: MyTokenizer,
+    graph_compiler: CharCtcTrainingGraphCompiler,
 ) -> None:
     """Display the batch statistics and save the batch into disk.
 
@@ -1265,7 +1185,7 @@ def display_and_save_batch(
 
     logging.info(f"features shape: {features.shape}")
 
-    y = tokenizer.encode_batch((supervisions["text"]))
+    y = graph_compiler.texts_to_ids(supervisions["text"])
     num_tokens = sum(len(i) for i in y)
     logging.info(f"num tokens: {num_tokens}")
 
@@ -1274,7 +1194,7 @@ def scan_pessimistic_batches_for_oom(
     model: Union[nn.Module, DDP],
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
-    tokenizer: MyTokenizer,
+    graph_compiler: CharCtcTrainingGraphCompiler,
     params: AttributeDict,
 ):
     from lhotse.dataset import find_pessimistic_batches
@@ -1286,11 +1206,11 @@ def scan_pessimistic_batches_for_oom(
     for criterion, cuts in batches.items():
         batch = train_dl.dataset[cuts]
         try:
-            with torch.amp.autocast('cuda', enabled=params.use_fp16):
+            with torch.cuda.amp.autocast(enabled=params.use_fp16):
                 loss, _ = compute_loss(
                     params=params,
                     model=model,
-                    tokenizer=tokenizer,
+                    graph_compiler=graph_compiler,
                     batch=batch,
                     is_training=True,
                 )
@@ -1305,7 +1225,7 @@ def scan_pessimistic_batches_for_oom(
                     f"Failing criterion: {criterion} "
                     f"(={crit_values[criterion]}) ..."
                 )
-            display_and_save_batch(batch, params=params, tokenizer=tokenizer)
+            display_and_save_batch(batch, params=params, graph_compiler=graph_compiler)
             raise
         logging.info(
             f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
@@ -1313,6 +1233,7 @@ def scan_pessimistic_batches_for_oom(
 
 
 def main():
+    raise RuntimeError("Please don't use this file directly!")
     parser = get_parser()
     AsrDataModule.add_arguments(parser)
     args = parser.parse_args()

@@ -100,9 +100,14 @@ from icefall.utils import (
 )
 from my_tokenizer import MyTokenizer
 import os
+from my_utils import cluster_tokens_using_ipa_by_language
+from my_utils import cluster_tokens_using_ipa_by_list
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
+
+def comma_separated_list(value):
+    return [int(x) for x in value.split(',')]
 
 def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
     if isinstance(model, DDP):
@@ -403,6 +408,27 @@ def get_parser():
         among 'all'=='libri_plus_kspon', 'libirspeech', 'ksponspeech'""",
     )
 
+    parser.add_argument(
+        "--num-category",
+        type=int,
+        default=50,
+        help="The number of category."
+    )
+
+    parser.add_argument(
+        "--num-category-list",
+        type=comma_separated_list,
+        default=[10, 50],
+        help="The list of category number [eng, kor]."
+    )
+
+    parser.add_argument(
+        "--category-alpha",
+        type=float,
+        default=0.1,
+        help="Weight for the category loss in the final loss function.",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -509,11 +535,18 @@ def get_decoder_model(params: AttributeDict) -> nn.Module:
 
 
 def get_joiner_model(params: AttributeDict) -> nn.Module:
+    # counting category size
+    num_category = 0
+    for num in params.num_category_list:
+        num_category += num
+    num_category += 2  # blank and punc symbols
+
     joiner = Joiner(
         encoder_dim=int(params.encoder_dims.split(",")[-1]),
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
+        num_category=num_category,
     )
     return joiner
 
@@ -657,6 +690,7 @@ def compute_loss(
     tokenizer: MyTokenizer,
     batch: dict,
     is_training: bool,
+    token_to_cluster_table: Optional[Tensor] = None,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute RNN-T loss given the model and its inputs.
@@ -703,12 +737,21 @@ def compute_loss(
     y = tokenizer.encode_batch(texts)
     #y = graph_compiler.texts_to_ids(texts)
     y = k2.RaggedTensor(y).to(device)
+    category_y = list()
+    for c in y.tolist():
+        c = torch.tensor(c, dtype=torch.long, device=device)
+        c_mapped = token_to_cluster_table[c].clone()
+        c_mapped = c_mapped.to(device)
+        category_y.append(c_mapped.tolist())
+
+    category_y = k2.RaggedTensor(category_y).to(device)
 
     with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss = model(
+        simple_loss, pruned_loss, category_loss = model(
             x=feature,
             x_lens=feature_lens,
             y=y,
+            category_y=category_y,
             prune_range=params.prune_range,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
@@ -725,7 +768,14 @@ def compute_loss(
             if batch_idx_train >= warm_step
             else 0.1 + 0.9 * (batch_idx_train / warm_step)
         )
-        loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
+        alpha = params.category_alpha
+        loss = (
+            simple_loss_scale * simple_loss
+            + pruned_loss_scale * (
+                (1 - alpha) * pruned_loss
+                + alpha*category_loss
+            )
+        )
 
     assert loss.requires_grad == is_training
 
@@ -738,6 +788,7 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
+    info["category_loss"] = category_loss.detach().cpu().item()
 
     return loss, info
 
@@ -748,6 +799,7 @@ def compute_validation_loss(
     tokenizer: MyTokenizer,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
+    token_to_cluster_table: Optional[Tensor] = None,
 ) -> MetricsTracker:
     """Run the validation process."""
     model.eval()
@@ -761,6 +813,7 @@ def compute_validation_loss(
             tokenizer=tokenizer,
             batch=batch,
             is_training=False,
+            token_to_cluster_table=token_to_cluster_table,
         )
         assert loss.requires_grad is False
         tot_loss = tot_loss + loss_info
@@ -789,6 +842,7 @@ def train_one_epoch(
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
+    token_to_cluster_table: Optional[Tensor] = None,
 ) -> None:
     """Train the model for one epoch.
 
@@ -837,6 +891,7 @@ def train_one_epoch(
                     tokenizer=tokenizer,
                     batch=batch,
                     is_training=True,
+                    token_to_cluster_table=token_to_cluster_table,
                 )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
@@ -940,6 +995,7 @@ def train_one_epoch(
                 tokenizer=tokenizer,
                 valid_dl=valid_dl,
                 world_size=world_size,
+                token_to_cluster_table=token_to_cluster_table,
             )
             model.train()
             logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
@@ -990,8 +1046,42 @@ def run(rank, world_size, args):
         device = torch.device("cuda", rank)
     logging.info(f"Device: {device}")
 
+    if not os.path.exists(params.lang_dir/"tokens.txt"):
+        logging.info(
+            f"Token file {params.lang_dir / 'tokens.txt'} doesn't exist."
+        )
+
     my_tokenizer = MyTokenizer(params.lang_dir/"tokens.txt")
     logging.info("Loading tokenizer is done")
+
+    logging.info("Clustering the tokens")
+
+    token_dict = {}
+    with open(params.lang_dir / "tokens.txt", "r", encoding="utf-8") as f:
+        tokens_lines = f.read().splitlines()
+
+    for line in tokens_lines:
+        token = line.split(' ')[0]
+        idx = line.split(' ')[-1]
+        key = token
+        value = int(idx)
+        token_dict[key] = value
+    print(f"{params.num_category_list}")
+    token_cluster = cluster_tokens_using_ipa_by_list(
+        token_dict, params.num_category_list)
+    max_index = max(token_cluster.keys())
+    token_to_cluster_table = torch.zeros(max_index+1, dtype=torch.int32)
+    for k, v in token_cluster.items():
+        token_to_cluster_table[k] = v
+
+    logging.info(f"Token to cluster table is ready, "
+                 f"vocab size(hyparam): {my_tokenizer.vocab_size} "
+                 f"num of category(hyparam): {params.num_category_list} "
+                 f"cluster size: {len(token_to_cluster_table)} "
+                 f"num of cluster: {torch.max(token_to_cluster_table)+1}")
+    print(f"{token_to_cluster_table.shape=}")
+    print(f"{torch.max(token_to_cluster_table)=}")
+    print(f"{torch.min(token_to_cluster_table)=}")
 
     """
     graph_compiler = CharCtcTrainingGraphCompiler(
@@ -1107,13 +1197,16 @@ def run(rank, world_size, args):
 
         return True
 
-    if params.dataset == "libri_plus_kspon" or params.dataset == "all":
+    if (
+        params.dataset.startswith("libri_plus_kspon") or
+        params.dataset.startswith("all")
+    ):
         logging.info("Using LibriPlusKspon dataset")
         libri_plus_kspon = LibriPlusKspon(manifest_dir=args.manifest_dir)
-    elif params.dataset == "libri" or params.dataset == "librispeech":
+    elif params.dataset.startswith("libri"):
         logging.info("Using LibriSpeech dataset")
         librispeech = LibriSpeech(manifest_dir=args.manifest_dir)
-    elif params.dataset == "kspon" or params.dataset == "ksponspeech":
+    elif params.dataset.startswith("kspon"):
         logging.info("Using KsponSpeech dataset")
         ksponspeech = KsponSpeech(manifest_dir=args.manifest_dir)
 
@@ -1127,7 +1220,7 @@ def run(rank, world_size, args):
         elif params.dataset.startswith("libri"):
             train_cuts = librispeech.train_all_shuf_cuts()
         elif params.dataset.startswith("kspon"):
-            train_cuts = ksponspeech.train_all_cuts()
+            train_cuts = ksponspeech.train_cuts()
     else:
         logging.info("Using 1/10 cuts for training")
         if (
@@ -1216,6 +1309,7 @@ def run(rank, world_size, args):
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,
+            token_to_cluster_table=token_to_cluster_table,
         )
 
         if params.print_diagnostics:

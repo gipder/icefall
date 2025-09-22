@@ -1,3 +1,4 @@
 data
 experiments
 train_*sh
+decode_*sh

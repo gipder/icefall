@@ -429,7 +429,7 @@ def decode_dataset(
             assert len(hyps) == len(texts)
             for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
                 language = batch['supervisions']['cut'][idx].supervisions[0].language
-                if language == 'Korean':
+                if language == 'Korean' or language == 'mixed':
                     hyp_text = ' '.join(hyp_words)
                     _, hyp_text = get_norm_text(ref_text, hyp_text)
                     hyp_words = hyp_text.split()
@@ -772,6 +772,18 @@ def main():
         test_sets = ["kspon_eval_clean", "kspon_eval_other"]
         test_dls = [test_kspon_eval_clean_dl,
                     test_kspon_eval_other_dl]
+    elif params.dataset == "mixed" or params.dataset == "Mixed":
+        logging.info("Using LibriSpeech + KsponSpeech dataset")
+        libri_plus_kspon = LibriPlusKspon(manifest_dir=args.manifest_dir)
+        test_mixed_eval_clean_cuts = libri_plus_kspon.test_mixed_eval_clean_cuts()
+        test_mixed_eval_other_cuts = libri_plus_kspon.test_mixed_eval_other_cuts()
+        test_mixed_eval_clean_dl = asr_datamodule.test_dataloaders(
+            test_mixed_eval_clean_cuts)
+        test_mixed_eval_other_dl = asr_datamodule.test_dataloaders(
+            test_mixed_eval_other_cuts)
+        test_sets = ["mixed_eval_clean", "mixed_eval_other"]
+        test_dls = [test_mixed_eval_clean_dl,
+                    test_mixed_eval_other_dl]
 
     for test_set, test_dl in zip(test_sets, test_dls):
         results_dict, cer_results_dict = decode_dataset(
