@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import os
+import re
 
 class MyTokenizer:
     def __init__(self, vocab_file=""):
@@ -200,7 +201,7 @@ def space_normalized_wer(ref=list(), hyp=list()):
 
 
 if __name__ == "__main__":
-    my_tokenizer = MyTokenizer("tokens.txt")
+    my_tokenizer = MyTokenizer("./data/lang_bpe_kspon_5000/tokens.txt")
     print("Vocabulary Size:", my_tokenizer.vocab_size)
     tokens = my_tokenizer.tokenize("안녕하세요 반갑습니다 THIS IS A SIMPLE TEST")
     print(tokens)
@@ -228,3 +229,35 @@ if __name__ == "__main__":
     print("normalized reference: ", refnorm)
     print("normalized hypothesis: ", hypnorm)
 
+    # for Chinese character
+    print("=== Chinese character test ===")
+    my_tokenizer = MyTokenizer("./data/lang_char_space_aishell_4000/tokens.txt")  
+    print("Vocabulary Size:", my_tokenizer.vocab_size)
+    tokens = my_tokenizer.tokenize("你好 世界 这是 一个 测试")
+    print(tokens)
+    print("Encoded:", my_tokenizer.encode("你好 世界 这是 一个 测试"))
+    print(my_tokenizer.encode(['你', '好', '世', '界', '这', '是', '一', '个', '测', '试']))
+    print("Decoded:", my_tokenizer.decode(my_tokenizer.encode("你好 世界 这是 一个 测试")))
+
+    print("=== Chinese character test without spaces ===")
+    tokens = my_tokenizer.tokenize("你好世界这是一个测试")
+    print(tokens)
+    print("Encoded:", my_tokenizer.encode("你好世界这是一个测试"))
+    print(my_tokenizer.encode(['你', '好', '世', '界', '这', '是', '一', '个', '测', '试']))
+    print("Decoded:", my_tokenizer.decode(my_tokenizer.encode("你好世界这是一个测试")))
+
+    chinese_pattern = re.compile(
+        '[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff'
+        '\U00020000-\U0002A6DF\U0002A700-\U0002B73F'
+        '\U0002B740-\U0002B81F\U0002B820-\U0002CEAF]'
+    )
+
+    if chinese_pattern.search("潍"):
+        print("Chinese characters detected!")
+
+    from phonemizer.backend import EspeakBackend
+    from phonemizer.separator import Separator
+    espeak_zh = EspeakBackend(language='cmn', language_switch='remove-flags')
+    separator = Separator(phone=' ', word='=', syllable='|')
+    print(espeak_zh.phonemize(["你"], strip=True, separator=separator))
+    

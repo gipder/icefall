@@ -454,7 +454,7 @@ def cluster_tokens_using_ipa_by_list(
     Clusters tokens based on their IPA representations.
     Args:
         tokens (dict): A dictionary contains BPE tokens.
-        num_language_clusters (list): Numbers of language clusters ([eng, kor])
+        num_language_clusters (list): Numbers of language clusters ([eng, kor, chn])
                                       except for blank_id 0 and punc_id 1
         last_first_lang_id: The last first language (english) token ID
         exceptions (Tuple or List): List of tokens that should be treated as exceptions.
@@ -467,20 +467,27 @@ def cluster_tokens_using_ipa_by_list(
         dict: A dictionary mapping IDs to their cluster IDs.
               key: original token id, value: group(cluster) id
     """
-    kor_and_digit = re.compile(r'[가-힣a-z\d]')
+    # Pattern matchers for each language
+    korean_pattern = re.compile(r'[가-힣]')
+    chinese_pattern = re.compile(r'[\u4e00-\u9fff]')
 
+    # Initialize espeak backends for each language
     espeaks = list()
-    espeak_ko = EspeakBackend(language='kok', language_switch='remove-flags')
     espeak_en = EspeakBackend(language='en-us')
+    espeak_ko = EspeakBackend(language='kok', language_switch='remove-flags')
+    espeak_zh = EspeakBackend(language='cmn', language_switch='remove-flags')
     espeaks.append(espeak_en)
     espeaks.append(espeak_ko)
+    espeaks.append(espeak_zh)
     separator = Separator(phone=' ', word='=', syllable='|')
 
     ipa_set = set()
     tokens_list = list()
+    bucket_langs = list()
     num_lang = len(num_language_clusters)
     for i in range(num_lang):
         tokens_list.append(list())
+        bucket_langs.append(set())
 
     for token in tokens:
         if (
@@ -490,21 +497,47 @@ def cluster_tokens_using_ipa_by_list(
         ):
             continue
         else:
-            modified_token = token.replace(front_space, '')
-            if tokens[token] > last_first_lang_id:
-                tokens_list[-1].append(modified_token)
+            modified_token = token.replace(front_space, '').replace(' ', '').strip()
+            
+            # Classify token by language based on character patterns
+            if chinese_pattern.search(modified_token):
+                # Chinese tokens (index 2)
+                if num_lang >= 3:
+                    tokens_list[2].append(modified_token)
+                    bucket_langs[2].add("zh")
+                else:
+                    tokens_list[-1].append(modified_token)
+                    bucket_langs[-1].add("zh")
+            elif korean_pattern.search(modified_token):
+                # Korean tokens (index 1)
+                if num_lang >= 2:
+                    tokens_list[1].append(modified_token)
+                    bucket_langs[1].add("ko")
+                else:
+                    tokens_list[-1].append(modified_token)
+                    bucket_langs[-1].add("ko")
             else:
+                # English and other tokens (index 0)
                 tokens_list[0].append(modified_token)
+                bucket_langs[0].add("en")
 
     ipas_list = list()
     for i in range(num_lang):
+        # Choose backend based on detected language in the bucket
+        if "zh" in bucket_langs[i]:
+            backend = espeak_zh
+        elif "ko" in bucket_langs[i]:
+            backend = espeak_ko
+        else:
+            backend = espeak_en
+
         ipas_list.append(
             list(
-                espeaks[i].phonemize(tokens_list[i], strip=True,
-                                     separator=separator)
+                backend.phonemize(tokens_list[i], strip=True,
+                                  separator=separator)
             )
         )
-
+    
     labels = list()
     ipa_converted_tokens_list = list()
     for i in range(num_lang):

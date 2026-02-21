@@ -40,11 +40,11 @@ class AIShell:
         cuts_train = load_manifest_lazy(f)
         return cuts_train
 
-    def valid_cuts(self) -> CutSet:
+    def dev_cuts(self) -> CutSet:
         f = self.manifest_dir / "aishell_cuts_dev.jsonl.gz"
-        logging.info(f"About to get valid cuts from {f}")
-        cuts_valid = load_manifest_lazy(f)
-        return cuts_valid
+        logging.info(f"About to get dev cuts from {f}")
+        cuts_dev = load_manifest_lazy(f)
+        return cuts_dev
 
     def test_cuts(self) -> CutSet:
         f = self.manifest_dir / "aishell_cuts_test.jsonl.gz"

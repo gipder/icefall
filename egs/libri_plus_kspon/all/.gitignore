@@ -1,4 +1,7 @@
+.vscode
 data
 experiments
+experiments*
 train_*sh
 decode_*sh
+*.local.sh

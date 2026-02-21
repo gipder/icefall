@@ -49,6 +49,7 @@ import argparse
 import copy
 import logging
 import random
+import re
 import warnings
 from pathlib import Path
 import pathlib
@@ -61,9 +62,10 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 # from aishell import AIShell
-from libri_plus_kspon import LibriPlusKspon
+#from libri_plus_kspon import LibriPlusKspon
 from librispeech import LibriSpeech
 from ksponspeech import KsponSpeech
+from aishell import AIShell
 from asr_datamodule import AsrDataModule
 from decoder import Decoder
 from joiner import Joiner
@@ -109,8 +111,29 @@ torch.serialization.add_safe_globals([pathlib.PosixPath])
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
 
+def remove_chinese_spaces(text: str) -> str:
+    """
+    Remove spaces between Chinese characters (CJK Unified Ideographs).
+    Preserves spaces around non-Chinese characters.
+    """
+    # Pattern to match: Chinese char + space + Chinese char
+    # CJK Unified Ideographs range: U+4E00 to U+9FFF
+    pattern = r'([\u4e00-\u9fff])\s+([\u4e00-\u9fff])'
+    
+    # Keep replacing until no more matches (handles multiple consecutive spaces)
+    prev_text = None
+    while prev_text != text:
+        prev_text = text
+        text = re.sub(pattern, r'\1\2', text)
+    
+    return text
+
+
 def comma_separated_list(value):
     return [int(x) for x in value.split(',')]
+
+def comma_separated_str_list(value):
+    return [str(x) for x in value.split(',')]
 
 def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
     if isinstance(model, DDP):
@@ -405,10 +428,12 @@ def get_parser():
 
     parser.add_argument(
         "--dataset",
-        type=str,
-        default="all",
-        help="""Selecting the dataset for training
-        among 'all'=='libri_plus_kspon', 'libirspeech', 'ksponspeech'""",
+        type=comma_separated_str_list,
+        default="librispeech",
+        help="""Selecting the dataset for training.
+        Can specify multiple datasets separated by comma (e.g., 'librispeech,ksponspeech').
+        'all' means using all the datasets.
+        Options: 'all', 'librispeech', 'ksponspeech', 'aishell'""",
     )
 
     parser.add_argument(
@@ -762,7 +787,10 @@ def compute_loss(
     warm_step = params.warm_step
 
     texts = batch["supervisions"]["text"]
+    # Remove spaces between Chinese characters
+    texts = [remove_chinese_spaces(text) for text in texts]
     y = tokenizer.encode_batch(texts)
+
     #y = graph_compiler.texts_to_ids(texts)
     y = k2.RaggedTensor(y).to(device)
 
@@ -914,7 +942,7 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(train_dl):
         params.batch_idx_train += 1
         batch_size = len(batch["supervisions"]["text"])
-        #print(f"{batch['supervisions']['text']=}")
+
         try:
             with torch.amp.autocast('cuda', enabled=params.use_fp16):
                 loss, loss_info = compute_loss(
@@ -1097,7 +1125,7 @@ def run(rank, world_size, args):
         key = token
         value = int(idx)
         token_dict[key] = value
-    
+
     if params.category_method == "random":
         logging.info("Using random category clustering")
         token_cluster = cluster_random_tokens(
@@ -1239,41 +1267,59 @@ def run(rank, world_size, args):
 
         return True
 
-    if (
-        params.dataset.startswith("libri_plus_kspon") or
-        params.dataset.startswith("all")
-    ):
-        logging.info("Using LibriPlusKspon dataset")
-        libri_plus_kspon = LibriPlusKspon(manifest_dir=args.manifest_dir)
-    elif params.dataset.startswith("libri"):
-        logging.info("Using LibriSpeech dataset")
-        librispeech = LibriSpeech(manifest_dir=args.manifest_dir)
-    elif params.dataset.startswith("kspon"):
-        logging.info("Using KsponSpeech dataset")
-        ksponspeech = KsponSpeech(manifest_dir=args.manifest_dir)
-
+    # Initialize dataset objects
+    librispeech = None
+    ksponspeech = None
+    aishell = None
+    
+    for dataset in params.dataset:
+        if dataset == "all":
+            logging.info("Using all datasets")
+            librispeech = LibriSpeech(manifest_dir=args.manifest_dir)
+            ksponspeech = KsponSpeech(manifest_dir=args.manifest_dir)
+            aishell = AIShell(manifest_dir=args.manifest_dir)
+        elif dataset == "libri" or dataset == "librispeech":
+            logging.info("Using LibriSpeech dataset")
+            librispeech = LibriSpeech(manifest_dir=args.manifest_dir)
+        elif dataset == "kspon" or dataset == "ksponspeech":
+            logging.info("Using KsponSpeech dataset")
+            ksponspeech = KsponSpeech(manifest_dir=args.manifest_dir)
+        elif dataset == "aishell":
+            logging.info("Using AIShell dataset")
+            aishell = AIShell(manifest_dir=args.manifest_dir)
+        else:
+            raise ValueError(f"Unsupported dataset: {dataset}")
+    
+    # Collect training cuts from each dataset
+    train_cuts_list = []
+    
     if params.use_full_dataset:
         logging.info("Using full dataset")
-        if (
-            params.dataset.startswith("libri_plus_kspon") or
-            params.dataset.startswith("all")
-        ):
-            logging.info("NOT IMPLEMENTED")
-        elif params.dataset.startswith("libri"):
-            train_cuts = librispeech.train_all_shuf_cuts()
-        elif params.dataset.startswith("kspon"):
-            train_cuts = ksponspeech.train_all_cuts()
+        if librispeech is not None:
+            train_cuts_list.append(librispeech.train_all_shuf_cuts())
+        if ksponspeech is not None:
+            train_cuts_list.append(ksponspeech.train_all_cuts())
+        if aishell is not None:
+            train_cuts_list.append(aishell.train_cuts())
     else:
         logging.info("Using 1/10 cuts for training")
-        if (
-            params.dataset.startswith("libri_plus_kspon") or
-            params.dataset.startswith("all")
-        ):
-            train_cuts = libri_plus_kspon.train_200_cuts(shuf=True)
-        elif params.dataset.startswith("libri"):
-            train_cuts = librispeech.train_clean_100_cuts()
-        elif params.dataset.startswith("kspon"):
-            train_cuts = ksponspeech.train_100_cuts()
+        if librispeech is not None:
+            train_cuts_list.append(librispeech.train_clean_100_cuts())
+        if ksponspeech is not None:
+            train_cuts_list.append(ksponspeech.train_100_cuts())
+        if aishell is not None:
+            logging.info("AIShell doesn't have a 1/10 subset, using the full training cuts")
+            train_cuts_list.append(aishell.train_cuts())
+    
+    # Combine all cuts
+    if len(train_cuts_list) == 0:
+        raise ValueError("No training data selected")
+    elif len(train_cuts_list) == 1:
+        train_cuts = train_cuts_list[0]
+    else:
+        train_cuts = train_cuts_list[0]
+        for cuts in train_cuts_list[1:]:
+            train_cuts = train_cuts + cuts
 
     train_cuts = train_cuts.filter(remove_short_and_long_utt)
 
@@ -1298,16 +1344,29 @@ def run(rank, world_size, args):
         sampler_state_dict=sampler_state_dict,
     )
 
-    if params.dataset == "libri_plus_kspon" or params.dataset == "all":
-        logging.info("Using LibriPlusKspon validation cuts")
-        valid_cuts = libri_plus_kspon.valid_cuts()
-    elif params.dataset == "libri" or params.dataset == "librispeech":
+    # Collect validation cuts from each dataset
+    valid_cuts_list = []
+    
+    if librispeech is not None:
         logging.info("Using LibriSpeech validation cuts")
-        valid_cuts = librispeech.dev_clean_cuts()
-        valid_cuts += librispeech.dev_other_cuts()
-    elif params.dataset == "kspon" or params.dataset == "ksponspeech":
+        valid_cuts_list.append(librispeech.dev_clean_cuts())
+        valid_cuts_list.append(librispeech.dev_other_cuts())
+    if ksponspeech is not None:
         logging.info("Using KsponSpeech validation cuts")
-        valid_cuts = ksponspeech.dev_cuts()
+        valid_cuts_list.append(ksponspeech.dev_cuts())
+    if aishell is not None:
+        logging.info("Using AIShell validation cuts")
+        valid_cuts_list.append(aishell.dev_cuts())
+    
+    # Combine all validation cuts
+    if len(valid_cuts_list) == 0:
+        raise ValueError("No validation data selected")
+    elif len(valid_cuts_list) == 1:
+        valid_cuts = valid_cuts_list[0]
+    else:
+        valid_cuts = valid_cuts_list[0]
+        for cuts in valid_cuts_list[1:]:
+            valid_cuts = valid_cuts + cuts
 
     valid_dl = asr_datamodule.valid_dataloaders(valid_cuts)
     """
