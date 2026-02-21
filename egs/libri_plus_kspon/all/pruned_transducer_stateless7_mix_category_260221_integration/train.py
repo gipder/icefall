@@ -1045,7 +1045,6 @@ def train_one_epoch(
         params.best_train_epoch = params.cur_epoch
         params.best_train_loss = params.train_loss
 
-
 def run(rank, world_size, args):
     """
     Args:
