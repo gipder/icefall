@@ -3,5 +3,5 @@
 ./download
 ./shared
 train_*_tr*.sh
-decode*.sh
+decode_*.sh
 vocab_test
