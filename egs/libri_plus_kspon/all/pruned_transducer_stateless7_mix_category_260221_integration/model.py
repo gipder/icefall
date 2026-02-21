@@ -76,7 +76,7 @@ class Transducer(nn.Module):
         x: torch.Tensor,
         x_lens: torch.Tensor,
         y: k2.RaggedTensor,
-        category_y: k2.RaggedTensor,
+        category_y: k2.RaggedTensor = None,
         prune_range: int = 5,
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
@@ -145,11 +145,17 @@ class Transducer(nn.Module):
         # Note: y does not start with SOS
         # y_padded : [B, S]
         y_padded = y.pad(mode="constant", padding_value=0)
-        category_y_padded = category_y.pad(mode="constant", padding_value=0)
-
         y_padded = y_padded.to(torch.int64)
-        category_y_padded = category_y_padded.to(torch.int64)
 
+        use_category = (
+          category_y is not None
+          and self.joiner.joiner_type in ["autojoint", "autojoint_shortcut"]
+        )
+
+        if use_category:
+          category_y_padded = category_y.pad(mode="constant", padding_value=0)
+          category_y_padded = category_y_padded.to(torch.int64)
+        
         boundary = torch.zeros((x.size(0), 4), dtype=torch.int64, device=x.device)
         boundary[:, 2] = y_lens
         boundary[:, 3] = x_lens
@@ -192,7 +198,6 @@ class Transducer(nn.Module):
         )
 
         # logits : [B, T, prune_range, vocab_size]
-
         # project_input=False since we applied the decoder's input projections
         # prior to do_rnnt_pruning (this is an optimization for speed).
         logits, category_logits = self.joiner(am_pruned, lm_pruned, project_input=False)
@@ -206,20 +211,18 @@ class Transducer(nn.Module):
                 boundary=boundary,
                 reduction="sum",
             )
+        
+        if use_category:
+          with torch.amp.autocast('cuda', enabled=False):
+              category_loss = k2.rnnt_loss_pruned(
+                  logits=category_logits.float(),
+                  symbols=category_y_padded,
+                  ranges=ranges,
+                  termination_symbol=blank_id,
+                  boundary=boundary,
+                  reduction="sum",
+              )
+        else:
+          category_loss = torch.tensor(0.0, device=x.device)
 
-        with torch.amp.autocast('cuda', enabled=False):
-            category_loss = k2.rnnt_loss_pruned(
-                logits=category_logits.float(),
-                symbols=category_y_padded,
-                ranges=ranges,
-                termination_symbol=blank_id,
-                boundary=boundary,
-                reduction="sum",
-            )
-        """
-        print(f"{x_lens.size(0)=}")
-        print(f"{x_lens=}")
-        print(f"{y_lens=}")
-        print("=" * 20)
-        """
         return (simple_loss, pruned_loss, category_loss)

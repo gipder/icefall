@@ -443,9 +443,9 @@ def get_parser():
     parser.add_argument(
         "--category-method",
         type=str,
-        choices=["ipa", "random"],
-        default="ipa",
-        help="The method to use for category clustering. Options are 'ipa' and 'random'.",
+        choices=["ipa", "random", "none"],
+        default="none",
+        help="The method to use for category clustering. Options are 'ipa', 'random', and 'none'.",
     )
 
     parser.add_argument(
@@ -574,6 +574,7 @@ def get_joiner_model(params: AttributeDict) -> nn.Module:
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
         num_category=num_category,
+        joiner_type=params.joiner_type,
     )
     return joiner
 
@@ -764,14 +765,18 @@ def compute_loss(
     y = tokenizer.encode_batch(texts)
     #y = graph_compiler.texts_to_ids(texts)
     y = k2.RaggedTensor(y).to(device)
-    category_y = list()
-    for c in y.tolist():
-        c = torch.tensor(c, dtype=torch.long, device=device)
-        c_mapped = token_to_cluster_table[c].clone()
-        c_mapped = c_mapped.to(device)
-        category_y.append(c_mapped.tolist())
 
-    category_y = k2.RaggedTensor(category_y).to(device)
+    if token_to_cluster_table is not None:
+        category_y = list()
+        for c in y.tolist():
+            c = torch.tensor(c, dtype=torch.long, device=device)
+            c_mapped = token_to_cluster_table[c].clone()
+            c_mapped = c_mapped.to(device)
+            category_y.append(c_mapped.tolist())
+
+        category_y = k2.RaggedTensor(category_y).to(device)
+    else:
+        category_y = None
 
     with torch.set_grad_enabled(is_training):
         simple_loss, pruned_loss, category_loss = model(
@@ -1102,31 +1107,32 @@ def run(rank, world_size, args):
         logging.info("Using IPA-based category clustering")
         token_cluster = cluster_tokens_using_ipa_by_list(
             token_dict, params.num_category_list)
+    elif params.category_method == "none":
+        logging.info("Using no category clustering. All tokens are assigned to None. "
+                     "The cluster will not be used in this case.")
+        #token_cluster = {token_id: 0 for token_id in token_dict.values()}
+        token_cluster = None
     else:
         raise ValueError(f"Unsupported category method: {params.category_method}")
     
-    max_index = max(token_cluster.keys())
-    token_to_cluster_table = torch.zeros(max_index+1, dtype=torch.int32, device=device)
+    if token_cluster is not None:
+        max_index = max(token_cluster.keys())
+        token_to_cluster_table = torch.zeros(max_index+1, dtype=torch.int32, device=device)
+    else:
+        token_to_cluster_table = None
     
-    for k, v in token_cluster.items():
-        token_to_cluster_table[k] = v
+    if token_to_cluster_table is not None:
+        for k, v in token_cluster.items():
+            token_to_cluster_table[k] = v
 
-    logging.info(f"Token to cluster table is ready, "
-                 f"vocab size(hyparam): {my_tokenizer.vocab_size} "
-                 f"num of category(hyparam): {params.num_category_list} "
-                 f"cluster size: {len(token_to_cluster_table)} "
-                 f"num of cluster: {torch.max(token_to_cluster_table)+1}")
-    print(f"{token_to_cluster_table.shape=}")
-    print(f"{torch.max(token_to_cluster_table)=}")
-    print(f"{torch.min(token_to_cluster_table)=}")
-
-    """
-    graph_compiler = CharCtcTrainingGraphCompiler(
-        lexicon=lexicon,
-        device=device,
-        oov="<unk>",
-    )
-    """
+        logging.info(f"Token to cluster table is ready, "
+                    f"vocab size(hyparam): {my_tokenizer.vocab_size} "
+                    f"num of category(hyparam): {params.num_category_list} "
+                    f"cluster size: {len(token_to_cluster_table)} "
+                    f"num of cluster: {torch.max(token_to_cluster_table)+1}")
+        logging.info(f"{token_to_cluster_table.shape=}")
+        logging.info(f"{torch.max(token_to_cluster_table)=}")
+        logging.info(f"{torch.min(token_to_cluster_table)=}")
 
     params.blank_id = my_tokenizer.blank_id
     params.vocab_size = my_tokenizer.vocab_size

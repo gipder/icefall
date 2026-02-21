@@ -44,10 +44,16 @@ class Joiner(nn.Module):
 
         self.encoder_proj = nn.Linear(encoder_dim, joiner_dim)
         self.decoder_proj = nn.Linear(decoder_dim, joiner_dim)
-        self.middle_linear = nn.Linear(joiner_dim, vocab_size)
-        self.category_linear = nn.Linear(vocab_size, num_category)
-        self.output_linear = nn.Linear(num_category, vocab_size)
         self.joiner_type = joiner_type
+        if self.joiner_type == "original":
+            self.middle_linear = None
+            self.category_linear = None
+            self.output_linear = nn.Linear(joiner_dim, vocab_size)
+        elif self.joiner_type in ["autojoint", "autojoint_shortcut"]:
+            self.middle_linear = nn.Linear(joiner_dim, vocab_size)
+            self.category_linear = nn.Linear(vocab_size, num_category)
+            self.output_linear = nn.Linear(num_category, vocab_size)
+        
 
     def forward(
         self,
