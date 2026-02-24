@@ -66,9 +66,10 @@ from typing import Dict, List, Optional, Tuple
 import k2
 import torch
 import torch.nn as nn
-from libri_plus_kspon import LibriPlusKspon
+#from libri_plus_kspon import LibriPlusKspon
 from librispeech import LibriSpeech
 from ksponspeech import KsponSpeech
+from aishell import AIShell
 from asr_datamodule import AsrDataModule
 from beam_search import (
     beam_search,
@@ -103,6 +104,9 @@ torch.serialization.add_safe_globals([pathlib.PosixPath])
 
 def comma_separated_list(value):
     return [int(x) for x in value.split(',')]
+
+def comma_separated_str_list(value):
+    return [str(x) for x in value.split(',')]
 
 
 def get_parser():
@@ -246,10 +250,12 @@ def get_parser():
 
     parser.add_argument(
         "--dataset",
-        type=str,
+        type=comma_separated_str_list,
         default="all",
-        help="""Selecting the dataset for training
-        among 'all'=='libri_plus_kspon', 'libirspeech', 'ksponspeech'""",
+        help="""Selecting the dataset for training.
+        Can specify multiple datasets separated by comma (e.g., 'librispeech,ksponspeech').
+        'all' means using all the datasets.
+        Options: 'all', 'librispeech', 'ksponspeech', 'aishell'""",
     )
 
     parser.add_argument(
@@ -266,6 +272,25 @@ def get_parser():
         type=comma_separated_list,
         default=[10, 50],
         help="The list of category number [eng, kor]."
+    )
+
+    # it dosn't affect decoding results,
+    # but it is used to specify the category clustering method, 
+    # which may affect the training of the model and thus affect the decoding results.
+    parser.add_argument(
+        "--category-method",
+        type=str,
+        choices=[ "none", "ipa", "random", "embedding"],
+        default="none",
+        help="The method to use for category clustering. Options are 'ipa', 'random', 'embedding', and 'none'.",
+    )
+
+    parser.add_argument(
+        "--joiner-type",
+        type=str,
+        choices=["original", "autojoint", "autojoint_shortcut"],
+        default="original",
+        help="The type of joiner to use. Options are 'original', 'autojoint', 'autojoint_shortcut'.",
     )
 
     add_model_arguments(parser)
@@ -452,7 +477,7 @@ def decode_dataset(
             assert len(hyps) == len(texts)
             for cut_id, hyp_words, ref_text in zip(cut_ids, hyps, texts):
                 language = batch['supervisions']['cut'][idx].supervisions[0].language
-                if language == 'Korean' or language == 'mixed':
+                if language == 'Korean' or language == 'Chinese':
                     hyp_text = ' '.join(hyp_words)
                     _, hyp_text = get_norm_text(ref_text, hyp_text)
                     hyp_words = hyp_text.split()
@@ -670,9 +695,8 @@ def main():
             logging.info(f"averaging {filenames}")
             model.to(device)
             model.load_state_dict(
-                average_checkpoints(filenames, device=device), strict=True
+                average_checkpoints(filenames, device=device), strict=False
             )
-            logging.info("GARBAGE " * 10)
     else:
         if params.iter > 0:
             filenames = find_checkpoints(params.exp_dir, iteration=-params.iter)[
@@ -751,63 +775,108 @@ def main():
     # we need cut ids to display recognition results.
     args.return_cuts = True
     asr_datamodule = AsrDataModule(args)
-    if params.dataset == "libri_plus_kspon" or params.dataset == "all":
-        logging.info("Using LibriPlusKspon dataset")
-        libri_plus_kspon = LibriPlusKspon(manifest_dir=args.manifest_dir)
-        test_kspon_eval_clean_cuts = libri_plus_kspon.test_kspon_eval_clean_cuts()
-        test_kspon_eval_other_cuts = libri_plus_kspon.test_kspon_eval_other_cuts()
-        test_libri_test_clean_cuts = libri_plus_kspon.test_libri_test_clean_cuts()
-        test_libri_test_other_cuts = libri_plus_kspon.test_libri_test_other_cuts()
-        test_kspon_eval_clean_dl = asr_datamodule.test_dataloaders(
-            test_kspon_eval_clean_cuts)
-        test_kspon_eval_other_dl = asr_datamodule.test_dataloaders(
-            test_kspon_eval_other_cuts)
-        test_libri_test_clean_dl = asr_datamodule.test_dataloaders(
-            test_libri_test_clean_cuts)
-        test_libri_test_other_dl = asr_datamodule.test_dataloaders(
-            test_libri_test_other_cuts)
-        test_sets = ["kspon_eval_clean", "kspon_eval_other",
-                     "libri_test_clean", "libri_test_other"]
-        test_dls = [test_kspon_eval_clean_dl,
-                    test_kspon_eval_other_dl,
-                    test_libri_test_clean_dl,
-                    test_libri_test_other_dl]
-    elif params.dataset == "libri" or params.dataset == "librispeech":
-        logging.info("Using LibriSpeech dataset")
-        libri_plus_kspon = LibriPlusKspon(manifest_dir=args.manifest_dir)
-        test_libri_test_clean_cuts = libri_plus_kspon.test_libri_test_clean_cuts()
-        test_libri_test_other_cuts = libri_plus_kspon.test_libri_test_other_cuts()
-        test_libri_test_clean_dl = asr_datamodule.test_dataloaders(
-            test_libri_test_clean_cuts)
-        test_libri_test_other_dl = asr_datamodule.test_dataloaders(
-            test_libri_test_other_cuts)
-        test_sets = ["libri_test_clean", "libri_test_other"]
-        test_dls = [test_libri_test_clean_dl,
-                    test_libri_test_other_dl]
-    elif params.dataset == "kspon" or params.dataset == "ksponspeech":
-        logging.info("Using KsponSpeech dataset")
-        libri_plus_kspon = LibriPlusKspon(manifest_dir=args.manifest_dir)
-        test_kspon_eval_clean_cuts = libri_plus_kspon.test_kspon_eval_clean_cuts()
-        test_kspon_eval_other_cuts = libri_plus_kspon.test_kspon_eval_other_cuts()
-        test_kspon_eval_clean_dl = asr_datamodule.test_dataloaders(
-            test_kspon_eval_clean_cuts)
-        test_kspon_eval_other_dl = asr_datamodule.test_dataloaders(
-            test_kspon_eval_other_cuts)
-        test_sets = ["kspon_eval_clean", "kspon_eval_other"]
-        test_dls = [test_kspon_eval_clean_dl,
-                    test_kspon_eval_other_dl]
-    elif params.dataset == "mixed" or params.dataset == "Mixed":
-        logging.info("Using LibriSpeech + KsponSpeech dataset")
-        libri_plus_kspon = LibriPlusKspon(manifest_dir=args.manifest_dir)
-        test_mixed_eval_clean_cuts = libri_plus_kspon.test_mixed_eval_clean_cuts()
-        test_mixed_eval_other_cuts = libri_plus_kspon.test_mixed_eval_other_cuts()
-        test_mixed_eval_clean_dl = asr_datamodule.test_dataloaders(
-            test_mixed_eval_clean_cuts)
-        test_mixed_eval_other_dl = asr_datamodule.test_dataloaders(
-            test_mixed_eval_other_cuts)
-        test_sets = ["mixed_eval_clean", "mixed_eval_other"]
-        test_dls = [test_mixed_eval_clean_dl,
-                    test_mixed_eval_other_dl]
+    
+    # Initialize dataset objects    
+    librispeech = None
+    ksponspeech = None
+    aishell = None
+    for dataset in params.dataset:
+        if dataset == "all":
+            logging.info("Using all datasets")
+            librispeech = LibriSpeech(manifest_dir=args.manifest_dir)
+            ksponspeech = KsponSpeech(manifest_dir=args.manifest_dir)
+            aishell = AIShell(manifest_dir=args.manifest_dir)
+        elif dataset == "libri" or dataset == "librispeech":
+            logging.info("Using LibriSpeech dataset")
+            librispeech = LibriSpeech(manifest_dir=args.manifest_dir)
+        elif dataset == "kspon" or dataset == "ksponspeech":
+            logging.info("Using KsponSpeech dataset")
+            ksponspeech = KsponSpeech(manifest_dir=args.manifest_dir)
+        elif dataset == "aishell":
+            logging.info("Using AIShell dataset")
+            aishell = AIShell(manifest_dir=args.manifest_dir)
+        else:
+            raise ValueError(f"Unsupported dataset: {dataset}")
+    
+
+    test_sets = []
+    test_dls = []    
+    for dataset in params.dataset:
+        if dataset == "all":
+            logging.info("Creating dataloaders for all datasets")
+            libri_test_clean_cuts = librispeech.test_clean_cuts()
+            libri_test_other_cuts = librispeech.test_other_cuts()
+            libri_dev_clean_cuts = librispeech.dev_clean_cuts()
+            libri_dev_other_cuts = librispeech.dev_other_cuts()
+            kspon_eval_clean_cuts = ksponspeech.eval_clean_cuts()
+            kspon_eval_other_cuts = ksponspeech.eval_other_cuts()
+            aishell_test_cuts = aishell.test_cuts()
+            aishell_dev_cuts = aishell.dev_cuts()
+
+            libri_test_clean_dl = asr_datamodule.test_dataloaders(
+                libri_test_clean_cuts)
+            libri_test_other_dl = asr_datamodule.test_dataloaders(
+                libri_test_other_cuts)
+            libri_dev_clean_dl = asr_datamodule.test_dataloaders(
+                libri_dev_clean_cuts)
+            libri_dev_other_dl = asr_datamodule.test_dataloaders(
+                libri_dev_other_cuts)
+            kspon_eval_clean_dl = asr_datamodule.test_dataloaders(
+                kspon_eval_clean_cuts)
+            kspon_eval_other_dl = asr_datamodule.test_dataloaders(
+                kspon_eval_other_cuts)
+            aishell_test_dl = asr_datamodule.test_dataloaders(
+                aishell_test_cuts)
+            aishell_dev_dl = asr_datamodule.test_dataloaders(
+                aishell_dev_cuts)
+            test_sets.extend(["libri_test_clean", "libri_test_other",
+                            "libri_dev_clean", "libri_dev_other",
+                            "kspon_eval_clean", "kspon_eval_other",
+                            "aishell_test", "aishell_dev"])
+            test_dls.extend([libri_test_clean_dl, libri_test_other_dl,
+                            libri_dev_clean_dl, libri_dev_other_dl,
+                            kspon_eval_clean_dl, kspon_eval_other_dl,
+                            aishell_test_dl, aishell_dev_dl])            
+        elif dataset == "libri" or dataset == "librispeech":
+            logging.info("Creating dataloaders for LibriSpeech dataset")
+            libri_test_clean_cuts = librispeech.test_clean_cuts()
+            libri_test_other_cuts = librispeech.test_other_cuts()
+            libri_dev_clean_cuts = librispeech.dev_clean_cuts()
+            libri_dev_other_cuts = librispeech.dev_other_cuts()
+            libri_test_clean_dl = asr_datamodule.test_dataloaders(
+                libri_test_clean_cuts)
+            libri_test_other_dl = asr_datamodule.test_dataloaders(
+                libri_test_other_cuts)
+            libri_dev_clean_dl = asr_datamodule.test_dataloaders(
+                libri_dev_clean_cuts)
+            libri_dev_other_dl = asr_datamodule.test_dataloaders(
+                libri_dev_other_cuts)
+            test_sets.extend(["libri_test_clean", "libri_test_other",
+                              "libri_dev_clean", "libri_dev_other"])
+            test_dls.extend([libri_test_clean_dl, libri_test_other_dl,
+                             libri_dev_clean_dl, libri_dev_other_dl])
+        elif dataset == "kspon" or dataset == "ksponspeech":
+            logging.info("Creating dataloaders for KsponSpeech dataset")
+            kspon_eval_clean_cuts = ksponspeech.eval_clean_cuts()
+            kspon_eval_other_cuts = ksponspeech.eval_other_cuts()
+            kspon_eval_clean_dl = asr_datamodule.test_dataloaders(
+                kspon_eval_clean_cuts)
+            kspon_eval_other_dl = asr_datamodule.test_dataloaders(
+                kspon_eval_other_cuts)
+            test_sets.extend(["kspon_eval_clean", "kspon_eval_other"])
+            test_dls.extend([kspon_eval_clean_dl, kspon_eval_other_dl])
+        elif dataset == "aishell":
+            logging.info("Creating dataloaders for AiShell dataset")
+            aishell_test_cuts = aishell.test_cuts()
+            aishell_dev_cuts = aishell.dev_cuts()
+            aishell_test_dl = asr_datamodule.test_dataloaders(
+                aishell_test_cuts)
+            aishell_dev_dl = asr_datamodule.test_dataloaders(
+                aishell_dev_cuts)
+            test_sets.extend(["aishell_test", "aishell_dev"])
+            test_dls.extend([aishell_test_dl, aishell_dev_dl])            
+        else:
+            raise ValueError(f"Unsupported dataset: {dataset}")
 
     for test_set, test_dl in zip(test_sets, test_dls):
         results_dict, cer_results_dict = decode_dataset(
@@ -822,9 +891,9 @@ def main():
             params=params,
             test_set_name=test_set,
             results_dict=results_dict,
-        )
+        )        
 
-        if test_set.startswith("kspon"):
+        if test_set.startswith("kspon") or test_set.startswith("aishell"):
             save_cer_results(
                 params=params,
                 test_set_name=test_set,

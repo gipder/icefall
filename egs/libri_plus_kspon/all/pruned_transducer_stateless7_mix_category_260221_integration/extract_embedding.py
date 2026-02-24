@@ -49,6 +49,7 @@ import argparse
 import copy
 import logging
 import random
+import sys
 import re
 import warnings
 from pathlib import Path
@@ -67,6 +68,7 @@ from librispeech import LibriSpeech
 from ksponspeech import KsponSpeech
 from aishell import AIShell
 from asr_datamodule import AsrDataModule
+from beam_search import greedy_search_batch, modified_beam_search
 from decoder import Decoder
 from joiner import Joiner
 from lhotse import CutSet, load_manifest
@@ -97,6 +99,7 @@ from icefall.lexicon import Lexicon
 from icefall.utils import (
     AttributeDict,
     MetricsTracker,
+    add_sos,
     filter_uneven_sized_batch,
     setup_logger,
     str2bool,
@@ -106,7 +109,6 @@ import os
 from my_utils import cluster_tokens_using_ipa_by_language
 from my_utils import cluster_tokens_using_ipa_by_list
 from my_utils import cluster_random_tokens
-from my_utils import cluster_tokens_using_embedding
 
 torch.serialization.add_safe_globals([pathlib.PosixPath])
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
@@ -469,9 +471,9 @@ def get_parser():
     parser.add_argument(
         "--category-method",
         type=str,
-        choices=["none", "ipa", "random", "embedding"],
+        choices=["ipa", "random", "none"],
         default="none",
-        help="The method to use for category clustering. Options are 'ipa', 'random', 'embedding', and 'none'.",
+        help="The method to use for category clustering. Options are 'ipa', 'random', and 'none'.",
     )
 
     parser.add_argument(
@@ -480,29 +482,6 @@ def get_parser():
         choices=["original", "autojoint", "autojoint_shortcut"],
         default="original",
         help="The type of joiner to use. Options are 'original', 'autojoint', 'autojoint_shortcut'.",
-    )
-
-    parser.add_argument(
-        "--embedding-file",
-        type=str,
-        default="",
-        help="The file containing token embeddings for embedding-based clustering. "
-             "Required if --category-method is 'embedding'."
-    )
-
-    parser.add_argument(
-        "--save-visualization",
-        type=str2bool,
-        default=False,
-        help="Whether to save the visualization of clustering. "             
-    )
-
-    parser.add_argument(
-        "--visualization-top-k",
-        type=int,
-        default=10,
-        help="The number of top tokens to consider for visualization. "
-             "Required if --save-visualization is True."
     )
 
     add_model_arguments(parser)
@@ -761,31 +740,29 @@ def save_checkpoint(
         copyfile(src=filename, dst=best_valid_filename)
 
 
-def compute_loss(
+def extract_token_embeddings(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
     tokenizer: MyTokenizer,
     batch: dict,
     is_training: bool,
     token_to_cluster_table: Optional[Tensor] = None,
-) -> Tuple[Tensor, MetricsTracker]:
+) -> None:
     """
-    Compute RNN-T loss given the model and its inputs.
+    Extract token embeddings from the model given its inputs.
 
     Args:
       params:
-        Parameters for training. See :func:`get_params`.
+        Parameters for extraction. See :func:`get_params`.
       model:
-        The model for training. It is an instance of Zipformer in our case.
+        The model for extraction. It is an instance of Zipformer in our case.
       batch:
         A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
         for the content in it.
       is_training:
-        True for training. False for validation. When it is True, this
-        function enables autograd during computation; when it is False, it
-        disables autograd.
-     warmup: a floating point value which increases throughout training;
-        values >= 1.0 are fully warmed up and have all modules present.
+        True for training mode. False for evaluation mode.
+      token_to_cluster_table:
+        Optional mapping table from tokens to clusters.
     """
     # For the uneven-sized batch, the total duration after padding would possibly
     # cause OOM. Hence, for each batch, which is sorted descendingly by length,
@@ -830,87 +807,121 @@ def compute_loss(
     else:
         category_y = None
 
-    with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss, category_loss = model(
-            x=feature,
-            x_lens=feature_lens,
-            y=y,
-            category_y=category_y,
-            prune_range=params.prune_range,
-            am_scale=params.am_scale,
-            lm_scale=params.lm_scale,
-        )
+    # compute encoder output
+    x = feature
+    x_lens = feature_lens
+    encoder_out, x_lens = model.encoder(x, x_lens)
+    assert torch.all(x_lens > 0)
 
-        s = params.simple_loss_scale
-        simple_loss_scale = (
-            s
-            if batch_idx_train >= warm_step
-            else 1.0 - (batch_idx_train / warm_step) * (1.0 - s)
-        )
-        pruned_loss_scale = (
-            1.0
-            if batch_idx_train >= warm_step
-            else 0.1 + 0.9 * (batch_idx_train / warm_step)
-        )
-        alpha = params.category_alpha
-        loss = (
-            simple_loss_scale * simple_loss
-            + pruned_loss_scale * (
-                (1 - alpha) * pruned_loss
-                + alpha*category_loss
-            )
-        )
+    blank_id = model.decoder.blank_id
 
-    assert loss.requires_grad == is_training
-
-    info = MetricsTracker()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
-
-    # Note: We use reduction=sum while computing the loss.
-    info["loss"] = loss.detach().cpu().item()
-    info["simple_loss"] = simple_loss.detach().cpu().item()
-    info["pruned_loss"] = pruned_loss.detach().cpu().item()
-    info["category_loss"] = category_loss.detach().cpu().item()
-
-    return loss, info
-
-
-def compute_validation_loss(
-    params: AttributeDict,
-    model: Union[nn.Module, DDP],
-    tokenizer: MyTokenizer,
-    valid_dl: torch.utils.data.DataLoader,
-    world_size: int = 1,
-    token_to_cluster_table: Optional[Tensor] = None,
-) -> MetricsTracker:
-    """Run the validation process."""
-    model.eval()
-
-    tot_loss = MetricsTracker()
-
-    for batch_idx, batch in enumerate(valid_dl):
-        loss, loss_info = compute_loss(
-            params=params,
-            model=model,
-            tokenizer=tokenizer,
-            batch=batch,
-            is_training=False,
-            token_to_cluster_table=token_to_cluster_table,
-        )
-        assert loss.requires_grad is False
-        tot_loss = tot_loss + loss_info
-
-    if world_size > 1:
-        tot_loss.reduce(loss.device)
-
-    loss_value = tot_loss["loss"] / tot_loss["frames"]
-    if loss_value < params.best_valid_loss:
-        params.best_valid_epoch = params.cur_epoch
-        params.best_valid_loss = loss_value
-
-    return tot_loss
+    # Use forced alignment with ground truth tokens instead of greedy search
+    with torch.no_grad():
+        # Compute decoder outputs for ground truth tokens
+        sos_y = add_sos(y, sos_id=blank_id)
+        sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
+        # decoder_out: [B, S + 1, decoder_dim]
+        decoder_out = model.decoder(sos_y_padded)
+        
+        # For each sample in batch, perform forced alignment
+        batch_size = encoder_out.size(0)
+        y_list = y.tolist()
+        
+        for batch_idx in range(batch_size):
+            gt_tokens = y_list[batch_idx]  # ground truth tokens for this sample
+            if len(gt_tokens) == 0:
+                continue
+            
+            T = x_lens[batch_idx].item()  # number of encoder frames
+            S = len(gt_tokens)  # number of tokens
+            
+            # Get encoder and decoder outputs for this sample
+            enc_out = encoder_out[batch_idx, :T, :]  # [T, encoder_dim]
+            dec_out = decoder_out[batch_idx, 1:S+1, :]  # [S, decoder_dim], skip SOS
+            
+            # Compute joiner logits for all (t, s) pairs
+            # Expand dimensions for broadcasting
+            enc_out_expanded = enc_out.unsqueeze(1)  # [T, 1, encoder_dim]
+            dec_out_expanded = dec_out.unsqueeze(0)  # [1, S, decoder_dim]
+            
+            # Compute joiner output: [T, S, vocab_size]
+            # We need to pass through the joiner network
+            enc_out_repeated = enc_out_expanded.repeat(1, S, 1)  # [T, S, encoder_dim]
+            dec_out_repeated = dec_out_expanded.repeat(T, 1, 1)  # [T, S, decoder_dim]
+            
+            # Flatten to pass through joiner
+            enc_flat = enc_out_repeated.reshape(T * S, -1)  # [T*S, encoder_dim]
+            dec_flat = dec_out_repeated.reshape(T * S, -1)  # [T*S, decoder_dim]
+            
+            # Get logits from joiner
+            logits, _ = model.joiner(enc_flat, dec_flat)  # [T*S, vocab_size]
+            logits = logits.reshape(T, S, -1)  # [T, S, vocab_size]
+            
+            # For each token, find the frame with maximum probability
+            token_indices = torch.tensor(gt_tokens, device=device, dtype=torch.long)
+            token_logits = logits[:, torch.arange(S), token_indices]  # [T, S]
+            
+            # Find best alignment using dynamic programming (Viterbi-like)
+            # For simplicity, we use argmax per token with monotonicity constraint
+            best_frames = []
+            last_frame = 0
+            
+            for s in range(S):
+                # Only consider frames from last_frame onwards (monotonic alignment)
+                token_scores = token_logits[last_frame:T, s]  # [T-last_frame]
+                relative_best_frame = torch.argmax(token_scores).item()
+                best_frame = last_frame + relative_best_frame
+                best_frames.append(best_frame)
+                last_frame = best_frame + 1  # move to next frame minimum
+                if last_frame >= T:
+                    last_frame = T - 1
+            
+            """
+            # DEBUG: Print alignment info for the first sample, then exit
+            if batch_idx == 0:
+                logging.info("=" * 80)
+                logging.info("DEBUG: Forced Alignment Result for First Sample")
+                logging.info("=" * 80)
+                logging.info(f"Ground Truth Text: {texts[batch_idx]}")
+                logging.info(f"Number of Encoder Frames (T): {T}")
+                logging.info(f"Number of Tokens (S): {S}")
+                logging.info(f"Ground Truth Token IDs: {gt_tokens}")
+                logging.info("-" * 80)
+                logging.info("Token Alignment (Token ID -> Character -> Frame Index):")
+                for token_idx, (token_id, t_idx) in enumerate(zip(gt_tokens, best_frames)):
+                    token_char = tokenizer.vocab_dict.get(token_id, f"<UNK:{token_id}>")
+                    logging.info(f"  [{token_idx:3d}] Token ID: {token_id:4d} | Char: {token_char:5s} | Frame: {t_idx:4d}/{T}")
+                logging.info("=" * 80)
+                logging.info("DEBUG: Exiting after first sample for debugging")
+                logging.info("=" * 80)
+                import sys
+                sys.exit(0)
+            """
+            
+            # Extract embeddings for each token using forced alignment
+            for token_idx, (token_id, t_idx) in enumerate(zip(gt_tokens, best_frames)):
+                # Audio embedding from encoder_out at aligned frame t_idx
+                audio_emb = encoder_out[batch_idx, t_idx, :].detach().cpu()
+                
+                # Text embedding from pre-computed decoder_out
+                # decoder_out has shape [B, S + 1, decoder_dim]
+                # token_idx + 1 because index 0 is SOS token
+                text_emb = decoder_out[batch_idx, token_idx + 1, :].detach().cpu()
+                
+                # Accumulate embeddings
+                if not hasattr(params, 'token_embeddings'):
+                    params.token_embeddings = {}
+                
+                if token_id not in params.token_embeddings:
+                    params.token_embeddings[token_id] = {
+                        'audio_embs': [],
+                        'text_embs': [],
+                        'count': 0
+                    }
+                
+                params.token_embeddings[token_id]['audio_embs'].append(audio_emb)
+                params.token_embeddings[token_id]['text_embs'].append(text_emb)
+                params.token_embeddings[token_id]['count'] += 1
 
 
 def train_one_epoch(
@@ -920,7 +931,6 @@ def train_one_epoch(
     scheduler: LRSchedulerType,
     tokenizer: MyTokenizer,
     train_dl: torch.utils.data.DataLoader,
-    valid_dl: torch.utils.data.DataLoader,
     scaler: GradScaler,
     model_avg: Optional[nn.Module] = None,
     tb_writer: Optional[SummaryWriter] = None,
@@ -928,27 +938,21 @@ def train_one_epoch(
     rank: int = 0,
     token_to_cluster_table: Optional[Tensor] = None,
 ) -> None:
-    """Train the model for one epoch.
-
-    The training loss from the mean of all frames is saved in
-    `params.train_loss`. It runs the validation process every
-    `params.valid_interval` batches.
+    """Extract embeddings for one epoch.
 
     Args:
       params:
         It is returned by :func:`get_params`.
       model:
-        The model for training.
+        The model for embedding extraction.
       optimizer:
-        The optimizer we are using.
+        The optimizer (kept for compatibility).
       scheduler:
-        The learning rate scheduler, we call step() every step.
+        The learning rate scheduler (kept for compatibility).
       train_dl:
         Dataloader for the training dataset.
-      valid_dl:
-        Dataloader for the validation dataset.
       scaler:
-        The scaler used for mix precision training.
+        The scaler (kept for compatibility).
       model_avg:
         The stored model averaged from the start of training.
       tb_writer:
@@ -959,9 +963,7 @@ def train_one_epoch(
         The rank of the node in DDP training. If no DDP is used, it should
         be set to 0.
     """
-    model.train()
-
-    tot_loss = MetricsTracker()
+    model.eval()
 
     for batch_idx, batch in enumerate(train_dl):
         params.batch_idx_train += 1
@@ -969,7 +971,7 @@ def train_one_epoch(
 
         try:
             with torch.amp.autocast('cuda', enabled=params.use_fp16):
-                loss, loss_info = compute_loss(
+                extract_token_embeddings(
                     params=params,
                     model=model,
                     tokenizer=tokenizer,
@@ -977,18 +979,6 @@ def train_one_epoch(
                     is_training=True,
                     token_to_cluster_table=token_to_cluster_table,
                 )
-            # summary stats
-            tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
-
-            # NOTE: We use reduction==sum and loss is computed over utterances
-            # in the batch and there is no normalization to it so far.
-            scaler.scale(loss).backward()
-            set_batch_count(model, params.batch_idx_train)
-            scheduler.step_batch(params.batch_idx_train)
-
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
         except:  # noqa
             display_and_save_batch(batch, params=params, tokenizer=tokenizer)
             raise
@@ -996,106 +986,11 @@ def train_one_epoch(
         if params.print_diagnostics and batch_idx == 5:
             return
 
-        if (
-            rank == 0
-            and params.batch_idx_train > 0
-            and params.batch_idx_train % params.average_period == 0
-        ):
-            update_averaged_model(
-                params=params,
-                model_cur=model,
-                model_avg=model_avg,
-            )
-
-        if (
-            params.batch_idx_train > 0
-            and params.batch_idx_train % params.save_every_n == 0
-        ):
-            save_checkpoint_with_global_batch_idx(
-                out_dir=params.exp_dir,
-                global_batch_idx=params.batch_idx_train,
-                model=model,
-                model_avg=model_avg,
-                params=params,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                sampler=train_dl.sampler,
-                scaler=scaler,
-                rank=rank,
-            )
-            remove_checkpoints(
-                out_dir=params.exp_dir,
-                topk=params.keep_last_k,
-                rank=rank,
-            )
-
-        if batch_idx % 100 == 0 and params.use_fp16:
-            # If the grad scale was less than 1, try increasing it.    The _growth_interval
-            # of the grad scaler is configurable, but we can't configure it to have different
-            # behavior depending on the current grad scale.
-            cur_grad_scale = scaler._scale.item()
-            if cur_grad_scale < 1.0 or (cur_grad_scale < 8.0 and batch_idx % 400 == 0):
-                scaler.update(cur_grad_scale * 2.0)
-            if cur_grad_scale < 0.01:
-                logging.warning(f"Grad scale is small: {cur_grad_scale}")
-            if cur_grad_scale < 1.0e-05:
-                # raise_grad_scale_is_too_small_error(cur_grad_scale)
-                raise RuntimeError(
-                    f"grad_scale is too small, exiting: {cur_grad_scale}"
-                )
         if batch_idx % params.log_interval == 0:
-            cur_lr = scheduler.get_last_lr()[0]
-            cur_grad_scale = scaler._scale.item() if params.use_fp16 else 1.0
-
             logging.info(
                 f"Epoch {params.cur_epoch}, "
-                f"batch {batch_idx}, loss[{loss_info}], "
-                f"tot_loss[{tot_loss}], batch size: {batch_size}, "
-                f"lr: {cur_lr:.2e}, "
-                + (f"grad_scale: {scaler._scale.item()}" if params.use_fp16 else "")
+                f"batch {batch_idx}, batch size: {batch_size}"
             )
-
-            if tb_writer is not None:
-                tb_writer.add_scalar(
-                    "train/learning_rate", cur_lr, params.batch_idx_train
-                )
-
-                loss_info.write_summary(
-                    tb_writer, "train/current_", params.batch_idx_train
-                )
-                tot_loss.write_summary(tb_writer, "train/tot_", params.batch_idx_train)
-                if params.use_fp16:
-                    tb_writer.add_scalar(
-                        "train/grad_scale",
-                        cur_grad_scale,
-                        params.batch_idx_train,
-                    )
-
-        if batch_idx % params.valid_interval == 0 and not params.print_diagnostics:
-            logging.info("Computing validation loss")
-            valid_info = compute_validation_loss(
-                params=params,
-                model=model,
-                tokenizer=tokenizer,
-                valid_dl=valid_dl,
-                world_size=world_size,
-                token_to_cluster_table=token_to_cluster_table,
-            )
-            model.train()
-            logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
-            logging.info(
-                f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
-            )
-            if tb_writer is not None:
-                valid_info.write_summary(
-                    tb_writer, "train/valid_", params.batch_idx_train
-                )
-
-    loss_value = tot_loss["loss"] / tot_loss["frames"]
-    params.train_loss = loss_value
-    if params.train_loss < params.best_train_loss:
-        params.best_train_epoch = params.cur_epoch
-        params.best_train_loss = params.train_loss
 
 def run(rank, world_size, args):
     """
@@ -1158,15 +1053,6 @@ def run(rank, world_size, args):
         logging.info("Using IPA-based category clustering")
         token_cluster = cluster_tokens_using_ipa_by_list(
             token_dict, params.num_category_list)
-    elif params.category_method == "embedding":
-        logging.info("Using embedding-based category clustering")
-        if not os.path.exists(params.embedding_file):
-            raise ValueError(f"Embedding file {params.embedding_file} does not exist.")
-        token_cluster = cluster_tokens_using_embedding(
-            token_dict, params.num_category_list,
-            params.embedding_file,
-            save_visualization=params.save_visualization,
-            visualization_top_k=params.visualization_top_k)        
     elif params.category_method == "none":
         logging.info("Using no category clustering. All tokens are assigned to None. "
                      "The cluster will not be used in this case.")
@@ -1377,42 +1263,6 @@ def run(rank, world_size, args):
         sampler_state_dict=sampler_state_dict,
     )
 
-    # Collect validation cuts from each dataset
-    valid_cuts_list = []
-    
-    if librispeech is not None:
-        logging.info("Using LibriSpeech validation cuts")
-        valid_cuts_list.append(librispeech.dev_clean_cuts())
-        valid_cuts_list.append(librispeech.dev_other_cuts())
-    if ksponspeech is not None:
-        logging.info("Using KsponSpeech validation cuts")
-        valid_cuts_list.append(ksponspeech.dev_cuts())
-    if aishell is not None:
-        logging.info("Using AIShell validation cuts")
-        valid_cuts_list.append(aishell.dev_cuts())
-    
-    # Combine all validation cuts
-    if len(valid_cuts_list) == 0:
-        raise ValueError("No validation data selected")
-    elif len(valid_cuts_list) == 1:
-        valid_cuts = valid_cuts_list[0]
-    else:
-        valid_cuts = valid_cuts_list[0]
-        for cuts in valid_cuts_list[1:]:
-            valid_cuts = valid_cuts + cuts
-
-    valid_dl = asr_datamodule.valid_dataloaders(valid_cuts)
-    """
-    if not params.print_diagnostics:
-        scan_pessimistic_batches_for_oom(
-            model=model,
-            train_dl=train_dl,
-            optimizer=optimizer,
-            tokenizer=my_tokenizer,
-            params=params,
-        )
-    """
-
     scaler = GradScaler(enabled=params.use_fp16, init_scale=1.0)
     if checkpoints and "grad_scaler" in checkpoints:
         logging.info("Loading grad scaler state dict")
@@ -1438,7 +1288,6 @@ def run(rank, world_size, args):
             scheduler=scheduler,
             tokenizer=my_tokenizer,
             train_dl=train_dl,
-            valid_dl=valid_dl,
             scaler=scaler,
             tb_writer=tb_writer,
             world_size=world_size,
@@ -1446,22 +1295,31 @@ def run(rank, world_size, args):
             token_to_cluster_table=token_to_cluster_table,
         )
 
-        if params.print_diagnostics:
-            diagnostic.print_diagnostics()
-            break
-
-        save_checkpoint(
-            params=params,
-            model=model,
-            model_avg=model_avg,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            sampler=train_dl.sampler,
-            scaler=scaler,
-            rank=rank,
-        )
+        logging.info("Embedding extraction complete after epoch 1. Exiting.")
+        break
 
     logging.info("Done!")
+    
+    # Save averaged token embeddings after epoch 1
+    if hasattr(params, 'token_embeddings') and rank == 0:
+        logging.info("Computing average embeddings for each token...")
+        final_embeddings = {}
+        for token_id, data in params.token_embeddings.items():
+            if data['count'] > 0:
+                # Stack and average
+                audio_stack = torch.stack(data['audio_embs'], dim=0)  # (N, encoder_dim)
+                text_stack = torch.stack(data['text_embs'], dim=0)    # (N, decoder_dim)
+                
+                final_embeddings[token_id] = {
+                    'audio_embedding': audio_stack.mean(dim=0),  # (encoder_dim,)
+                    'text_embedding': text_stack.mean(dim=0),    # (decoder_dim,)
+                    'count': data['count']
+                }
+        
+        save_path = params.exp_dir / "token_embeddings.pt"
+        torch.save(final_embeddings, save_path)
+        logging.info(f"Saved token embeddings to {save_path}")
+        logging.info(f"Total unique tokens: {len(final_embeddings)}")
 
     if world_size > 1:
         torch.distributed.barrier()
@@ -1515,15 +1373,13 @@ def scan_pessimistic_batches_for_oom(
         batch = train_dl.dataset[cuts]
         try:
             with torch.amp.autocast('cuda', enabled=params.use_fp16):
-                loss, _ = compute_loss(
+                extract_token_embeddings(
                     params=params,
                     model=model,
                     tokenizer=tokenizer,
                     batch=batch,
                     is_training=True,
                 )
-            loss.backward()
-            optimizer.zero_grad()
         except Exception as e:
             if "CUDA out of memory" in str(e):
                 logging.error(
