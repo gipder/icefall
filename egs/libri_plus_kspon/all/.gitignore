@@ -5,3 +5,7 @@ experiments*
 train_*sh
 decode_*sh
 *.local.sh
+*.jpg
+*.png
+*.pdf
+*.pkl
