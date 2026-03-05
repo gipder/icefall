@@ -66,17 +66,17 @@ def save_tsne_visualization(
                          edgecolors='black', linewidth=0.5)
     
     # Create legend with cluster sizes inside the plot
-    legend_labels = [f"n = {size}" for cluster_id, size in top_k_clusters]
+    legend_labels = [f"Top-{i+1} (n = {size})" for i, (cluster_id, size) in enumerate(top_k_clusters)]
     legend_handles = [plt.scatter([], [], c=[plt.cm.get_cmap(cmap)(i / len(top_k_clusters))], 
-                                 s=100, alpha=0.8, edgecolors='black', linewidth=0.5)
+                                 s=250, alpha=0.8, edgecolors='black', linewidth=1)
                      for i in range(len(top_k_clusters))]
-    plt.legend(legend_handles, legend_labels, loc='upper left', fontsize=11, 
-              title='Cluster Sizes', title_fontsize=12, framealpha=0.95)
+    plt.legend(legend_handles, legend_labels, loc='upper left', fontsize=15, 
+              title='Cluster Sizes', title_fontsize=16, framealpha=0.95)
     
-    plt.title(f"Token Embedding Clusters (Top {visualization_top_k} by Size)",
-             fontsize=16, fontweight='bold', pad=20)
-    plt.xlabel("t-SNE Dimension 1", fontsize=12, fontweight='bold')
-    plt.ylabel("t-SNE Dimension 2", fontsize=12, fontweight='bold')
+    #plt.title(f"Token Embedding Clusters (Top {visualization_top_k} by Size)",
+    #         fontsize=16, fontweight='bold', pad=20)
+    #plt.xlabel("t-SNE Dimension 1", fontsize=12, fontweight='bold')
+    #plt.ylabel("t-SNE Dimension 2", fontsize=12, fontweight='bold')
     plt.grid(True, alpha=0.3, linestyle='--')
 
     filename = f"token_{cluster_type}_clusters_top{visualization_top_k}.png"

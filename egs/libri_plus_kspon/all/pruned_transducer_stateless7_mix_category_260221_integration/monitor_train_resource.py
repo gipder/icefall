@@ -50,6 +50,7 @@ import copy
 import logging
 import random
 import re
+import time
 import warnings
 from pathlib import Path
 import pathlib
@@ -913,11 +914,8 @@ def train_one_epoch(
     scheduler: LRSchedulerType,
     tokenizer: MyTokenizer,
     train_dl: torch.utils.data.DataLoader,
-    valid_dl: torch.utils.data.DataLoader,
     scaler: GradScaler,
     model_avg: Optional[nn.Module] = None,
-    tb_writer: Optional[SummaryWriter] = None,
-    world_size: int = 1,
     rank: int = 0,
     token_to_cluster_table: Optional[Tensor] = None,
 ) -> None:
@@ -938,8 +936,6 @@ def train_one_epoch(
         The learning rate scheduler, we call step() every step.
       train_dl:
         Dataloader for the training dataset.
-      valid_dl:
-        Dataloader for the validation dataset.
       scaler:
         The scaler used for mix precision training.
       model_avg:
@@ -955,10 +951,19 @@ def train_one_epoch(
     model.train()
 
     tot_loss = MetricsTracker()
-
+    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
+    
+    # Reset peak memory stats at the start of each epoch
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+    
+    start_time = time.time()
+    total_samples = 0
     for batch_idx, batch in enumerate(train_dl):
+        batch_start_time = time.time()
         params.batch_idx_train += 1
         batch_size = len(batch["supervisions"]["text"])
+        total_samples += batch_size
 
         try:
             with torch.amp.autocast('cuda', enabled=params.use_fp16):
@@ -986,9 +991,6 @@ def train_one_epoch(
             display_and_save_batch(batch, params=params, tokenizer=tokenizer)
             raise
 
-        if params.print_diagnostics and batch_idx == 5:
-            return
-
         if (
             rank == 0
             and params.batch_idx_train > 0
@@ -999,7 +1001,7 @@ def train_one_epoch(
                 model_cur=model,
                 model_avg=model_avg,
             )
-
+        """
         if (
             params.batch_idx_train > 0
             and params.batch_idx_train % params.save_every_n == 0
@@ -1021,6 +1023,7 @@ def train_one_epoch(
                 topk=params.keep_last_k,
                 rank=rank,
             )
+        """
 
         if batch_idx % 100 == 0 and params.use_fp16:
             # If the grad scale was less than 1, try increasing it.    The _growth_interval
@@ -1037,58 +1040,53 @@ def train_one_epoch(
                     f"grad_scale is too small, exiting: {cur_grad_scale}"
                 )
         if batch_idx % params.log_interval == 0:
+            batch_elapsed_time = time.time() - batch_start_time
+            epoch_elapsed_time = time.time() - start_time
             cur_lr = scheduler.get_last_lr()[0]
             cur_grad_scale = scaler._scale.item() if params.use_fp16 else 1.0
+            current_memory = 0
+            peak_memory = 0
+            reserved_memory = 0
+            peak_reserved_memory = 0
+            if torch.cuda.is_available():
+                current_memory = torch.cuda.memory_allocated(device) / (1024**3)  # Convert to GB
+                peak_memory = torch.cuda.max_memory_allocated(device) / (1024**3)  # Convert to GB
+                reserved_memory = torch.cuda.memory_reserved(device) / (1024**3)  # Convert to GB
+                peak_reserved_memory = torch.cuda.max_memory_reserved(device) / (1024**3)  # Convert to GB
 
             logging.info(
                 f"Epoch {params.cur_epoch}, "
                 f"batch {batch_idx}, loss[{loss_info}], "
                 f"tot_loss[{tot_loss}], batch size: {batch_size}, "
                 f"lr: {cur_lr:.2e}, "
+                f"memory: {current_memory:.2f}GB (reserved: {reserved_memory:.2f}GB), "
+                f"peak_memory: {peak_memory:.2f}GB (reserved: {peak_reserved_memory:.2f}GB), "
+                f"batch_time: {batch_elapsed_time:.2f}s, elapsed_time: {epoch_elapsed_time:.1f}s ({epoch_elapsed_time/60:.1f}m), "
                 + (f"grad_scale: {scaler._scale.item()}" if params.use_fp16 else "")
             )
-
-            if tb_writer is not None:
-                tb_writer.add_scalar(
-                    "train/learning_rate", cur_lr, params.batch_idx_train
-                )
-
-                loss_info.write_summary(
-                    tb_writer, "train/current_", params.batch_idx_train
-                )
-                tot_loss.write_summary(tb_writer, "train/tot_", params.batch_idx_train)
-                if params.use_fp16:
-                    tb_writer.add_scalar(
-                        "train/grad_scale",
-                        cur_grad_scale,
-                        params.batch_idx_train,
-                    )
-
-        if batch_idx % params.valid_interval == 0 and not params.print_diagnostics:
-            logging.info("Computing validation loss")
-            valid_info = compute_validation_loss(
-                params=params,
-                model=model,
-                tokenizer=tokenizer,
-                valid_dl=valid_dl,
-                world_size=world_size,
-                token_to_cluster_table=token_to_cluster_table,
-            )
-            model.train()
-            logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
-            logging.info(
-                f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
-            )
-            if tb_writer is not None:
-                valid_info.write_summary(
-                    tb_writer, "train/valid_", params.batch_idx_train
-                )
 
     loss_value = tot_loss["loss"] / tot_loss["frames"]
     params.train_loss = loss_value
     if params.train_loss < params.best_train_loss:
         params.best_train_epoch = params.cur_epoch
         params.best_train_loss = params.train_loss
+    
+    # Calculate and log epoch timing and peak memory
+    elapsed_time = time.time() - start_time
+    time_per_sample = elapsed_time / total_samples if total_samples > 0 else 0
+    peak_memory = 0
+    peak_reserved_memory = 0
+    if torch.cuda.is_available():
+        peak_memory = torch.cuda.max_memory_allocated(device) / (1024**3)  # Convert to GB
+        peak_reserved_memory = torch.cuda.max_memory_reserved(device) / (1024**3)  # Convert to GB
+    
+    logging.info(
+        f"Epoch {params.cur_epoch} completed - "
+        f"Total time: {elapsed_time:.2f}s ({elapsed_time/60:.2f}m), "
+        f"Total samples: {total_samples}, "
+        f"Time per sample: {time_per_sample*1000:.2f}ms, "
+        f"Peak memory: {peak_memory:.2f}GB (reserved: {peak_reserved_memory:.2f}GB)"
+    )
 
 def run(rank, world_size, args):
     """
@@ -1400,16 +1398,6 @@ def run(rank, world_size, args):
             valid_cuts = valid_cuts + cuts
 
     valid_dl = asr_datamodule.valid_dataloaders(valid_cuts)
-    """
-    if not params.print_diagnostics:
-        scan_pessimistic_batches_for_oom(
-            model=model,
-            train_dl=train_dl,
-            optimizer=optimizer,
-            tokenizer=my_tokenizer,
-            params=params,
-        )
-    """
 
     scaler = GradScaler(enabled=params.use_fp16, init_scale=1.0)
     if checkpoints and "grad_scaler" in checkpoints:
@@ -1436,17 +1424,10 @@ def run(rank, world_size, args):
             scheduler=scheduler,
             tokenizer=my_tokenizer,
             train_dl=train_dl,
-            valid_dl=valid_dl,
             scaler=scaler,
-            tb_writer=tb_writer,
-            world_size=world_size,
             rank=rank,
             token_to_cluster_table=token_to_cluster_table,
         )
-
-        if params.print_diagnostics:
-            diagnostic.print_diagnostics()
-            break
 
         save_checkpoint(
             params=params,
@@ -1494,48 +1475,6 @@ def display_and_save_batch(
     y = tokenizer.encode_batch((supervisions["text"]))
     num_tokens = sum(len(i) for i in y)
     logging.info(f"num tokens: {num_tokens}")
-
-
-def scan_pessimistic_batches_for_oom(
-    model: Union[nn.Module, DDP],
-    train_dl: torch.utils.data.DataLoader,
-    optimizer: torch.optim.Optimizer,
-    tokenizer: MyTokenizer,
-    params: AttributeDict,
-):
-    from lhotse.dataset import find_pessimistic_batches
-
-    logging.info(
-        "Sanity check -- see if any of the batches in epoch 1 would cause OOM."
-    )
-    batches, crit_values = find_pessimistic_batches(train_dl.sampler)
-    for criterion, cuts in batches.items():
-        batch = train_dl.dataset[cuts]
-        try:
-            with torch.amp.autocast('cuda', enabled=params.use_fp16):
-                loss, _ = compute_loss(
-                    params=params,
-                    model=model,
-                    tokenizer=tokenizer,
-                    batch=batch,
-                    is_training=True,
-                )
-            loss.backward()
-            optimizer.zero_grad()
-        except Exception as e:
-            if "CUDA out of memory" in str(e):
-                logging.error(
-                    "Your GPU ran out of memory with the current "
-                    "max_duration setting. We recommend decreasing "
-                    "max_duration and trying again.\n"
-                    f"Failing criterion: {criterion} "
-                    f"(={crit_values[criterion]}) ..."
-                )
-            display_and_save_batch(batch, params=params, tokenizer=tokenizer)
-            raise
-        logging.info(
-            f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
-        )
 
 
 def main():
